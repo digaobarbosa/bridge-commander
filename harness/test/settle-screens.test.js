@@ -208,3 +208,48 @@ test('every permission mode\'s ready UI reads as ready, and none reads as fatal'
   assert.ok(SETTLE.readyRe.test('⏵⏵ auto mode on (shift+tab to cycle)'));
   assert.ok(SETTLE.readyRe.test('⏵⏵ accept edits on (shift+tab to cycle)'));
 });
+
+// Captured from a failed worker start on claude 2.1.282: the trust screen now
+// preselects "No, exit". The old settle answered it with Enter, claude quit to
+// the shell, and every card start timed out at 45s.
+const TRUST_NO_PRESELECTED = `
+ Accessing workspace:
+
+ /Users/digao/dev/fleet/.bridge-commander/worktrees/BR2-1
+
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+`;
+const TRUST_YES_SELECTED = TRUST_NO_PRESELECTED
+  .replace(' ❯ No, exit', '   No, exit')
+  .replace('   Yes, I trust this folder', ' ❯ Yes, I trust this folder');
+
+test('a trust screen with "No, exit" preselected is walked to Yes before Enter', async () => {
+  const claude = require(path.join(__dirname, '..', 'claude-tmux.js'));
+  const { mockTmux } = require('./tmux-mock.js');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-settle-'));
+  const m = mockTmux({ readyTail: [TRUST_NO_PRESELECTED, TRUST_YES_SELECTED, READY] });
+  try {
+    await claude.spawn(dir, 'hi', { session: 'bc-w', stateDir: dir, installHooks: false });
+    const keys = m.calls.filter((c) => c.fn === 'sendKey').map((c) => c.args[1]);
+    // Enter #1 submits the launch line; after that, Down must come before any Enter.
+    const afterLaunch = keys.slice(1);
+    assert.strictEqual(afterLaunch[0], 'Down', `Enter on "No, exit" quits claude (keys: ${keys.join(',')})`);
+    assert.ok(afterLaunch.includes('Enter'), 'and the Yes is then accepted');
+  } finally {
+    m.restore();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

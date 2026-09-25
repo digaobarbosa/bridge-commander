@@ -240,6 +240,7 @@ async function adoptWindow(ref, window, taken = []) {
 // (composer + footer are the screen's last rows), so the tail is behavior-
 // preserving there.
 const SETTLE_TAIL_LINES = 15;
+const NO_PRESELECTED_RE = /❯\s*(\d+\.\s*)?No\b/;
 
 function paneTail(pane) {
   return pane.replace(/\s+$/, '').split('\n').slice(-SETTLE_TAIL_LINES).join('\n');
@@ -275,6 +276,13 @@ async function launchAndSettle(target, launchCmd, sig) {
     }
     if (SHELLS.has(cmd)) continue; // agent not up yet (or it already exited — captured by timeout)
     if (menus.some((re) => re.test(tail))) {
+      // claude 2.1.28x preselects "No, exit" on the trust screen, where Enter
+      // quits claude. Walk the cursor off a No before answering.
+      if (NO_PRESELECTED_RE.test(tail)) {
+        await t.sendKey(target, 'Down');
+        await t.sleep(300);
+        continue;
+      }
       await t.sendKey(target, 'Enter');
       await t.sleep(1000);
       continue;
