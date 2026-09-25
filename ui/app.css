@@ -1337,6 +1337,8 @@ a.a-uri { color: var(--accent); }
 .pane-hint.on { color: var(--accent); }
 #pane-close { flex: none; color: var(--dim); font-size: 15px; padding: 2px 6px; }
 #pane-close:hover { color: var(--text); }
+#pane-term { flex: none; color: var(--dim); font-size: 15px; padding: 2px 6px; cursor: pointer; text-decoration: none; }
+#pane-term:hover { color: var(--accent); }
 /* window tabs: rendered only when a card offers more than one, so a single
    window is the drawer exactly as it was before they existed */
 .pane-tabs {
