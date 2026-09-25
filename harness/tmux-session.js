@@ -55,36 +55,39 @@ function spawnArgsFile(stateDir, key) {
 // The launch facts a resume has to replay, taken straight off the spawn's opts:
 // the extra flags (--model/--effort, pinned by the card's playbook) and the
 // caller's allowRoot consent (the IS_SANDBOX=1 prefix without which claude
-// refuses to come back as uid 0). Written as an object; a bare array is the
-// older record's shape and still reads as flags-only.
+// refuses to come back as uid 0) and the permission mode (claude only; a
+// resume that drops it comes back in the default mode). Written as an object;
+// a bare array is the older record's shape and still reads as flags-only.
 function recordSpawnArgs(stateDir, key, opts = {}) {
   const file = spawnArgsFile(stateDir, key);
   try {
     const rec = { args: (opts.extraArgs || []).map(String) };
     if (opts.allowRoot) rec.allowRoot = true;
-    if (rec.args.length || rec.allowRoot) fs.writeFileSync(file, JSON.stringify(rec) + '\n');
+    if (typeof opts.permissionMode === 'string' && opts.permissionMode) rec.permissionMode = opts.permissionMode;
+    if (rec.args.length || rec.allowRoot || rec.permissionMode) fs.writeFileSync(file, JSON.stringify(rec) + '\n');
     else fs.rmSync(file, { force: true });
   } catch {
     // best-effort: the record is an optimisation, never a precondition
   }
 }
-// -> { args: string[], allowRoot: boolean }. Missing, unreadable or corrupt
+// -> { args: string[], allowRoot: boolean, permissionMode: string|null }. Missing, unreadable or corrupt
 // reads as "nothing extra" and never throws: a resume that cannot read a hint
 // must still resume.
 function recordedSpawnArgs(stateDir, key) {
   try {
     const v = JSON.parse(fs.readFileSync(spawnArgsFile(stateDir, key), 'utf8'));
-    if (Array.isArray(v)) return { args: v.filter((a) => typeof a === 'string'), allowRoot: false };
+    if (Array.isArray(v)) return { args: v.filter((a) => typeof a === 'string'), allowRoot: false, permissionMode: null };
     if (v && typeof v === 'object') {
       return {
         args: Array.isArray(v.args) ? v.args.filter((a) => typeof a === 'string') : [],
         allowRoot: !!v.allowRoot,
+        permissionMode: typeof v.permissionMode === 'string' && v.permissionMode ? v.permissionMode : null,
       };
     }
   } catch {
     // fall through to the empty record
   }
-  return { args: [], allowRoot: false };
+  return { args: [], allowRoot: false, permissionMode: null };
 }
 
 function shellQuote(s) {
