@@ -181,3 +181,30 @@ test('the real ready footer is not mistaken for the consent screen', () => {
   assert.ok(!SETTLE.fatalRe.test(READY), 'a working session must never read as fatal');
   assert.ok(SETTLE.readyRe.test(READY));
 });
+
+// Agents launch with --permission-mode <mode> now (bypass is opt-in), and each
+// mode draws its own footer. The default mode draws none, so its composer's
+// column-zero ❯ is the only signature — the same anchor the picker test pins.
+const footerScreen = (footer) => `
+───────────────────────────────────────────────────────────────────────
+❯
+───────────────────────────────────────────────────────────────────────
+  Opus 5 | █████░░░░░░░░░░░░░░░ 27% | 270k/1000k
+${footer}
+`;
+
+test('every permission mode\'s ready UI reads as ready, and none reads as fatal', () => {
+  const screens = {
+    auto: footerScreen('  ⏵⏵ auto mode on (shift+tab to cycle)'),
+    acceptEdits: footerScreen('  ⏵⏵ accept edits on (shift+tab to cycle)'),
+    default: footerScreen('  ? for shortcuts'),
+    bypass: READY,
+  };
+  for (const [mode, screen] of Object.entries(screens)) {
+    assert.ok(SETTLE.readyRe.test(screen), mode + ' mode UI must read as ready');
+    assert.ok(!SETTLE.fatalRe.test(screen), mode + ' mode UI must never read as fatal');
+  }
+  // The footer alone, before the composer is drawn, is enough for the modes that have one.
+  assert.ok(SETTLE.readyRe.test('⏵⏵ auto mode on (shift+tab to cycle)'));
+  assert.ok(SETTLE.readyRe.test('⏵⏵ accept edits on (shift+tab to cycle)'));
+});
