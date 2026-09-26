@@ -21,7 +21,7 @@ const SELF_DIR = path.dirname(fs.realpathSync(process.argv[1]));
 // deliberately-crashing script to exercise the boot-failure path.
 const SERVER_JS = process.env.BC_SERVER_JS || path.join(SELF_DIR, '..', 'server', 'server.js');
 const { STATE_DIR_NAME, LEGACY_STATE_DIR_NAME, migrateStateDir, resolveStateDir, migrateHomeStateDir, isWorkspace, isId,
-  ONBOARDING_STEPS } =
+  slugBase, ONBOARDING_STEPS } =
   require(path.join(SELF_DIR, '..', 'server', 'layout.js'));
 const gitrev = require(path.join(SELF_DIR, '..', 'server', 'gitrev.js'));
 // The playbooks a workspace is seeded with, and the worker-duties skill that
@@ -362,9 +362,9 @@ function excludeFromGit(dir, entry) {
     if (!cur.split('\n').includes(entry)) fs.appendFileSync(excl, entry + '\n');
   } catch (e) { /* not a git repo — nothing to exclude */ }
 }
-function slugId(s) {
-  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'lt';
-}
+// The id a name derives to, needed here before the server has answered (the
+// charter file is named after it). The rule is the server's (layout.slugBase).
+function idFromName(name) { return slugBase(name) || 'lt'; }
 
 // --charter-file seeds a lieutenant's memory file; it never replaces one. The
 // file's existence is the mark — the same rule the boot migration follows —
@@ -481,7 +481,7 @@ async function cmdInit() {
   // 3. founding lieutenant: the CALLER's session is its ref. resumeId is learned
   // from the first turn-end POST (adoption); CLAUDE_SESSION_ID seeds it when the
   // harness exports it.
-  const id = opts.id || slugId(opts.name);
+  const id = opts.id || idFromName(opts.name);
   const ref = { harness: 'claude', session: tmuxSession, cwd: WORKSPACE };
   if (process.env.CLAUDE_SESSION_ID) ref.resumeId = process.env.CLAUDE_SESSION_ID;
   const body = { name: opts.name, id, ref, actor: 'user' };
@@ -686,7 +686,7 @@ async function cmdInitOnboard() {
   //    lieutenant with no idea why she exists.
   const id = opts.id || BRIDGET.id;
   const name = opts.name || BRIDGET.name;
-  const avatar = opts.avatar !== null ? parseAvatarOpt(opts.avatar) : BRIDGET.avatar;
+  const avatar = opts.avatar !== null ? avatarArg(opts.avatar) : BRIDGET.avatar;
   const charterFile = path.join(ONBOARDING_DIR, 'bridget.md');
   if (fs.existsSync(charterPath(WORKSPACE, id))) {
     console.log('charter left alone — ' + charterPath(WORKSPACE, id) + ' already exists');
@@ -811,12 +811,11 @@ async function cmdStop() {
 }
 
 // ---------- lieutenants ----------
-function parseAvatarOpt(raw) {
-  const n = parseInt(raw, 10);
-  if (!Number.isInteger(n) || String(n) !== String(raw).trim() || n < 0 || n > 63) {
-    die('--avatar must be an integer 0-63');
-  }
-  return n;
+// --avatar is a string on argv and a number on the wire. Only the conversion
+// lives here: the range is the server's, and so is the refusal.
+function avatarArg(raw) {
+  if (raw === 'none') return null;
+  return /^\s*\d+\s*$/.test(raw) ? Number(raw) : raw;
 }
 
 async function cmdLtCreate() {
@@ -826,12 +825,12 @@ async function cmdLtCreate() {
   if (opts.id) body.id = opts.id;
   if (opts.prefix) body.prefix = opts.prefix;
   if (opts.color) body.color = opts.color;
-  if (opts.avatar !== null) body.avatar = parseAvatarOpt(opts.avatar);
+  if (opts.avatar !== null) body.avatar = avatarArg(opts.avatar);
   // A charter pins the id here rather than leaving it to the server: the memory
   // file is named after it, and it has to be on disk BEFORE --spawn reads it
   // into the launch prompt.
   if (opts.charterFile) {
-    body.id = body.id || slugId(opts.name);
+    body.id = body.id || idFromName(opts.name);
     seedCharter(body.id, opts.charterFile);
   }
   if (opts.actor) body.actor = opts.actor;
@@ -857,7 +856,7 @@ async function cmdLtPatch() {
   const id = positional[0];
   if (!id) die(LT_PATCH_USAGE);
   const body = {};
-  if (opts.avatar !== null) body.avatar = opts.avatar === 'none' ? null : parseAvatarOpt(opts.avatar);
+  if (opts.avatar !== null) body.avatar = avatarArg(opts.avatar);
   if (opts.color) body.color = opts.color;
   if (opts.prefix) body.prefix = opts.prefix;
   if (opts.model !== null) body.model = opts.model === 'none' ? null : opts.model;
@@ -903,7 +902,7 @@ async function cmdLtList() {
     // The harness is a property of the SESSION, so a lieutenant with none shows
     // '-' rather than a default it is not actually running on.
     const run = (l.ref ? l.ref.harness : '-') + (l.model ? ':' + l.model : '');
-    console.log(l.id + '\t' + l.name + '\t' + l.color + '\t' + l.prefix + '-' + ((l.cardSeq || 0) + 1)
+    console.log(l.id + '\t' + l.name + '\t' + l.color + '\t' + (l.next || '-')
       + '\t' + run + (charter ? '\t' + charter : ''));
   }
 }
@@ -1016,14 +1015,13 @@ async function cmdCreate() {
   }
   if (opts.id) {
     // The owner mints the id — refuse locally, before any create, and name the
-    // id it would have minted (the same prefix+cardSeq compute cmdLtList does).
-    // The lookup is a courtesy: the refusal is local policy and stands whether
-    // or not a server is there to answer.
+    // id the server says it would mint. The lookup is a courtesy: the refusal
+    // is local policy and stands whether or not a server is there to answer.
     let minted = null;
     try {
       const lr = await request('GET', '/api/lieutenants');
       const lt = (lr.lieutenants || []).find((l) => l.id === opts.owner);
-      if (lt) minted = lt.prefix + '-' + ((Number.isInteger(lt.cardSeq) ? lt.cardSeq : 0) + 1);
+      minted = lt ? lt.next : null;
     } catch (e) { minted = null; }
     die('card create refused: the owner mints the id, --id is not accepted.' +
       (minted ? ' ' + opts.owner + ' would mint ' + minted + ' next.' : ''));
@@ -1038,15 +1036,11 @@ async function cmdCreate() {
   if (opts.bodyFile) body.body = readInput(opts.bodyFile);
   // A duplicate id is refused, never resolved: print the server's sentence as
   // its own line so the human reads what to do instead of an HTTP envelope.
-  // The server offers two remedies because an API caller has both; here the id
-  // is always the mint, so drop the door this command no longer has and leave
-  // the one a CLI caller can walk through.
   let r;
   try { r = await request('POST', '/api/cards', body); }
   catch (e) {
     if (!(e.status === 409 && e.body && e.body.error)) die(e.message);
-    die('card create refused: ' +
-      e.body.error.replace(/\s*Create it with an explicit free id, or give /, ' Give '));
+    die('card create refused: ' + e.body.error);
   }
   console.log('created ' + r.card.id + ' in ' + r.card.column);
 }

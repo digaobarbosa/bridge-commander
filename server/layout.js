@@ -20,6 +20,16 @@ const crypto = require('node:crypto');
 const ID_RE = /^[\w][\w.-]*$/;
 /** isId(s) -> true when `s` is a legal board id. */
 function isId(s) { return typeof s === 'string' && ID_RE.test(s); }
+/**
+ * slugBase(name) -> the ASCII id a display name derives to ('' when it has no
+ * ASCII). Emoji and other non-ASCII are stripped, so derived ids (and the
+ * session names built from them) never reach tmux. The server derives a
+ * lieutenant id from it; `bc-axi` does too, when it needs the id before any
+ * server has answered (the charter file is named after it).
+ */
+function slugBase(s) {
+  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+}
 
 // ---------- the state dir ----------
 // Canonical state-dir names + one-shot rename migrations from the pre-rename
@@ -156,7 +166,7 @@ function workerWindow(cardId) {
 const LIEUTENANT_WINDOW = 'lt';
 
 module.exports = {
-  ID_RE, isId,
+  ID_RE, isId, slugBase,
   STATE_DIR_NAME, LEGACY_STATE_DIR_NAME,
   migrateStateDir, resolveStateDir, migrateHomeStateDir, isWorkspace,
   ONBOARDING_STEPS,

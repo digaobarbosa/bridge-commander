@@ -408,8 +408,8 @@ test('a duplicate id is REFUSED, visibly — no suffix, no retry, no next free n
     let r = await s.api('POST', '/api/cards', { title: 'Colliding', owner: 'monica' });
     assert.strictEqual(r.status, 409);
     assert.match(r.body.error, /card exists: MON-2/);
-    assert.match(r.body.error, /explicit free id/, 'the message says what a human can do about it');
-    assert.match(r.body.error, /unused prefix/);
+    assert.match(r.body.error, /Give Monica an unused prefix in its settings\./,
+      'the message names the fix every caller has, and the one that unwedges the mint');
 
     // refused means refused: nothing was created, and the counter did not move
     assert.strictEqual((await s.api('GET', '/api/cards/MON-2')).body.title, 'Squatter');

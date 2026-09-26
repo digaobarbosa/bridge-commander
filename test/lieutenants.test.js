@@ -57,6 +57,13 @@ test('emoji-safe naming: id is the ASCII slug, display name keeps the emoji, ses
     // eslint-disable-next-line no-control-regex
     assert.match(r.body.lieutenant.ref.session, /^[\x21-\x7e]+$/, 'session name is pure ASCII');
 
+    // a refused avatar is refused BEFORE the spawn: no session is left behind
+    // with no lieutenant to own it
+    r = await s.api('POST', '/api/lieutenants', { name: 'Bad avatar', spawn: true, harness: 'fake', avatar: 64 });
+    assert.strictEqual(r.status, 400);
+    assert.match(r.body.error, /avatar must be an integer 0-63/);
+    assert.ok(!fs.readdirSync(fdir).some((f) => f.includes('bad-avatar')), 'no fake session was spawned');
+
     // pure-emoji names still yield usable, unique ids (fallback 'lt', deduped)
     r = await s.api('POST', '/api/lieutenants', { name: '👩‍🦰' });
     assert.strictEqual(r.status, 200);
@@ -242,9 +249,14 @@ test('cli: lieutenant create --avatar and lieutenant patch', async () => {
     let lt = (await s.api('GET', '/api/lieutenants')).body.lieutenants.find((l) => l.id === 'avi');
     assert.strictEqual(lt.avatar, 5);
 
+    // the range is the server's: the CLI forwards the number and prints the refusal
     r = await runCli(['lieutenant', 'create', '--name', 'Bad', '--id', 'bad', '--avatar', '64', ...args]);
     assert.notStrictEqual(r.code, 0);
-    assert.match(r.stderr, /--avatar must be an integer 0-63/);
+    assert.match(r.stderr, /avatar must be an integer 0-63/);
+    r = await runCli(['lieutenant', 'create', '--name', 'Bad', '--id', 'bad', '--avatar', 'blue', ...args]);
+    assert.notStrictEqual(r.code, 0);
+    assert.match(r.stderr, /avatar must be an integer 0-63/);
+    assert.ok(!(await s.api('GET', '/api/lieutenants')).body.lieutenants.some((l) => l.id === 'bad'));
 
     r = await runCli(['lieutenant', 'patch', 'avi', '--avatar', '9', '--color', '#abcdef', ...args]);
     assert.strictEqual(r.code, 0, r.stderr);
@@ -578,10 +590,12 @@ test('live=1 adds the next card id, the live-card count, the charter path and th
     },
   });
   try {
-    // the plain read is untouched — no probe, no extra fields
+    // the plain read runs no probe; it carries only `next`, which costs nothing
+    // and saves every client the arithmetic (bc-axi lieutenant list prints it)
     const plain = (await s.api('GET', '/api/lieutenants')).body.lieutenants;
     assert.deepStrictEqual(plain.map((l) => l.id), ['ada', 'grace', 'hedy']);
-    for (const l of plain) assert.ok(!('session' in l) && !('next' in l), l.id + ' carries no probe');
+    for (const l of plain) assert.ok(!('session' in l) && !('cards' in l), l.id + ' carries no probe');
+    assert.deepStrictEqual(plain.map((l) => l.next), ['ADA-7', 'GRC-1', 'HED-42']);
 
     const r = await s.api('GET', '/api/lieutenants?live=1');
     assert.strictEqual(r.status, 200);
