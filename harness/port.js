@@ -1,106 +1,26 @@
 'use strict';
-// harness port — the multi-harness contract (docs/api/overview.md, "harness port").
-//
-// The server speaks ONLY this port. An implementation is a module exposing
-// exactly these seven verbs (all may be async):
+// harness port — the multi-harness contract. The server speaks ONLY this port.
+// An implementation exposes these seven verbs (all may be async):
 //
 //   spawn(cwd, prompt, opts?) -> HarnessRef   birth an agent session
 //   send(ref, text)                           type a message into a session (verified submit)
-//   alive(ref) -> bool                        liveness
-//   resumable(ref, opts?) -> bool             would resume(ref) restore memory? (introspection only)
-//   resume(ref) -> HarnessRef                 reincarnate a dead session with memory when possible
-//   kill(ref)                                 end a session for good (idempotent; dead ref is a no-op)
-//   onTurnEnd(ref, hook) -> unsubscribe()     turn-boundary detection
+//   alive(ref) -> bool                        liveness; throws when it cannot tell
+//   resumable(ref, opts?) -> bool             would resume(ref, opts) restore memory?
+//   resume(ref, opts?) -> HarnessRef          reincarnate a dead session, with memory when possible
+//   kill(ref)                                 end a session for good (idempotent)
+//   onTurnEnd(ref, hook, opts?) -> unsubscribe()   turn-boundary detection
 //
-// A HarnessRef is a plain, JSON-serializable object; `harness` names the
-// implementation and the rest is that implementation's opaque address:
-//   { harness: 'claude', session: 'bc-<id>', window?: 'w-<id>', cwd: '/abs/path', resumeId?: '<uuid>' }
-// `window` marks a window-granular ref: the agent lives in a named window of
-// a shared session (workers inside their lieutenant's session) instead of
-// owning the whole session.
+// opts is one bag for spawn, resumable, resume and onTurnEnd: stateDir,
+// callbackUrl, extraArgs, allowRoot, installHooks, session, window.
 //
-// Adding a harness = implementing the seven verbs and registering it here
-// (or shipping it as a builtin module). Nothing else.
+// A HarnessRef is plain JSON: { harness, session, window?, cwd, resumeId? },
+// with window and resumeId either absent or strings.
 //
-// All seven must EXIST; one that cannot be honored must THROW with the reason
-// rather than pretend — a caller that learns why beats one watching text vanish
-// into a verb that quietly did nothing.
-//
-// OPTIONAL capability verbs: beyond the seven REQUIRED verbs a harness MAY
-// expose extra verbs for features not every harness can honor. They are
-// deliberately NOT validated here — adding one to VERBS would force every
-// harness (the fake included) to implement it and break validation. The
-// server capability-checks at the call site (`typeof impl.openPane ===
-// 'function'`) and degrades gracefully when the verb is absent. Current
-// optional verbs — pane viewing (the UI's 👁 peek):
-//   openPane(ref, { onFrame, intervalMs?, lines? }) -> { close() }
-//       deliver the pane's CURRENT RENDERED SCREEN as successive frames:
-//       onFrame(frameString) fires whenever the content changes (identical
-//       frames are skipped); a frame MAY carry ANSI SGR escapes. close()
-//       stops delivery and releases resources. All async-safe.
-//   paneSnapshot(ref, { lines? }) -> Promise<string>
-//       one-shot capture — the initial paint / non-streaming fallback.
-//   paneInput(ref, { text? | key? }) -> Promise<void>
-//       forward RAW input to the pane: `text` typed literally (multi-line
-//       rides a bracketed paste), `key` ONE tmux key name ('Enter', 'BSpace',
-//       'Up', 'BTab', 'C-c', …). Exactly one of the two; anything else throws,
-//       as does an unusable key name, a pane that is gone, or text past
-//       PANE_INPUT_MAX. Validate with the SHARED validatePaneInput() below —
-//       a harness with its own copy of the rules is a harness that drifts from
-//       them. Deliberately NOT
-//       send(): that one types, settles, Enters and retries until the composer
-//       verifies empty — right for delivering a brief, wrong for a keystroke.
-//       A harness MAY offer paneInput while send() throws: "no composer for a
-//       brief" and "no way to press a key" are different claims.
-//       Implementations that also stream SHOULD speed their feed up briefly
-//       after input, so the echo is not stuck behind the poll.
-// — migration of a session-granular ref to window granularity (the lieutenant
-// whose session it turned out to cohabit with its worker windows):
-//   adoptWindow(ref, window, taken?) -> Promise<HarnessRef|null>
-//       make the SAME running agent addressable as `session:window` without
-//       restarting it. `taken` names windows that belong to someone else and
-//       must never be adopted. null = the agent's window cannot be identified;
-//       the caller keeps the old ref. Idempotent: a ref that already carries a
-//       window comes back unchanged.
-// — and slash commands + session status (the UI composer's "/" and the
-// context bars; agent-status.js holds the shared machinery):
-//   commands(ref?) -> [{ name, description, args? }]
-//       the slash commands this harness answers (/status /compact /help
-//       where applicable; claude adds /autocompact and /output-style — verified
-//       against the binary, the public docs lag behind).
-//       `ref`, when given, scopes the answer to that session — claude's style
-//       list includes the ones installed in the session's own cwd.
-//       `args` is OPTIONAL metadata: [{ value, description }], the values this
-//       command accepts as its single argument, for a composer that wants to
-//       keep completing AFTER the command name (ui/js/slash.js). A harness that
-//       does not send it behaves exactly as before — the picker closes on the
-//       space, as it always did — so this is additive for every existing
-//       implementation. Everything a caller types after the command name is ONE
-//       argument: a `value` may contain spaces, and runCommand must not tokenize
-//       it. The server passes the field through untouched.
-//   runCommand(ref, command, opts?) -> Promise<string>
-//       execute one command line against the session (first token names the
-//       command; arguments ride along); resolves to the reply text. opts is
-//       the same bag spawn/resume take — `stateDir` is the one field that
-//       matters here, since /status reads from it.
-//       Pass-through commands (/compact, claude's /autocompact) type the
-//       LITERAL line through the verified-submit send path — the harness's
-//       own implementation runs in-session; /status formats status(); /help
-//       renders commands(). Unknown names throw — and so does a command whose
-//       argument is missing or unrecognised, BEFORE it does anything: claude's
-//       /output-style writes a setting to disk, and a typo must not sit there
-//       waiting to surprise the next conversation. A command that changes
-//       something the session only reads at STARTUP says WHEN it applies in
-//       its reply (/output-style: the next time this session starts) without
-//       naming a command to get there, which a harness cannot know exists —
-//       no verb here restarts a session on the caller's behalf.
-//   status(ref, opts?) -> Promise<{ model, contextUsed, contextWindow, rateLimits? } | null>
-//       model + context usage read from the files the harness already
-//       writes (transcript / rollout log); null — never a throw — when
-//       nothing is readable. opts.stateDir points at the board's harness
-//       state (codex resolves its thread-id from the session-id file there);
-//       omitting it falls back to whatever the ref alone can answer. rateLimits only where the harness persists
-//       them (codex); claude omits the field.
+// A verb a harness cannot honor THROWS with the reason, never silently
+// succeeds. The optional capability verbs (pane viewing, slash commands,
+// status, window adoption) are deliberately NOT validated here — the contract
+// for them lives in ONE place, harness/README.md, and the inventory in
+// docs/api/overview.md.
 
 const VERBS = ['spawn', 'send', 'alive', 'resumable', 'resume', 'kill', 'onTurnEnd'];
 

@@ -24,6 +24,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+const { STATE_DIR_NAME, findWorkspace, toEpochSecs, stateKey, readSessionId } = require('./util.js');
+
 const TAIL_BYTES = 256 * 1024;
 
 // tailRead — the last maxBytes of a file, decoded; null when missing/unreadable.
@@ -81,19 +83,6 @@ function claudeContextWindow(model) {
 // account rate limits, and the model display name. Lieutenants run with cwd =
 // workspace root, so the sidecar exists for them; workers in worktree cwds have
 // none and fall through to the transcript+map path below (accepted).
-const STATE_DIR_NAME = '.bridge-commander';
-function findBridgeWorkspace(startDir) {
-  if (!startDir) return null;
-  let dir = path.resolve(startDir);
-  for (;;) {
-    try {
-      if (fs.statSync(path.join(dir, STATE_DIR_NAME)).isDirectory()) return dir;
-    } catch { /* keep walking up */ }
-    const parent = path.dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
-  }
-}
 
 // Map the statusline payload's rate_limits (five_hour/seven_day, each
 // {used_percentage, resets_at}) onto the shared status rateLimits shape
@@ -101,22 +90,11 @@ function findBridgeWorkspace(startDir) {
 // so formatStatus labels them 5h / 1w just like codex.
 function claudeSidecarRateLimits(rl) {
   if (!rl || typeof rl !== 'object') return null;
-  const toEpochSecs = (v) => {
-    if (v == null) return undefined;
-    if (typeof v === 'number' && Number.isFinite(v)) return v > 1e11 ? Math.floor(v / 1000) : Math.floor(v);
-    if (typeof v === 'string' && v.trim() !== '') {
-      const n = Number(v);
-      if (Number.isFinite(n)) return n > 1e11 ? Math.floor(n / 1000) : Math.floor(n);
-      const p = Date.parse(v);
-      if (!Number.isNaN(p)) return Math.floor(p / 1000);
-    }
-    return undefined;
-  };
   const pick = (w, windowMinutes) => {
     if (!w || typeof w !== 'object' || w.used_percentage == null) return undefined;
     const out = { usedPercent: Number(w.used_percentage), windowMinutes };
     const r = toEpochSecs(w.resets_at);
-    if (r !== undefined) out.resetsAt = r;
+    if (r !== null) out.resetsAt = r;
     return out;
   };
   const out = {};
@@ -134,7 +112,7 @@ function claudeSidecarRateLimits(rl) {
 function claudeSidecarStatus(ref, opts = {}) {
   const dir = opts.sidecarDir
     || (() => {
-      const ws = opts.workspace || findBridgeWorkspace(ref.cwd);
+      const ws = opts.workspace || findWorkspace(ref.cwd);
       return ws ? path.join(ws, STATE_DIR_NAME, 'statusline') : null;
     })();
   if (!dir) return null;
@@ -266,15 +244,8 @@ function codexRateLimits(rl) {
 // opts.stateDir comes from the caller that knows where harness state lives
 // (codex-tmux status()); without it only the ref can answer.
 function codexThreadId(ref, opts = {}) {
-  if (ref && ref.session && opts.stateDir) {
-    const key = ref.window ? ref.session + ':' + ref.window : ref.session;
-    try {
-      const rec = fs.readFileSync(path.join(opts.stateDir, key + '.session-id'), 'utf8').trim();
-      if (rec) return rec;
-    } catch {
-      // no recorded id — the ref's is all there is
-    }
-  }
+  const rec = ref && ref.session ? readSessionId(opts.stateDir, stateKey(ref.session, ref.window)) : null;
+  if (rec) return rec;
   return (ref && ref.resumeId) || null;
 }
 
@@ -329,6 +300,30 @@ const SLASH_COMMANDS = [
   { name: '/help', description: 'list the available commands' },
 ];
 
+/**
+ * runSlashCommand(ref, command, opts, h) -> reply text — the slash-command
+ * dispatch every harness shares. h: { key, commands, status, send, handlers,
+ * passthrough, noStatusHint }. /help renders commands(ref), /status formats
+ * status(), a handler emulates a command, a pass-through name types the
+ * LITERAL line into the session; anything else throws before doing anything.
+ */
+async function runSlashCommand(ref, command, opts, h) {
+  const line = String(command || '').trim();
+  const name = line.split(/\s+/)[0];
+  if (name === '/help') return helpText(h.commands(ref));
+  if (name === '/status') {
+    const st = await h.status(ref, opts);
+    if (!st) throw new Error('no status for ' + h.key + ' — ' + (h.noStatusHint || 'nothing readable yet'));
+    return formatStatus(st);
+  }
+  if (Object.prototype.hasOwnProperty.call(h.handlers || {}, name)) return h.handlers[name](ref, line, opts);
+  if ((h.passthrough || []).includes(name)) {
+    await h.send(ref, line); // verified submit; the harness's own command runs in-session
+    return '"' + line + '" submitted to ' + h.key + ' — the session runs it in-place';
+  }
+  throw new Error('unknown command ' + name + ' (see /help)');
+}
+
 // Replies render as markdown in the chat thread, where a single newline
 // collapses — blank-line separators keep each line its own paragraph.
 function helpText(cmds) {
@@ -375,7 +370,6 @@ module.exports = {
   tailRead,
   claudeProjectSlug,
   claudeContextWindow,
-  findBridgeWorkspace,
   claudeSidecarStatus,
   claudeStatus,
   codexRolloutFile,
@@ -384,4 +378,5 @@ module.exports = {
   SLASH_COMMANDS,
   helpText,
   formatStatus,
+  runSlashCommand,
 };

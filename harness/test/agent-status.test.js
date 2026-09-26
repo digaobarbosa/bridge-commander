@@ -9,7 +9,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   claudeProjectSlug, claudeContextWindow, claudeStatus,
-  claudeSidecarStatus, findBridgeWorkspace,
+  claudeSidecarStatus,
   codexRolloutFile, codexThreadId, codexStatus, formatStatus,
 } = require('../agent-status.js');
 
@@ -191,19 +191,6 @@ test('claudeSidecarStatus: bad JSON / missing window → null (falls through), n
     writeSidecar(ws, 'nowin', { session_id: 'nowin', cwd: ws, model: { id: 'claude-opus-4-8' } });
     assert.strictEqual(claudeSidecarStatus({ cwd: ws, resumeId: 'nowin' }), null);
     assert.strictEqual(claudeSidecarStatus({ cwd: ws, resumeId: 'absent' }), null);
-  } finally {
-    fs.rmSync(ws, { recursive: true, force: true });
-  }
-});
-
-test('findBridgeWorkspace: nearest .bridge-commander/ ancestor, else null', () => {
-  const ws = tmpdir('bc-find-ws-');
-  try {
-    fs.mkdirSync(path.join(ws, '.bridge-commander'), { recursive: true });
-    const deep = path.join(ws, 'x', 'y');
-    fs.mkdirSync(deep, { recursive: true });
-    assert.strictEqual(findBridgeWorkspace(deep), ws);
-    assert.strictEqual(findBridgeWorkspace('/'), null);
   } finally {
     fs.rmSync(ws, { recursive: true, force: true });
   }

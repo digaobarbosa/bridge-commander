@@ -26,7 +26,7 @@ test('onTurnEnd fires per turn, only after registration, and unsubscribes', asyn
   await fake.send(ref, 'm2');
   await tick();
   assert.strictEqual(events.length, 2);
-  assert.strictEqual(events[0].event, 'Stop');
+  assert.strictEqual(events[0].event, 'turn-end', 'the TurnEndEvent the real relays emit');
   assert.strictEqual(events[0].session, ref.session);
   unsub();
   await fake.send(ref, 'm3');
@@ -65,7 +65,7 @@ test('resume without matching memory starts fresh', async () => {
   fake.kill(ref);
   const ref2 = await fake.resume({ ...ref, resumeId: 'wrong-id' });
   assert.strictEqual(await fake.alive(ref2), true);
-  assert.notStrictEqual(ref2.resumeId, ref.resumeId);
+  assert.ok(!('resumeId' in ref2), 'no memory, no id: the next turn-end delivers it, as with a real harness');
   assert.deepStrictEqual(fake.transcript(ref2), []);
 });
 
@@ -177,4 +177,54 @@ test('adoptWindow re-keys the SAME live agent to session:window, and is idempote
   assert.strictEqual(await fake.alive(moved), true);
   assert.deepStrictEqual(fake.transcript(moved), ['charter'], 'memory follows the agent — never restarted');
   assert.deepStrictEqual(await fake.adoptWindow(moved, 'lt'), moved, 'idempotent');
+});
+
+// The fake reads the resume id the way the tmux adapters do — the relay's
+// record in stateDir first, the ref second — and records it the way the relay
+// does, so server code exercising resume-vs-relaunch sees the real rule.
+test('resumable/resume honour opts.stateDir: the recorded id wins over a stale ref', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-fake-sid-'));
+  try {
+    const ref = await fake.spawn('/tmp/x', 'p', { session: 'bc-sid', stateDir });
+    await tick();
+    assert.strictEqual(fs.readFileSync(path.join(stateDir, 'bc-sid.session-id'), 'utf8').trim(), ref.resumeId,
+      'the emitted turn-end was recorded like the relay records it');
+    fake.kill(ref);
+    const stale = { harness: 'fake', session: 'bc-sid', cwd: '/tmp/x' }; // e.g. a ref that lost its id
+    assert.strictEqual(await fake.resumable(stale), false, 'without stateDir only the ref can answer');
+    assert.strictEqual(await fake.resumable(stale, { stateDir }), true);
+    const back = await fake.resume(stale, { stateDir });
+    assert.strictEqual(back.resumeId, ref.resumeId);
+    assert.deepStrictEqual(fake.transcript(back), ['p'], 'memory came back');
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('BC_FAKE_TURNEND_POST=1 POSTs each turn end to opts.callbackUrl', async () => {
+  const http = require('node:http');
+  const got = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => { got.push(JSON.parse(body)); res.end('{}'); });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  process.env.BC_FAKE_TURNEND_POST = '1';
+  try {
+    const callbackUrl = 'http://127.0.0.1:' + server.address().port + '/api/turn-end';
+    const ref = await fake.spawn('/tmp/x', 'p', { session: 'bc-post', callbackUrl });
+    for (let i = 0; i < 50 && got.length < 1; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.strictEqual(got.length, 1);
+    assert.strictEqual(got[0].session, 'bc-post');
+    assert.strictEqual(got[0].session_id, ref.resumeId);
+    assert.strictEqual(got[0].event, 'turn-end');
+    assert.strictEqual(got[0].text, 'fake turn 1');
+  } finally {
+    delete process.env.BC_FAKE_TURNEND_POST;
+    server.close();
+  }
 });

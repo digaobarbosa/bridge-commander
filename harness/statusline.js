@@ -22,8 +22,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-
-const STATE_DIR_NAME = '.bridge-commander';
+const { STATE_DIR_NAME, findWorkspace, toEpochSecs } = require('./util.js');
 
 const C = {
   reset: '\x1b[0m',
@@ -33,21 +32,6 @@ const C = {
   cyan: '\x1b[36m',
   dim: '\x1b[2m',
 };
-
-// findWorkspace — nearest ancestor of startDir that contains a .bridge-commander/
-// directory; null when none is found (or startDir is empty).
-function findWorkspace(startDir) {
-  if (!startDir) return null;
-  let dir = path.resolve(startDir);
-  for (;;) {
-    try {
-      if (fs.statSync(path.join(dir, STATE_DIR_NAME)).isDirectory()) return dir;
-    } catch { /* not here — keep walking up */ }
-    const parent = path.dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
-  }
-}
 
 // writeSidecar — atomically tee the payload to its per-session sidecar. Returns
 // the file path written, or null when there is no session_id, no workspace, or
@@ -93,22 +77,6 @@ function pctColor(pct) {
 // fmtK — token count as a rounded `k` string (118213 → "118k", 1000000 → "1000k").
 function fmtK(n) {
   return Math.round((Number(n) || 0) / 1000) + 'k';
-}
-
-// toEpochSecs — coerce a rate-limit resets_at (epoch seconds, epoch millis, a
-// numeric string, or an ISO timestamp) to epoch SECONDS; null when unparseable.
-function toEpochSecs(v) {
-  if (v == null) return null;
-  if (typeof v === 'number' && Number.isFinite(v)) {
-    return v > 1e11 ? Math.floor(v / 1000) : Math.floor(v);
-  }
-  if (typeof v === 'string' && v.trim() !== '') {
-    const n = Number(v);
-    if (Number.isFinite(n)) return n > 1e11 ? Math.floor(n / 1000) : Math.floor(n);
-    const p = Date.parse(v);
-    if (!Number.isNaN(p)) return Math.floor(p / 1000);
-  }
-  return null;
 }
 
 // fmtEta — seconds until resetsAt in compact form: 2d4h / 3h12m / 45m. Empty
@@ -184,12 +152,10 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
-  findWorkspace,
   writeSidecar,
   bar,
   pctColor,
   fmtK,
-  toEpochSecs,
   fmtEta,
   render,
   STATE_DIR_NAME,

@@ -234,6 +234,14 @@ const TRUST_YES_SELECTED = TRUST_NO_PRESELECTED
   .replace(' ❯ No, exit', '   No, exit')
   .replace('   Yes, I trust this folder', ' ❯ Yes, I trust this folder');
 
+test('the decline signature finds a cursor on "No" and nothing else', () => {
+  assert.ok(SETTLE.trustRe.test(TRUST_NO_PRESELECTED));
+  assert.ok(SETTLE.declineRe.test(TRUST_NO_PRESELECTED));
+  for (const [name, screen] of Object.entries({ TRUST_YES_SELECTED, RESUME_PICKER, READY })) {
+    assert.ok(!SETTLE.declineRe.test(screen), name + ' must be answered with Enter, not walked');
+  }
+});
+
 test('a trust screen with "No, exit" preselected is walked to Yes before Enter', async () => {
   const claude = require(path.join(__dirname, '..', 'claude-tmux.js'));
   const { mockTmux } = require('./tmux-mock.js');
@@ -252,4 +260,32 @@ test('a trust screen with "No, exit" preselected is walked to Yes before Enter',
     m.restore();
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------- codex ----------
+// The strings below are pinned against the codex 0.155.1 binary (`strings`),
+// not recalled: the login picker, the update modal, and a resume of a thread
+// codex has no rollout for.
+const codexSettle = require(path.join(__dirname, '..', 'codex-tmux.js')).SETTLE;
+const CODEX_READY = '\n>_ OpenAI Codex (v0.155.1)\n\n  YOLO mode\n\n› Ask Codex to do anything\n';
+const CODEX_FATAL = {
+  missing: 'zsh: command not found: codex',
+  login: 'Sign in with ChatGPT to use Codex as part of your paid plan\n  2. Provide your own API key',
+  update: '✨ Update available! 0.155.1 -> 0.156.0\n\n› 1. Update now (runs `brew upgrade codex`)\n  2. Skip\n  3. Skip until next version',
+  resume: 'Error: No saved session found with ID 019f49a7-81f4-7ad3-822d-3acf8cf81ed6',
+};
+
+test('codex: the screens that can never come up are fatal', () => {
+  for (const [name, screen] of Object.entries(CODEX_FATAL)) {
+    assert.ok(codexSettle.fatalRe.test(screen), name + ' must end the wait at once');
+  }
+});
+
+test('codex: the ready UI and the trust prompt are not fatal', () => {
+  assert.ok(codexSettle.readyRe.test(CODEX_READY));
+  assert.ok(!codexSettle.fatalRe.test(CODEX_READY));
+  const trust = '> You are in /tmp/x\n\n  Do you trust the contents of this directory?\n\n› 1. Yes, continue\n  2. No, quit';
+  assert.ok(codexSettle.trustRe.test(trust));
+  assert.ok(!codexSettle.fatalRe.test(trust));
+  assert.ok(!codexSettle.declineRe, 'codex preselects Yes; Enter answers its trust prompt');
 });

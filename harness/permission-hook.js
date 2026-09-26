@@ -2,9 +2,10 @@
 'use strict';
 // permission-hook.js — the Claude Code PermissionRequest-hook relay.
 //
-// Registered by claude-tmux.js installHooks next to the Stop hook. Claude Code
-// runs it when it is about to show a permission dialog, with the request as a
-// JSON payload on stdin ({ session_id, cwd, tool_name, tool_input, ... }).
+// Registered by claude-settings.js installHooks next to the Stop hook; installed
+// settings files name THIS path, so it stays. Claude Code runs it when it is
+// about to show a permission dialog, with the request as a JSON payload on
+// stdin ({ session_id, cwd, tool_name, tool_input, ... }).
 //
 // It POSTs the request to the board and WAITS: the server holds the response
 // open until the captain approves or denies on the board. The answer becomes
@@ -15,41 +16,13 @@
 //
 // Usage (as a hook command): node permission-hook.js <stateDir> <session> <url>
 
-const { execFileSync } = require('node:child_process');
 const http = require('node:http');
+const { tmuxSession, readStdin } = require('./util.js');
 
 // Just under the hook's own 3600s timeout, so the request gives up (and claude
 // shows its dialog) before claude kills the hook.
 const FETCH_TIMEOUT_MS = 3550 * 1000;
 const DEFAULT_DENY = 'Denied by the captain on the board';
-
-// Same as turnend-hook.js: the pane's tmux session lets the server attribute
-// the request when the state key alone does not.
-function tmuxSession() {
-  if (!process.env.TMUX) return '';
-  try {
-    return execFileSync('tmux', ['display-message', '-p', '#S'], { encoding: 'utf8' }).trim();
-  } catch {
-    return '';
-  }
-}
-
-function readStdin() {
-  return new Promise((resolve) => {
-    let data = '';
-    const timer = setTimeout(() => resolve(data), 3000);
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (c) => (data += c));
-    process.stdin.on('end', () => {
-      clearTimeout(timer);
-      resolve(data);
-    });
-    process.stdin.on('error', () => {
-      clearTimeout(timer);
-      resolve(data);
-    });
-  });
-}
 
 // postJson(url, body) -> parsed JSON reply, or null. Not fetch: undici drops a
 // request whose response headers take over 300s, and the captain may take longer.

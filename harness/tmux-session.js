@@ -1,14 +1,11 @@
 'use strict';
-// tmux-session — session/window/pane plumbing SHARED by the tmux-TUI harness
-// adapters (claude-tmux.js, codex-tmux.js). Everything here is harness-agnostic:
-// pane lifecycle, naming/validation, state-dir resolution, the launch-and-settle
-// skeleton (the adapter supplies its trust-prompt and UI-ready signatures), the
-// turn-end file tail, and the optional pane-viewing verbs. An adapter differs
-// only in its launch line, screen signatures, resume semantics, and turn-end
-// relay wiring.
+// tmux-session — session/window/pane plumbing under tmux-adapter.js. Every
+// piece here is harness-agnostic: pane lifecycle, naming/validation, state-dir
+// resolution, the launch-and-settle loop (the profile supplies its screen
+// signatures), the turn-end file tail, and the pane-viewing verbs.
 //
-// Extracted verbatim from claude-tmux.js (the reference implementation) — the
-// comments below carry that provenance where behavior was learned the hard way.
+// Learned on claude-tmux.js first — the comments below carry that provenance
+// where behavior was learned the hard way.
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -16,6 +13,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const t = require('./tmux.js');
 const { validatePaneInput } = require('./port.js');
+const { shellQuote, stateKey, readSessionId } = require('./util.js');
 
 // A pane sitting back at a bare shell means the agent process exited.
 const SHELLS = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh']);
@@ -90,21 +88,8 @@ function recordedSpawnArgs(stateDir, key) {
   return { args: [], allowRoot: false, permissionMode: null };
 }
 
-function shellQuote(s) {
-  return `'` + String(s).replace(/'/g, `'\\''`) + `'`;
-}
-
 function newSessionName() {
   return 'bc-' + crypto.randomBytes(3).toString('hex');
-}
-
-// stateKey — the per-agent key for prompt/turnend/session-id state files and
-// the turn-end relay's `session` argument. Window-granular agents share their
-// tmux session name with the lieutenant (and sibling workers), so the bare
-// session would collide; the `session:window` form is unique — tmux session
-// names can never contain ':'.
-function stateKey(session, window) {
-  return window ? `${session}:${window}` : session;
 }
 
 // paneTarget — exact-match tmux target for an agent's pane.
@@ -229,6 +214,8 @@ async function adoptWindow(ref, window, taken = []) {
 //   sig.trustRe — matches the trust screen (checked FIRST: a trust screen may
 //                 contain composer-like glyphs, so it must win over readyRe)
 //   sig.readyRe — matches signatures only the main UI renders
+//   sig.declineRe — optional: the menu cursor sits on a "No", so Down goes
+//                 before Enter
 //   sig.label   — the agent name for error messages ('claude', 'codex')
 //
 // Both signatures are tested against the TAIL of the pane — the current
@@ -240,7 +227,6 @@ async function adoptWindow(ref, window, taken = []) {
 // (composer + footer are the screen's last rows), so the tail is behavior-
 // preserving there.
 const SETTLE_TAIL_LINES = 15;
-const NO_PRESELECTED_RE = /❯\s*(\d+\.\s*)?No\b/;
 
 function paneTail(pane) {
   return pane.replace(/\s+$/, '').split('\n').slice(-SETTLE_TAIL_LINES).join('\n');
@@ -252,7 +238,8 @@ async function launchAndSettle(target, launchCmd, sig) {
   await t.sendKey(target, 'Enter');
 
   // Screens that stand between the launch and the UI, each one a menu whose
-  // PRESELECTED option is the one we want, so Enter answers all of them. They
+  // wanted option is preselected (or one Down away, see declineRe), so Enter
+  // answers all of them. They
   // are checked before readyRe because a dialog can carry composer-like glyphs
   // and would otherwise be mistaken for the main UI.
   const menus = [sig.trustRe, sig.resumeRe].filter(Boolean);
@@ -276,9 +263,9 @@ async function launchAndSettle(target, launchCmd, sig) {
     }
     if (SHELLS.has(cmd)) continue; // agent not up yet (or it already exited — captured by timeout)
     if (menus.some((re) => re.test(tail))) {
-      // claude 2.1.28x preselects "No, exit" on the trust screen, where Enter
-      // quits claude. Walk the cursor off a No before answering.
-      if (NO_PRESELECTED_RE.test(tail)) {
+      // A menu can preselect a No (claude 2.1.282's trust screen: Enter there
+      // quits the agent). Walk the cursor off it before answering.
+      if (sig.declineRe && sig.declineRe.test(tail)) {
         await t.sendKey(target, 'Down');
         await t.sleep(300);
         continue;
@@ -538,6 +525,7 @@ module.exports = {
   shellQuote,
   newSessionName,
   stateKey,
+  readSessionId,
   paneTarget,
   paneCommand,
   hasSession,

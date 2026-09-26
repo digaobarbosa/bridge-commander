@@ -157,10 +157,10 @@ actor strings are honor-system. The network boundary is the auth boundary.
 | `harness.spawn` | `cwd, prompt, opts → HarnessRef` | ⚙️ | birth an agent in a named WINDOW of a session (`opts`: session name, window name — non-numeric: `lt` for the lieutenant, `w-<card-id>` for its workers, which share that session —, state dir, turn-end callback URL, hook install mode); no window name = the agent owns the whole session |
 | `harness.send` | `ref, text` | ⚙️ | type into a session (the wake half of delivery) |
 | `harness.alive` | `ref → bool` | ⚙️ | liveness check for supervision. `false` means the session is provably GONE, never "I could not look" — a harness that cannot read its own backend THROWS, like any other verb it cannot honor. The board drops worker records on this answer, so a backend hiccup passing for absence would strand a live session nothing points at |
-| `harness.resumable` | `ref → bool` | ⚙️ | introspection: would `resume` restore memory? The server picks resume vs relaunch-with-charter on it |
+| `harness.resumable` | `ref, opts → bool` | ⚙️ | introspection: would `resume` restore memory? The server picks resume vs relaunch-with-charter on it |
 | `harness.resume` | `ref, opts → HarnessRef` | ⚙️ | reincarnate a dead session with memory when possible |
 | `harness.kill` | `ref` | ⚙️ | end a session for good (idempotent): the handoff out of Working, the boot sweep, merged-PR cleanup, card archive, lieutenant.retire |
-| `harness.onTurnEnd` | `ref, hook` | embedders | turn-boundary detection for port consumers; the SERVER's channel is the spawn-time callback URL — a Stop hook in the session POSTs each turn end (with its tmux session for exact attribution) |
+| `harness.onTurnEnd` | `ref, hook, opts → unsubscribe` | embedders | turn-boundary detection for port consumers; the SERVER's channel is the spawn-time callback URL — a Stop hook in the session POSTs each turn end (with its tmux session for exact attribution) |
 
 The server speaks ONLY this port. Builtins: `claude`, `codex` (OpenAI Codex CLI) and a
 file-backed `fake` for tests; adding a harness is implementing these seven verbs, nothing
