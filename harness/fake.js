@@ -2,7 +2,10 @@
 // fake — in-memory harness implementing the same seven verbs, for unit tests
 // of server code. No tmux, no claude, no filesystem.
 //
-// Refs look like the real thing: { harness: 'fake', session: 'bc-<id>', window?, cwd, resumeId }.
+// Refs look like the real thing: { harness: 'fake', session: 'bc-<id>', window?, cwd, resumeId? }
+// — the same shape rule as the tmux adapters (tmux-adapter.js makeRef): the fake
+// knows its id at birth like claude, and a resume without memory comes back
+// WITHOUT one (the next turn-end delivers it, as with a real harness).
 // A window-granular ref (opts.window at spawn — workers as windows in their
 // lieutenant's session) is keyed as `session:window` everywhere the plain
 // session name would be: the in-memory map, marker files, sends log, and the
@@ -14,13 +17,20 @@
 //   send    — throws on a dead session; records the text; emits a turn-end.
 //   alive   — session exists and is not killed.
 //   resumable — would resume restore memory? true iff this process holds the
-//             session's transcript under a matching resumeId.
-//   resume  — revives a dead session; transcript (memory) survives iff the
-//             resumeId matches the recorded one.
+//             session's transcript under the resume id — read the way the real
+//             harnesses read it: opts.stateDir's <key>.session-id, then the ref.
+//   resume  — revives a dead session; transcript (memory) survives iff that id
+//             matches. No match: a fresh session, and a ref without resumeId.
 //   kill    — ends a session for good (idempotent); in file-backed mode also
 //             removes the marker, so cross-process alive() flips false.
 //   onTurnEnd — hooks fire once per emitted turn, in registration order,
 //             only for events after registration. Returns unsubscribe().
+//             The event is the TurnEndEvent the real relays emit
+//             (turnend-relay.js); with opts.stateDir at spawn/resume it is also
+//             recorded there, like the relay does. BC_FAKE_TURNEND_POST=1 also
+//             POSTs it to opts.callbackUrl — opt-in, because the server passes
+//             its callback on every spawn and most server tests do not expect
+//             the fake's turn ends to arrive at /api/turn-end.
 //
 // Test helpers (not part of the port contract): transcript(ref), reset().
 //
@@ -46,10 +56,12 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { SLASH_COMMANDS, helpText, formatStatus } = require('./agent-status.js');
+const { SLASH_COMMANDS, runSlashCommand } = require('./agent-status.js');
 const { validatePaneInput } = require('./port.js');
+const { readSessionId } = require('./util.js');
+const relay = require('./turnend-relay.js');
 
-const sessions = new Map(); // key (session or session:window) -> { alive, cwd, resumeId, transcript, hooks, turns }
+const sessions = new Map(); // key (session or session:window) -> { alive, cwd, resumeId, transcript, hooks, turns, stateDir, callbackUrl }
 
 function keyOf(session, window) {
   return window ? session + ':' + window : session;
@@ -124,11 +136,16 @@ function emitTurnEnd(name) {
   const event = {
     ts: new Date().toISOString(),
     session: name,
-    event: 'Stop',
+    harness: 'fake',
+    event: 'turn-end',
     session_id: s.resumeId,
     cwd: s.cwd,
+    tmux_session: '',
+    text: 'fake turn ' + s.turns,
     turn: s.turns,
   };
+  if (s.stateDir) relay.record(s.stateDir, name, event);
+  if (s.callbackUrl && process.env.BC_FAKE_TURNEND_POST) relay.post(s.callbackUrl, event);
   const hooks = [...s.hooks];
   setImmediate(() => {
     for (const h of hooks) {
@@ -178,6 +195,8 @@ async function spawn(cwd, prompt, opts = {}) {
     transcript: [prompt],
     hooks: [],
     turns: 0,
+    stateDir: opts.stateDir || null,
+    callbackUrl: opts.callbackUrl || null,
   });
   const marker = markerFile(key);
   if (marker) {
@@ -235,32 +254,45 @@ async function alive(ref) {
   return keys.some(live);
 }
 
-// resumable — introspection only: memory survives a resume iff this process
-// still holds the session's transcript under the same resumeId.
-async function resumable(ref) {
-  const s = sessions.get(refKey(ref));
-  return !!(s && ref.resumeId && ref.resumeId === s.resumeId);
+// The resume id, read the way the tmux adapters read it: the relay's record
+// in opts.stateDir first, the ref second.
+function resumeIdOf(ref, opts) {
+  return readSessionId(opts.stateDir, refKey(ref)) || ref.resumeId || undefined;
 }
 
-async function resume(ref) {
+// resumable — introspection only: memory survives iff this process still
+// holds the session's transcript under that id.
+async function resumable(ref, opts = {}) {
+  const s = sessions.get(refKey(ref));
+  const id = resumeIdOf(ref, opts);
+  return !!(s && id && id === s.resumeId);
+}
+
+async function resume(ref, opts = {}) {
   const key = refKey(ref);
   const s = sessions.get(key);
   if (s && s.alive) return { ...ref };
-  const out = { harness: 'fake', session: ref.session, cwd: ref.cwd, resumeId: ref.resumeId };
+  const id = resumeIdOf(ref, opts);
+  const out = { harness: 'fake', session: ref.session, cwd: ref.cwd };
   if (ref.window) out.window = ref.window;
-  if (s && ref.resumeId === s.resumeId) {
+  if (s && id && id === s.resumeId) {
     s.alive = true; // memory (transcript) preserved
-    return { ...out, cwd: s.cwd };
+    if (opts.stateDir) s.stateDir = opts.stateDir;
+    if (opts.callbackUrl) s.callbackUrl = opts.callbackUrl;
+    return { ...out, cwd: s.cwd, resumeId: id };
   }
-  // No matching memory: fresh session under the same name (transcript lost).
-  out.resumeId = crypto.randomUUID();
+  // No matching memory: a fresh session under the same name. It has an id of
+  // its own, but — like a real harness — the ref learns it from a turn-end,
+  // not from resume.
   sessions.set(key, {
     alive: true,
     cwd: ref.cwd,
-    resumeId: out.resumeId,
+    resumeId: crypto.randomUUID(),
     transcript: [],
     hooks: s ? s.hooks : [],
     turns: 0,
+    stateDir: opts.stateDir || (s && s.stateDir) || null,
+    callbackUrl: opts.callbackUrl || (s && s.callbackUrl) || null,
   });
   return out;
 }
@@ -384,20 +416,11 @@ async function status(ref) {
   return marker && fs.existsSync(marker) ? { ...FAKE_STATUS } : null;
 }
 
-async function runCommand(ref, command) {
-  const line = String(command || '').trim();
-  const name = line.split(/\s+/)[0];
-  if (name === '/help') return helpText(commands());
-  if (name === '/status') {
-    const st = await status(ref);
-    if (!st) throw new Error('fake: no status for ' + refKey(ref));
-    return formatStatus(st);
-  }
-  if (name === '/compact') {
-    await send(ref, line); // same path a real adapter uses: the send machinery
-    return '"' + line + '" submitted to ' + refKey(ref) + ' — the session runs it in-place';
-  }
-  throw new Error('fake: unknown command ' + name + ' (see /help)');
+function runCommand(ref, command, opts = {}) {
+  // The same dispatch the tmux adapters use, so the fake cannot drift from it.
+  return runSlashCommand(ref, command, opts, {
+    key: refKey(ref), commands, status, send, passthrough: ['/compact'],
+  });
 }
 
 // --- test helpers ---
