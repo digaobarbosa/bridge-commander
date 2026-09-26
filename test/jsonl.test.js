@@ -8,9 +8,10 @@ const os = require('node:os');
 const path = require('node:path');
 const { readJsonl, sealJsonl } = require('../server/jsonl.js');
 
+const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-jsonl-'));
+test.after(() => fs.rmSync(ROOT, { recursive: true, force: true }));
 function tmpFile(content) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-jsonl-'));
-  const f = path.join(dir, 'x.jsonl');
+  const f = path.join(fs.mkdtempSync(path.join(ROOT, 'f-')), 'x.jsonl');
   if (content !== undefined) fs.writeFileSync(f, content);
   return f;
 }

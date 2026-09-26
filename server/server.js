@@ -81,6 +81,7 @@ const { ONBOARDING_STEPS } = require(path.join(__dirname, 'firstrun.js'));
 const { proxyTts } = require(path.join(__dirname, 'ttsproxy.js'));
 const { proxyStt, proxySttUpgrade } = require(path.join(__dirname, 'sttproxy.js'));
 const { readJsonl, sealJsonl } = require(path.join(__dirname, 'jsonl.js'));
+const { createDelivery } = require(path.join(__dirname, 'delivery.js'));
 const { execFile, execFileSync } = require('child_process');
 
 // ---------- args ----------
@@ -836,11 +837,7 @@ async function retireLieutenant(id, body) {
   board.lieutenants = board.lieutenants.filter((l) => l.id !== id);
   if (board.line === id) board.line = null; // the line falls back rather than pointing at a ghost
   respawnAttempts.delete(id);
-  nudged.delete(id);
-  // A retired lieutenant can never drain again: its queue files go too.
-  try { fs.unlinkSync(queueFile(id)); } catch (e) { /* none */ }
-  try { fs.unlinkSync(ackFile(id)); } catch (e) { /* none */ }
-  try { fs.unlinkSync(drainedFile(id)); } catch (e) { /* none */ }
+  delivery.forget(id); // a retired lieutenant can never drain again: its queue goes too
   // …and so does its conversation, which used to leave with the record itself:
   // a conversation belongs to the instance that had it. The memory file does
   // NOT leave — lieutenants/<id>/ belongs to the ROLE, hand-written by the
@@ -854,99 +851,35 @@ async function retireLieutenant(id, body) {
   return { ok: true, event: ev, memory };
 }
 
-// ---------- delivery queues (per-lieutenant durable jsonl, GLOBAL seq) ----------
-// One QueueItem = one durable delivery to a lieutenant: captain message,
-// drag-order, or (future) worker event. At-least-once: drain serves everything
-// past the lieutenant's committed ack cursor and never advances it; only
-// POST /api/feed/ack does. Unacked items re-offer forever (dedupe by seq).
-// A second, delivery-neutral cursor rides alongside: <lt>.drained, the high-water
-// seq a drain has SERVED this lieutenant — it feeds the UI's seen/unseen split
-// and nothing else.
-// The durable queue is the write-ahead ground truth; the wake half (one
-// coalesced harness.send per append burst) rides behind it, below.
-function queueFile(lt) { return path.join(QUEUE_DIR, lt + '.jsonl'); }
-function ackFile(lt) { return path.join(QUEUE_DIR, lt + '.ack'); }
-function drainedFile(lt) { return path.join(QUEUE_DIR, lt + '.drained'); }
-function readQueue(lt) { return readJsonl(queueFile(lt)); }
-function queueIds() {
-  const ids = new Set(board.lieutenants.map((l) => l.id));
-  try {
-    for (const f of fs.readdirSync(QUEUE_DIR)) if (f.endsWith('.jsonl')) ids.add(f.slice(0, -6));
-  } catch (e) {}
-  return [...ids];
-}
-// The queue seq is global across every lieutenant's queue (QueueItems are
-// seq-ordered board-wide). Recovered from the files at boot: a torn line still
-// names its seq (it is the first key), and a cursor can sit past every readable
-// item, so both count — a reused seq at or below the ack cursor would be lost.
-let qseq = 0;
-for (const lt of queueIds()) {
-  const seen = (seq) => { if (seq > qseq) qseq = seq; };
-  const torn = (line) => { const m = /^\{"seq":(\d+)/.exec(line); if (m) seen(Number(m[1])); };
-  sealJsonl(queueFile(lt));
-  for (const it of readJsonl(queueFile(lt), torn)) seen(it.seq);
-  seen(readAck(lt));
-  seen(readDrained(lt));
-}
-function readAck(lt) {
-  try { return parseInt(fs.readFileSync(ackFile(lt), 'utf8'), 10) || 0; }
-  catch (e) { return 0; }
-}
-// The drained cursor is a durable high-water mark of the highest seq ever SERVED
-// to this lieutenant by a drain. It never gates delivery (only the ack cursor
-// does — unacked items re-offer forever); it exists purely so the UI can tell
-// "sitting unread in the queue" from "drained and being worked on": drain marks
-// the turn START, ack marks the turn END, and without this file the whole
-// drain→ack working window would still read as queued/unseen.
-function readDrained(lt) {
-  try { return parseInt(fs.readFileSync(drainedFile(lt), 'utf8'), 10) || 0; }
-  catch (e) { return 0; }
-}
-function advanceDrained(lt, seq) {
-  if (seq <= readDrained(lt)) return false;
-  fs.writeFileSync(drainedFile(lt), String(seq));
-  return true;
-}
-// The seen boundary: a seq at or below it has been drained OR acked. Acked
-// implies seen even when the drained file lags (an ack written with no drain
-// on record — e.g. cursors that predate the drained file).
-function seenCursor(lt) { return Math.max(readDrained(lt), readAck(lt)); }
-function queuePush(lt, rec) {
-  const item = Object.assign({ seq: ++qseq, ts: now(), lieutenant: lt }, rec);
-  fs.appendFileSync(queueFile(lt), JSON.stringify(item) + '\n');
-  scheduleWake(lt); // the queue write landed first (write-ahead); now the wake half
-  return item;
-}
-function pendingItems(lt) {
-  const ack = readAck(lt);
-  return readQueue(lt).filter((it) => it.seq > ack);
-}
-function drainItems(lt) {
-  const lts = lt ? [lt] : queueIds();
-  const out = [];
-  for (const id of lts) out.push(...pendingItems(id));
-  out.sort((a, b) => a.seq - b.seq);
-  return out;
-}
-// ack <seq>: commit the cursor of the lieutenant whose queue holds that seq.
-// Committing seq N acks every item <= N in that lieutenant's queue (items are
-// seq-ascending per queue). Acking an already-acked seq is a harmless no-op.
-// The seq MUST live in ownerId's own queue — refuse otherwise, so one
-// lieutenant can never commit (and thereby silently discard) another
-// lieutenant's pending items.
-function commitAck(seq, ownerId) {
-  for (const lt of queueIds()) {
-    const items = readQueue(lt);
-    if (!items.some((it) => it.seq === seq)) continue;
-    if (lt !== ownerId) {
-      return { error: 'seq ' + seq + ' is not in your queue (belongs to ' + lt + ')', code: 409 };
-    }
-    const cur = readAck(lt);
-    if (seq > cur) fs.writeFileSync(ackFile(lt), String(seq));
-    return { ok: true, lieutenant: lt, ack: Math.max(cur, seq) };
-  }
-  return { error: 'unknown seq: ' + seq, code: 400 };
-}
+// ---------- delivery (server/delivery.js: queues, cursors, wakes, owed) ----------
+// One QueueItem = one durable delivery to a lieutenant: a captain message, a
+// drag-order, a worker event. Write-ahead and at-least-once: the queue write
+// lands first, then ONE coalesced wake line goes to the lieutenant's live
+// session; only an ack removes. A failed wake is non-fatal — the turn-end hook
+// and the supervision sweep re-nudge — and the wake flag is in-memory by
+// design: after a restart the next append or turn-end simply re-nudges.
+const WAKE_TTL_MS = process.env.BC_WAKE_TTL_MS !== undefined
+  ? parseInt(process.env.BC_WAKE_TTL_MS, 10) : 90000;
+const delivery = createDelivery({
+  dir: QUEUE_DIR,
+  wakeTtlMs: WAKE_TTL_MS,
+  send(ltId, text) {
+    const lt = findLieutenant(ltId);
+    if (!lt || !isHarnessRef(lt.ref)) return false;
+    const ref = lt.ref;
+    return Promise.resolve()
+      .then(() => harnessFor(ref).send(ref, text))
+      .catch((e) => {
+        console.error(now() + ' wake failed for ' + ltId + ' (' + ref.harness + ':' + ref.session + '): '
+          + String((e && e.message) || e));
+        throw e;
+      });
+  },
+});
+// The names the rest of the server calls.
+function queuePush(lt, rec) { return delivery.push(lt, rec); }
+function pendingItems(lt) { return delivery.pending(lt); }
+function scheduleWake(lt) { delivery.nudge(lt); }
 
 // ---------- lieutenant main chat (append-only files; the FILE is truth) ----------
 // One jsonl per lieutenant, written exactly the way archive.jsonl and the
@@ -1011,41 +944,6 @@ function chatTail(ltId, n) { return chatPage(ltId, '', n); }
   if (carried) saveBoard(); // drops the key even when the file was already there
 }
 
-// ---------- wakes (the send half of delivery; the queue is truth) ----------
-// Every queue append for a lieutenant with a live ref sends ONE compact wake
-// line via harness.send. Coalesced: while items are pending-and-nudged, further
-// appends do not stack identical wakes; a drain (or ack) clears the flag, so a
-// new append after a drain nudges again. Wake failures are non-fatal — the
-// durable queue is the ground truth and the turn-end backstop re-nudges — but
-// they clear the flag so a later append can retry, and they are logged.
-// The flag is in-memory by design: after a server restart the next append or
-// turn-end simply re-nudges (at-least-once delivery tolerates a spare wake).
-// Each entry carries the send timestamp: a nudge older than WAKE_TTL_MS no
-// longer suppresses the next wake, because "sent" is not "delivered" — tmux
-// send-keys can land in a busy pane and never become a turn. The supervision
-// sweep re-runs scheduleWake for live lieutenants with pending items, so a
-// lapsed nudge self-heals within one tick instead of hanging forever.
-const WAKE_TTL_MS = process.env.BC_WAKE_TTL_MS !== undefined
-  ? parseInt(process.env.BC_WAKE_TTL_MS, 10) : 90000;
-const nudged = new Map(); // lieutenant id -> epoch-ms of the last wake sent since its last drain
-function wakeLine(n) { return '[bridge-commander] ' + n + ' pending item(s) — run: bc-axi drain'; }
-function scheduleWake(ltId) {
-  const lt = findLieutenant(ltId);
-  if (!lt || !isHarnessRef(lt.ref)) return;
-  const n = pendingItems(ltId).length;
-  if (!n) return;
-  const ts = nudged.get(ltId);
-  if (ts !== undefined && Date.now() - ts <= WAKE_TTL_MS) return;
-  nudged.set(ltId, Date.now());
-  Promise.resolve()
-    .then(() => harnessFor(lt.ref).send(lt.ref, wakeLine(n)))
-    .catch((e) => {
-      nudged.delete(ltId);
-      console.error(now() + ' wake failed for ' + ltId + ' (' + lt.ref.harness + ':' + lt.ref.session + '): '
-        + String((e && e.message) || e));
-    });
-}
-
 // ---------- card status (the ONE work signal; derived on read) ----------
 // card.status.worker is the only writable signal, set exclusively by status.set
 // (POST /api/cards/:id/status) as a lease with expiry: the persisted record is
@@ -1066,56 +964,16 @@ function lastThreadReadMs(target, user) {
   return ts ? Date.parse(ts) : 0;
 }
 // owed is QUEUE truth, not thread order: the latest captain message delivered
-// to this target has not been ACKED (consumed) by its lieutenant. Thread order
-// lies under interleaving — a captain message sent mid-turn gets buried when
-// the lieutenant replies to an EARLIER batch, and "last thread message is the
-// captain's" would read not-owed while the message sits genuinely unhandled.
-// Only the ack clears owed; a reply alone does not (in the normal reply-then-ack
-// turn the two coincide, so the simple case still clears promptly).
-// owed splits into a tri-state, because "unanswered" hides two very different
-// situations: the captain's message may still sit UNDRAINED in the owner's queue
-// (the lieutenant never saw it), or the lieutenant drained it — its turn started —
-// and simply hasn't replied yet. The boundary is the drained cursor, NOT the ack
-// cursor: a lieutenant drains at the START of a turn and acks at the END, so
-// keying off ack would leave the whole working phase reading as queued/unseen.
-// owedState says which side of the drain the latest captain message is on:
-//   'queued' = owed AND its delivery seq is past the seen cursor (unseen)
-//   'seen'   = owed and drained (turn underway; the reply is owed for real)
-//   null     = not owed
-// `msgSeqs` is the precomputed target -> latest-message-delivery map (one queue
-// scan per serialization); absent, it is derived on the spot.
-function latestMessageSeqs() {
-  const map = new Map(); // target -> {seq, lt} of the latest kind:'message' delivery
-  for (const lt of queueIds()) {
-    for (const it of readQueue(lt)) {
-      if (it.kind !== 'message' || !it.target) continue;
-      const cur = map.get(it.target);
-      if (!cur || it.seq > cur.seq) map.set(it.target, { seq: it.seq, lt });
-    }
-  }
-  return map;
-}
-// Queued = the latest captain message delivered to this target has not crossed
-// its lieutenant's seen cursor. No delivery on record → not queued (a thread
-// message that never became a QueueItem has nothing to sit unseen in).
-function targetQueued(target, msgSeqs) {
-  const m = msgSeqs.get(target);
-  return !!(m && m.seq > seenCursor(m.lt));
-}
-// Owed = the latest captain message delivered to this target is still unacked
-// (not yet consumed). No delivery on record → not owed.
-function targetOwed(target, msgSeqs) {
-  const m = msgSeqs.get(target);
-  return !!(m && m.seq > readAck(m.lt));
-}
-function cardStatus(card, user, msgSeqs) {
+// to this target has not been ACKED by its lieutenant. Thread order lies under
+// interleaving — a captain message sent mid-turn gets buried when the lieutenant
+// replies to an EARLIER batch. Only the ack clears owed; a reply alone does not.
+// owedState splits it by the drained cursor (a lieutenant drains at the START of
+// a turn, acks at the END): 'queued' = not drained yet, the lieutenant never saw
+// it; 'seen' = drained, the turn is underway; null = not owed (delivery.owed).
+function cardStatus(card, user) {
   const thread = card.thread || [];
-  const msgs = msgSeqs || latestMessageSeqs();
-  const owed = targetOwed('card:' + card.id, msgs);
-  let owedState = null;
-  if (owed) {
-    owedState = targetQueued('card:' + card.id, msgs) ? 'queued' : 'seen';
-  }
+  const owedState = delivery.owed('card:' + card.id);
+  const owed = owedState !== null;
   const readMs = lastThreadReadMs('card:' + card.id, user);
   let unread = false;
   for (const m of thread) if (m.author !== 'user' && Date.parse(m.ts) > readMs) { unread = true; break; }
@@ -1136,8 +994,8 @@ function cardActivity(card) {
 }
 // Serialization view: cards go out with the derived `status` and `activity`
 // attached; the stored board keeps only the raw lease.
-function publicCard(card, user, msgSeqs) {
-  return Object.assign({}, card, { status: cardStatus(card, user, msgSeqs), activity: cardActivity(card) });
+function publicCard(card, user) {
+  return Object.assign({}, card, { status: cardStatus(card, user), activity: cardActivity(card) });
 }
 // The served board carries the EFFECTIVE kinds map (built-ins merged under the
 // registered entries); the stored board keeps only the registered map.
@@ -1146,7 +1004,6 @@ function publicCard(card, user, msgSeqs) {
 // the old stream.
 const BOOT_ID = process.pid + '-' + Date.now();
 function publicBoard(user) {
-  const msgSeqs = latestMessageSeqs(); // one queue scan for the whole payload
   const holder = lineHolder().lieutenant;
   return Object.assign({}, board, {
     boot: BOOT_ID,
@@ -1154,13 +1011,13 @@ function publicBoard(user) {
     // The RESOLVED holder, never the raw stored id: a board that never had a
     // conversation still names whoever a `target: "line"` post would reach.
     line: holder ? holder.id : null,
-    cards: board.cards.map((c) => publicCard(c, user, msgSeqs)),
+    cards: board.cards.map((c) => publicCard(c, user)),
     workers: board.workers.map(withStatusAge),
     // chatOwed/chatQueued mirror status.owed/owedState:'queued' for a
     // lieutenant's MAIN chat — both queue-derived, same rules as cards.
     lieutenants: board.lieutenants.map((l) => Object.assign({}, withStatusAge(l), {
-      chatOwed: targetOwed('lieutenant:' + l.id, msgSeqs),
-      chatQueued: targetQueued('lieutenant:' + l.id, msgSeqs),
+      chatOwed: delivery.owed('lieutenant:' + l.id) !== null,
+      chatQueued: delivery.owed('lieutenant:' + l.id) === 'queued',
     })),
   });
 }
@@ -1592,7 +1449,7 @@ async function resetLieutenant(id) {
     return { error: 'reset failed: ' + String((e && e.message) || e) };
   }
   respawnAttempts.delete(id);
-  nudged.delete(id); // the new session owes a drain — the queue is truth, its memory was a cache
+  delivery.resetNudge(id); // the new session owes a drain — the queue is truth, its memory was a cache
   board.events.push(mkEvent({
     text: 'lieutenant ' + lt.name + ' was reset by the captain — new session on the launch prompt',
     actor: 'user',
@@ -1662,7 +1519,7 @@ async function switchLieutenantHarness(lt, harness, actor) {
   // patched: half of an old address is not an address.
   lt.ref = { harness: ref.harness, session: ref.session, cwd: ref.cwd, window: ref.window || names.LIEUTENANT_WINDOW };
   respawnAttempts.delete(lt.id);
-  nudged.delete(lt.id); // the new session owes a drain; its predecessor's memory went with it
+  delivery.resetNudge(lt.id); // the new session owes a drain; its predecessor's memory went with it
   const ev = mkEvent({
     text: 'lieutenant ' + lt.name + ' moved to ' + harness
       + (validModel(lt.model) ? ':' + validModel(lt.model) : '')
@@ -3531,7 +3388,7 @@ async function superviseTick() {
           actor: 'server',
         }, { kind: 'respawned' }));
         changed = true;
-        nudged.delete(lt.id); // the reincarnated session owes a drain: queue is truth, its memory is a cache
+        delivery.resetNudge(lt.id); // the reincarnated session owes a drain: queue is truth, its memory is a cache
         if (pendingItems(lt.id).length) scheduleWake(lt.id);
         else {
           const target = lt.ref;
@@ -4306,8 +4163,7 @@ const server = http.createServer(async (req, res) => {
       if (t) return proxyStt(req, res, t.url, p.slice(STT_PREFIX.length) + url.search);
     }
     if (route === 'GET /api/status') {
-      let pending = 0;
-      for (const lt of queueIds()) pending += pendingItems(lt).length;
+      const pending = delivery.pending().length;
       return sendJson(res, 200, {
         // `host` is what this process actually BOUND, not what config said —
         // a caller that wants a different bind (init/open --host) can only tell
@@ -4315,7 +4171,7 @@ const server = http.createServer(async (req, res) => {
         // that sent a stranger a URL their browser could not reach.
         workspace: WORKSPACE, port: PORT, host: BIND_HOST, cards: board.cards.length,
         lieutenants: board.lieutenants.length, seq: board.seq,
-        queue_seq: qseq, queue_pending: pending,
+        queue_seq: delivery.head(), queue_pending: pending,
         projects: board.projects.length, workers: board.workers.length,
         pid: process.pid,
         code: CODE, // {root, commit, short, dirty} as of BOOT — the CLI compares it to HEAD now
@@ -5505,32 +5361,23 @@ const server = http.createServer(async (req, res) => {
       let lt = url.searchParams.get('lieutenant') || '';
       const sess = url.searchParams.get('session') || '';
       // Session-scoped drain: a lieutenant identifies itself by its tmux session
-      // so it drains ONLY its own queue — the fix for cross-lieutenant drain. A
-      // registered lieutenant always resolves here; an unresolved session (a
-      // non-lieutenant caller, or a stale ref) falls back to unscoped behavior
-      // rather than erroring, so tooling and peeks keep working.
+      // so it drains ONLY its own queue — the fix for cross-lieutenant drain.
       if (lt && !findLieutenant(lt)) return sendJson(res, 404, { error: 'unknown lieutenant: ' + lt });
       if (!lt && sess) {
         const owner = board.lieutenants.find((l) => l.ref && l.ref.session === sess);
-        // A session-identified caller drains ONLY its own queue. If the session
-        // resolves to no lieutenant (a worker, a stale ref, a non-lieutenant
-        // tmux), return nothing — draining every queue here is exactly what let
-        // a non-owner ack-wipe another lieutenant's items.
-        if (!owner) return sendJson(res, 200, { items: [], head: qseq });
+        // A session that resolves to no lieutenant (a stale ref, a non-lieutenant
+        // tmux) gets nothing — draining every queue here is exactly what let a
+        // non-owner ack-wipe another lieutenant's items.
+        if (!owner) return sendJson(res, 200, { items: [], head: delivery.head() });
         lt = owner.id;
       }
-      // A drain clears the nudged flag: the next append (or a turn-end with
-      // still-unacked items) wakes again. A truly unidentified caller (no
-      // lieutenant, no session — raw tooling) gets a read-only peek at all
-      // queues: it is not a lieutenant starting its turn, so no wake state moves.
-      if (lt) nudged.delete(lt);
-      const items = drainItems(lt);
-      // Draining is SEEING: advance the lieutenant's durable drained cursor to
-      // the highest seq just served, and let the UI flip queued→seen. Only an
-      // identified drain advances — an unscoped all-queues drain is raw tooling
-      // peeking, not a lieutenant starting its turn.
-      if (lt && items.length && advanceDrained(lt, items[items.length - 1].seq)) broadcast();
-      return sendJson(res, 200, { items, head: qseq });
+      // No identity at all (raw tooling): a read-only peek at every queue. It is
+      // not a lieutenant starting its turn, so no wake flag or cursor moves.
+      if (!lt) return sendJson(res, 200, { items: delivery.pending(), head: delivery.head() });
+      // Draining is SEEING: the drained cursor moves, the UI flips queued→seen.
+      const r = delivery.drain(lt);
+      if (r.seen) broadcast();
+      return sendJson(res, 200, { items: r.items, head: delivery.head() });
     }
 
     // ----- feed.ack: commit the cursor AFTER the items were handled -----
@@ -5552,9 +5399,8 @@ const server = http.createServer(async (req, res) => {
       if (!ackOwner) {
         return sendJson(res, 400, { error: 'ack needs an identity: run it in your lieutenant session, or pass --lieutenant <id>' });
       }
-      const r = commitAck(seq, ackOwner);
+      const r = delivery.ack(ackOwner, seq);
       if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      nudged.delete(r.lieutenant); // handled: a fresh append nudges anew
       broadcast(); // the ack advances the seen cursor too (drain normally beat it here)
       return sendJson(res, 200, r);
     }
