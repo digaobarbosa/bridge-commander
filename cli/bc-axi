@@ -584,6 +584,8 @@ function scaffoldWorkspace() {
 const BRIDGET = { name: 'Bridget', id: 'bridget', prefix: 'BRI', avatar: 5 };
 const ONBOARDING_DIR = path.join(SELF_DIR, '..', 'onboarding');
 
+// The one writer of config.json on this side. A key patched to undefined is
+// dropped (JSON.stringify leaves it out), which is how a setting is cleared.
 function writeConfigKeys(patch) {
   let cfg = {};
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (e) {}
@@ -1729,12 +1731,7 @@ async function cmdConfig() {
   if (sub === 'voices') {
     if (positional.length < 2) die('usage: bc-axi config voices "<name,name,...>"  ("" clears the filter)');
     const names = positional.slice(1).join(' ').split(',').map((s) => s.trim()).filter(Boolean);
-    let cfg = {};
-    try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (e) {}
-    if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) cfg = {};
-    if (names.length) cfg.voices = names; else delete cfg.voices;
-    fs.mkdirSync(STATE_DIR, { recursive: true });
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2) + '\n');
+    writeConfigKeys({ voices: names.length ? names : undefined });
     console.log(names.length ? 'voices=' + names.join(',') : 'voices cleared');
     return;
   }
