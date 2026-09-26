@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { startServer, runCli } = require('./helper');
-const { charterPath, writeCharter } = require('../server/charter.js');
+const { charterPath, writeCharter } = require('../server/layout.js');
 
 test('lieutenant create: slug id, palette color; a charter sent by a client is ignored; duplicates conflict', async () => {
   const s = await startServer();

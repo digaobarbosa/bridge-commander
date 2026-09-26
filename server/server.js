@@ -73,10 +73,12 @@ const { parseWhen, nextAfter, dueWindows, pickWindows, describeWhen, normalizeSc
   NAME_RE: SCHEDULE_NAME_RE, OVERLAP, CATCHUP } = require(path.join(__dirname, 'schedules.js'));
 const { createSampler } = require(path.join(__dirname, 'sysload.js'));
 const { workerBrief, listPlaybooks, resolvePlaybook, playbooksDir, PACKAGED_PLAYBOOKS_DIR, parsePlaybook, attrVar, attrCardKey, PLACEHOLDERS, FRONTMATTER } = require(path.join(__dirname, 'playbooks.js'));
-const names = require(path.join(__dirname, 'names.js'));
-const { STATE_DIR_NAME, migrateStateDir, migrateHomeStateDir } = require(path.join(__dirname, 'statedir.js'));
+// layout.js: where things live in a workspace — the state dir, the charter,
+// and the session names (still read as `names.<fn>` below).
+const names = require(path.join(__dirname, 'layout.js'));
+const { STATE_DIR_NAME, migrateStateDir, migrateHomeStateDir } = require(path.join(__dirname, 'layout.js'));
 const gitrev = require(path.join(__dirname, 'gitrev.js'));
-const { charterPath, readCharter, writeCharter } = require(path.join(__dirname, 'charter.js'));
+const { charterPath, readCharter, writeCharter } = require(path.join(__dirname, 'layout.js'));
 const { ONBOARDING_STEPS } = require(path.join(__dirname, 'firstrun.js'));
 const { makeProxy, engineUrl } = require(path.join(__dirname, 'proxy.js'));
 const { execFile, execFileSync } = require('child_process');
@@ -788,7 +790,7 @@ async function spawnLieutenant(body) {
   try {
     ref = await impl.spawn(WORKSPACE, lieutenantPrompt(name, id), ltLaunchOpts({ model }, {
       session,
-      window: names.LIEUTENANT_WINDOW, // its own window in its own session — see names.js
+      window: names.LIEUTENANT_WINDOW, // its own window in its own session — see layout.js
       // Only the first run sends this, and only when the person said so out
       // loud: the harness decides what it means (for claude, IS_SANDBOX=1).
       allowRoot: !!body.allowRoot,
@@ -4800,7 +4802,7 @@ const server = http.createServer(async (req, res) => {
       // lieutenant's — without this guard a stale worker POST (its record
       // already gone) would corrupt the lieutenant's resumeId. The WINDOW part
       // of the key tells them apart: `:lt` is the lieutenant's own window,
-      // `:w-<card>` is a worker's (names.js — workerWindow / LIEUTENANT_WINDOW).
+      // `:w-<card>` is a worker's (layout.js — workerWindow / LIEUTENANT_WINDOW).
       const keyWindow = sname.includes(':') ? sname.slice(sname.indexOf(':') + 1) : '';
       const workerKey = !!keyWindow && keyWindow !== names.LIEUTENANT_WINDOW;
       if (!lt && tmux && !workerKey) lt = board.lieutenants.find((l) => isHarnessRef(l.ref) && l.ref.session === tmux);

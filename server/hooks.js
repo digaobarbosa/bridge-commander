@@ -68,8 +68,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { STATE_DIR_NAME } = require(path.join(__dirname, 'layout.js'));
 
-const STATE_DIRNAME = '.bridge-commander';
 const HOOKS_DIRNAME = 'hooks'; // under <workspace>/.bridge-commander/
 const RUNS_FILENAME = 'hookruns.jsonl'; // the trace, under <workspace>/.bridge-commander/
 // Where `bc-axi` lives, APPENDED to every hook's PATH. A hook's whole API is
@@ -95,9 +95,9 @@ const TEARDOWN_TIMEOUT_MS = 300000;
 const OUTPUT_CAP = 4096; // combined stdout+stderr bytes kept per run
 
 // hooksDir(workspace) — the one directory this module builds every path from.
-function hooksDir(workspace) { return path.join(workspace, STATE_DIRNAME, HOOKS_DIRNAME); }
+function hooksDir(workspace) { return path.join(workspace, STATE_DIR_NAME, HOOKS_DIRNAME); }
 // runsFile(workspace) — the trace.
-function runsFile(workspace) { return path.join(workspace, STATE_DIRNAME, RUNS_FILENAME); }
+function runsFile(workspace) { return path.join(workspace, STATE_DIR_NAME, RUNS_FILENAME); }
 
 // Executable regular files in the event's hook dir, alphabetical. Anything
 // else (subdirs, non-executables, unreadables) is skipped silently.

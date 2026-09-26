@@ -21,7 +21,7 @@ const SELF_DIR = path.dirname(fs.realpathSync(process.argv[1]));
 // deliberately-crashing script to exercise the boot-failure path.
 const SERVER_JS = process.env.BC_SERVER_JS || path.join(SELF_DIR, '..', 'server', 'server.js');
 const { STATE_DIR_NAME, LEGACY_STATE_DIR_NAME, migrateStateDir, resolveStateDir, migrateHomeStateDir, isWorkspace } =
-  require(path.join(SELF_DIR, '..', 'server', 'statedir.js'));
+  require(path.join(SELF_DIR, '..', 'server', 'layout.js'));
 const gitrev = require(path.join(SELF_DIR, '..', 'server', 'gitrev.js'));
 // The playbooks a workspace is seeded with, and the worker-duties skill that
 // goes with them — one call, because they are one thing (see playbooks.js).
@@ -30,8 +30,8 @@ const { seedPlaybooksAndDuties } = require(path.join(SELF_DIR, '..', 'server', '
 // the way the packaged playbooks are — copies, and only the missing ones.
 const { seedHooks } = require(path.join(SELF_DIR, '..', 'server', 'hooks.js'));
 // --charter-file writes the lieutenant's memory file, not a board field — the
-// charter is prose the agent reads at launch (see server/charter.js).
-const { charterPath, readCharter, writeCharter } = require(path.join(SELF_DIR, '..', 'server', 'charter.js'));
+// charter is prose the agent reads at launch (see server/layout.js).
+const { charterPath, readCharter, writeCharter } = require(path.join(SELF_DIR, '..', 'server', 'layout.js'));
 const DEFAULT_PORT = 4780;
 
 function die(msg) { console.error(msg); process.exit(1); }

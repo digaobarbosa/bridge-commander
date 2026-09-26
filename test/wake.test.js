@@ -12,8 +12,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { startServer, sleep } = require('./helper');
-const { lieutenantSession } = require('../server/names.js');
-const { writeCharter } = require('../server/charter.js');
+const { lieutenantSession } = require('../server/layout.js');
+const { writeCharter } = require('../server/layout.js');
 
 function sendsFile(dir, session) { return path.join(dir, session + '.sends.jsonl'); }
 function readSends(dir, session) {
@@ -177,7 +177,7 @@ test('lieutenant.create with spawn: real harness.spawn in the workspace root, re
     assert.strictEqual(lt.ref.cwd, path.resolve(s.dir)); // spawned in the workspace root
     assert.ok(lt.ref.resumeId, 'resumeId known at birth');
     // a lieutenant lives in its OWN window of that session — the worker windows
-    // it will host cohabit the session with it (server/names.js)
+    // it will host cohabit the session with it (server/layout.js)
     assert.strictEqual(lt.ref.window, 'lt');
     const key = lt.ref.session + ':' + lt.ref.window;
 

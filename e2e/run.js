@@ -232,7 +232,7 @@ async function step(name, fn) {
     });
 
     await step('two boards, one machine: same-named lieutenant → distinct sessions, harness state per workspace', async () => {
-      const { lieutenantSession } = require(path.join(__dirname, '..', 'server', 'names.js'));
+      const { lieutenantSession } = require(path.join(__dirname, '..', 'server', 'layout.js'));
       // Two fresh servers on two temp workspaces; the file-backed fake harness
       // records each spawn (session, prompt, and the stateDir plumbed through
       // the port) so the workspace scoping is genuinely exercised.

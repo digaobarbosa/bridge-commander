@@ -19,7 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const net = require('net');
 const { execFileSync } = require('child_process');
-const { STATE_DIR_NAME, LEGACY_STATE_DIR_NAME } = require(path.join(__dirname, 'statedir.js'));
+const { STATE_DIR_NAME, LEGACY_STATE_DIR_NAME } = require(path.join(__dirname, 'layout.js'));
 
 // Entries that say nothing about what a folder is for. A stranger's "empty
 // folder" has usually already been opened by an agent, and the agent left its

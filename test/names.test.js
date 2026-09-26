@@ -7,7 +7,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { workspaceDisc, lieutenantSession, workerWindow } = require('../server/names.js');
+const { workspaceDisc, lieutenantSession, workerWindow } = require('../server/layout.js');
 
 const TMUX_SAFE = /^bc-[A-Za-z0-9-]+$/; // no dots, no colons, ASCII only
 

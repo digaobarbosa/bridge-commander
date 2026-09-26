@@ -77,8 +77,8 @@ function git(dir, ...args) {
   return execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 
-const { lieutenantSession, workspaceDisc } = require(path.join(__dirname, '..', 'server', 'names.js'));
-const { writeCharter } = require(path.join(__dirname, '..', 'server', 'charter.js'));
+const { lieutenantSession, workspaceDisc } = require(path.join(__dirname, '..', 'server', 'layout.js'));
+const { writeCharter } = require(path.join(__dirname, '..', 'server', 'layout.js'));
 
 const LT = 'hopper';
 const LT_SESSION = lieutenantSession(ws, LT); // workspace-discriminated

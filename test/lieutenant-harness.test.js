@@ -15,7 +15,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { startServer, runCli, sleep } = require('./helper');
-const { writeCharter } = require('../server/charter.js');
+const { writeCharter } = require('../server/layout.js');
 
 const PRELOAD = path.join(__dirname, 'recording-harness.js');
 
