@@ -20,6 +20,31 @@ plain Node (>= 18; uses `node:test`, `fetch`). Beyond the seven, a harness MAY
 expose **optional capability verbs** — see below. This README is the one place
 their contract is written down; `port.js` points here.
 
+## Binding: the plumbing is bound once
+
+`stateDir` and `callbackUrl` are plumbing, not choices: a board has one of
+each. The server binds them once and never passes them again:
+
+```js
+const port = require('./harness/port.js');
+const env = { stateDir: '<ws>/.bridge-commander/harness', callbackUrl: 'http://127.0.0.1:<port>/api/turn-end' };
+port.harnessFor(ref, env).resume(ref, { permissionMode: 'auto' }); // stateDir + callbackUrl added
+port.getHarness('claude', env).spawn(cwd, brief, { session, window });
+```
+
+A bound instance adds both to the opts of every verb that takes opts (the
+binding wins over a caller's), passes every other verb through untouched, and
+keeps the optional-verb set of its implementation. A binding without `stateDir`
+throws — that is the point: an unbound caller that forgot it lands in the global
+last-resort dir, shared by every board on the machine. `getHarness(name)` and
+`harnessFor(ref)` without an env still return the raw implementation, for tests
+and embedders (`smoke.js`) that pass opts themselves.
+
+The port also exports `keyOf(ref)` — the state key (`session` or
+`session:window`) every per-agent file and turn-end event carries — and
+`isSpawnableSession(name)`, the `bc-<id>` rule `spawn` enforces. Nothing outside
+the harness builds either.
+
 ## Optional capability verbs (pane viewing, slash commands, session status, window adoption)
 
 Optional verbs are features not every harness can honor, so `port.js` never
@@ -110,7 +135,8 @@ focus, so an agent with siblings must always carry its window.
 
 ## Files
 
-- `port.js` — the contract: `getHarness(name)`, `registerHarness(name, impl)`, `harnessFor(ref)`, `isHarnessRef(ref)`
+- `port.js` — the contract: `getHarness(name, env?)`, `registerHarness(name, impl)`, `harnessFor(ref, env?)`,
+  `isHarnessRef(ref)`, `keyOf(ref)`, `isSpawnableSession(name)`
 - `tmux-adapter.js` — `tmuxAdapter(profile)`: the ONE implementation of every verb over tmux
 - `claude-tmux.js` — the claude profile (launch line, permission modes, screens,
   hooks, `/output-style`)
@@ -260,8 +286,9 @@ nothing. The server's worker-stall alert quotes it.
   directory), each named by its front-matter `name:` with the basename as
   fallback. A missing or unknown name throws before anything is written.
 
-State lives in `opts.stateDir` — the server and CLI always pass the
-workspace's `.bridge-commander/harness/` (`BC_HARNESS_STATE` overrides; the
+State lives in `opts.stateDir` — the server binds the port to the
+workspace's `.bridge-commander/harness/` and the CLI installs its hooks against
+the same dir (`server/layout.js` `harnessStateDir`; `BC_HARNESS_STATE` overrides; the
 global `~/.bridge-commander/harness/` is a last-resort for bare embedders only):
 `<session>.prompt`, `<session>.session-id`, `<session>.turnend.jsonl`,
 `<session>.spawn-args` (the launch facts a spawn was given — `opts.extraArgs`,

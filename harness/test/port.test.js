@@ -60,6 +60,36 @@ test('keyOf is the state key; isSpawnableSession is the spawn name rule', () => 
   }
 });
 
+test('a bound harness adds the plumbing opts to every verb that takes opts, and nothing else', async () => {
+  const seen = [];
+  const rec = (verb) => (...args) => { seen.push([verb, args]); return verb; };
+  const impl = {
+    spawn: rec('spawn'), send: rec('send'), alive: rec('alive'), resumable: rec('resumable'),
+    resume: rec('resume'), kill: rec('kill'), onTurnEnd: rec('onTurnEnd'), status: rec('status'),
+    openPane: rec('openPane'),
+  };
+  registerHarness('bindme', impl);
+  const env = { stateDir: '/ws/.bridge-commander/harness', callbackUrl: 'http://127.0.0.1:1/api/turn-end' };
+  const h = getHarness('bindme', env);
+  const ref = { harness: 'bindme', session: 'bc-1', cwd: '/x' };
+
+  h.spawn('/x', 'go', { window: 'w-1', permissionMode: 'auto', stateDir: '/elsewhere' });
+  assert.deepStrictEqual(seen.pop()[1][2],
+    { window: 'w-1', permissionMode: 'auto', stateDir: env.stateDir, callbackUrl: env.callbackUrl },
+    'per-call choices kept; the binding wins over a stray stateDir');
+  h.resume(ref);
+  assert.deepStrictEqual(seen.pop()[1], [ref, { stateDir: env.stateDir, callbackUrl: env.callbackUrl }]);
+  h.status(ref);
+  assert.strictEqual(seen.pop()[1][1].stateDir, env.stateDir);
+
+  assert.strictEqual(h.send, impl.send, 'verbs without opts pass through untouched');
+  assert.strictEqual(h.openPane, impl.openPane, 'optional verbs too');
+  assert.strictEqual(h.runCommand, undefined, 'an absent optional verb stays absent');
+  assert.strictEqual(harnessFor(ref, env), h, 'one bound instance per env and impl');
+  assert.strictEqual(getHarness('bindme'), impl, 'the unbound form is the implementation itself');
+  assert.throws(() => getHarness('bindme', { callbackUrl: 'x' }), /needs a stateDir/);
+});
+
 test('harnessFor dispatches by ref.harness', () => {
   const ref = { harness: 'fake', session: 'bc-1', cwd: '/x' };
   assert.strictEqual(harnessFor(ref), getHarness('fake'));

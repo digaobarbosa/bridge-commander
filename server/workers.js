@@ -143,7 +143,8 @@ const PR_URL_RE = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/g;
  * @param {(id: string) => object|null} deps.findCard card on the board, or null
  * @param {(name: string) => object|null} deps.findProject registered project
  * @param {(id: string) => string} deps.columnTitle
- * @param {(ref: object) => object} deps.harnessFor harness port for a ref
+ * @param {(ref: object) => object} deps.harnessFor harness port for a ref, BOUND
+ *   (port.js getHarness/harnessFor with an env): verbs take no stateDir/callbackUrl
  * @param {{create: Function, release: Function, toolFor: Function}} deps.worktrees
  * @param {(cmd: string, ctx: object, opts: object) => Promise<object>} deps.runTeardown
  * @param {(card: object, w: object) => object} deps.hookContext
@@ -158,8 +159,7 @@ const PR_URL_RE = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/g;
  * @param {(cardId: string) => string} deps.workerWindow
  * @param {(w: object) => Promise<boolean>} [deps.refreshStatus]
  * @param {(msg: string) => void} [deps.log]
- * @param {object} deps.config {stateDir, harnessStateDir, turnendUrl, teardownMs,
- *   restartTeardownMs, staleSecs}
+ * @param {object} deps.config {stateDir, harnessStateDir, teardownMs, restartTeardownMs, staleSecs}
  */
 function createWorkers(deps) {
   const cfg = deps.config || {};
@@ -551,7 +551,7 @@ function createWorkers(deps) {
 
     const spawnOpts = {
       session: deps.ownerSession(card), window: deps.workerWindow(card.id),
-      stateDir: cfg.harnessStateDir, callbackUrl: cfg.turnendUrl, permissionMode: permissionMode(),
+      permissionMode: permissionMode(),
     };
     if (plan.extraArgs && plan.extraArgs.length) spawnOpts.extraArgs = plan.extraArgs;
     let ref;
@@ -652,8 +652,7 @@ function createWorkers(deps) {
     }
     let ref;
     try {
-      ref = await deps.harnessFor(existing.ref).resume(existing.ref,
-        { stateDir: cfg.harnessStateDir, callbackUrl: cfg.turnendUrl, permissionMode: permissionMode() });
+      ref = await deps.harnessFor(existing.ref).resume(existing.ref, { permissionMode: permissionMode() });
     } catch (e) {
       return { error: 'worker resume failed: ' + errText(e), code: 502 };
     }

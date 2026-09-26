@@ -67,7 +67,8 @@ const crypto = require('crypto');
 // The harness port — the ONLY seam the server speaks to agent sessions through
 // (docs/api/overview.md, "harness port"). Lazy builtins: requiring port.js
 // drags in no tmux/claude machinery until a ref is actually dispatched.
-const { isHarnessRef, harnessFor, getHarness, keyOf, isSpawnableSession } = require(path.join(__dirname, '..', 'harness', 'port.js'));
+const port = require(path.join(__dirname, '..', 'harness', 'port.js'));
+const { isHarnessRef, keyOf, isSpawnableSession } = port;
 const { createWorktree, releaseWorktree, worktreeToolFor } = require(path.join(__dirname, 'worktrees.js'));
 const { createWorkers } = require(path.join(__dirname, 'workers.js'));
 const { runHooks, runTeardown, listAllHooks, runNamedHook, runningHook, readRuns, lastRuns, hookKey,
@@ -156,9 +157,8 @@ const PID_FILE = path.join(STATE_DIR, 'server.pid');
 const UPLOADS_DIR = path.join(STATE_DIR, 'uploads');
 const UI_DIR = path.join(__dirname, '..', 'ui');
 // Harness working state (session ids, prompts, turn-end logs) lives in the
-// WORKSPACE, never in the harness's global last-resort dir — two boards on one
-// machine must never share it. BC_HARNESS_STATE stays an explicit override.
-const HARNESS_STATE_DIR = process.env.BC_HARNESS_STATE || path.join(STATE_DIR, 'harness');
+// WORKSPACE (layout.js harnessStateDir); the port is bound to it below.
+const HARNESS_STATE_DIR = names.harnessStateDir(STATE_DIR);
 fs.mkdirSync(QUEUE_DIR, { recursive: true });
 fs.mkdirSync(CHAT_DIR, { recursive: true });
 fs.mkdirSync(HARNESS_STATE_DIR, { recursive: true });
@@ -258,6 +258,12 @@ const LOOPBACKS = ['127.0.0.1', 'localhost', '::1'];
 const BIND_HOST = opts.host || configHost() || '127.0.0.1';
 // Turn-end hooks (workspace-level and per-worker-spawn) POST here.
 const TURNEND_URL = 'http://127.0.0.1:' + PORT + '/api/turn-end';
+// The harness port BOUND to this workspace: every verb gets the state dir and
+// the turn-end callback from here, so no call site passes them and none can
+// forget them. The rest of the server asks for harnesses only through these two.
+const HARNESS_ENV = Object.freeze({ stateDir: HARNESS_STATE_DIR, callbackUrl: TURNEND_URL });
+function harnessFor(ref) { return port.harnessFor(ref, HARNESS_ENV); }
+function getHarness(name) { return port.getHarness(name, HARNESS_ENV); }
 
 // The commit this process is RUNNING, decided once here at boot and never
 // re-read: a merge into the checkout below moves the files, not this record,
@@ -762,8 +768,7 @@ function respawnPrompt(lt) {
 // a model comes back on it, respawn after respawn.
 function ltLaunchOpts(lt, extra) {
   const opts = Object.assign(
-    { stateDir: HARNESS_STATE_DIR, callbackUrl: TURNEND_URL, installHooks: false,
-      permissionMode: configPermissionMode() },
+    { installHooks: false, permissionMode: configPermissionMode() },
     extra || {}
   );
   const model = lt && validModel(lt.model);
@@ -1598,13 +1603,13 @@ async function runChatCommand(target, text) {
     // the FULL line goes to the harness — pass-through commands (/compact,
     // claude's /autocompact) may carry arguments; `name` only did the match
     const impl = getHarness(r.ref.harness);
-    const result = await impl.runCommand(r.ref, text, { stateDir: HARNESS_STATE_DIR });
+    const result = await impl.runCommand(r.ref, text);
     // /status also fetches the structured status (a cheap transcript read) so the
     // reply carries both the formatted text (fallback) and the payload the UI
     // renders as model + context bar + rate lines — never parsing the prose.
     let extra;
     if (name === '/status' && typeof impl.status === 'function') {
-      try { const st = await impl.status(r.ref, { stateDir: HARNESS_STATE_DIR }); if (st && typeof st === 'object') extra = { status: st }; } catch {}
+      try { const st = await impl.status(r.ref); if (st && typeof st === 'object') extra = { status: st }; } catch {}
     }
     reply(r.ref.harness, String(result == null ? name + ' done' : result), extra);
   } catch (e) {
@@ -1623,7 +1628,7 @@ async function refreshAgentStatus(rec) {
   try { impl = getHarness(rec.ref.harness); } catch { return false; }
   if (typeof impl.status !== 'function') return false;
   try {
-    const st = await impl.status(rec.ref, { stateDir: HARNESS_STATE_DIR });
+    const st = await impl.status(rec.ref);
     if (!st || typeof st !== 'object') return false;
     rec.agentStatus = Object.assign({}, st, { ts: now() });
     return true;
@@ -2286,7 +2291,7 @@ const workers = createWorkers({
   permissionPending: (cardId) => permissions.has((it) => it.card === cardId),
   log: (m) => console.error(now() + ' ' + m),
   config: {
-    stateDir: STATE_DIR, harnessStateDir: HARNESS_STATE_DIR, turnendUrl: TURNEND_URL,
+    stateDir: STATE_DIR, harnessStateDir: HARNESS_STATE_DIR,
     teardownMs: TEARDOWN_TIMEOUT_MS, restartTeardownMs: RESTART_TEARDOWN_TIMEOUT_MS,
     staleSecs: BC_WORKER_STALE_SECS,
   },
