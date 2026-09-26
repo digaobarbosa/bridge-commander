@@ -271,3 +271,46 @@ export function cardArtifacts(card) {
   if (!Array.isArray(v)) return [];
   return v.filter((e) => e && typeof e === 'object' && typeof e.uri === 'string' && e.uri);
 }
+
+// First match wins, so the order is the dispatch order: a drawing is JSON on
+// disk but opens as a canvas, and audio must be claimed before the binary list.
+const FILE_KINDS = [
+  ['drawing', /\.excalidraw$/i],
+  ['image', /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i],
+  ['video', /\.(mp4|mov|webm|m4v)$/i],
+  ['audio', /\.(mp3|wav|m4a|aac|ogg|oga|opus|flac)$/i],
+  ['html', /\.html?$/i],
+  ['markdown', /\.(md|markdown)$/i],
+  ['text', /\.(txt|log|json|ya?ml|csv|js|ts|py|sh|css)$/i],
+  // known binaries: never worth a text preview — offer the download straight away
+  ['binary', /\.(pdf|zip|gz|tgz|tar|xlsx?|docx?|pptx?|bin|exe|dmg|iso|woff2?|ttf|otf|parquet|pkl|npz|so|dll|wasm|class|jar)$/i],
+];
+
+/**
+ * What a file name opens as, by extension: 'drawing' | 'image' | 'video' |
+ * 'audio' | 'html' | 'markdown' | 'text' | 'binary', or '' when the name does
+ * not say (the viewer then asks the server).
+ */
+export function classifyFile(name) {
+  const s = String(name || '');
+  for (const [kind, re] of FILE_KINDS) if (re.test(s)) return kind;
+  return '';
+}
+
+const TEXTY_MIME = /^(text\/|application\/(json|xml|javascript|x-sh|x-yaml|yaml|csv|x-www-form-urlencoded)|image\/svg)/;
+
+/**
+ * How a chat attachment shows: 'image' | 'video' | 'audio' | 'text' |
+ * 'binary', from its mime when it has one, else from its name. '' means
+ * neither decides — the served Content-Type has to (pass it back in as mime).
+ */
+export function attachmentKind(mime, name) {
+  const m = String(mime || '');
+  if (m) {
+    for (const k of ['image', 'video', 'audio']) if (m.startsWith(k + '/')) return k;
+    return TEXTY_MIME.test(m) ? 'text' : 'binary';
+  }
+  const k = classifyFile(name);
+  if (k === 'image' || k === 'video' || k === 'audio') return k;
+  return k === 'markdown' || k === 'html' || k === 'text' ? 'text' : '';
+}

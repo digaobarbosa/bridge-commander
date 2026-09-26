@@ -96,17 +96,16 @@ test('a file we cannot read is not an empty drawing — it throws instead of ove
 
 // ---------- 2. the wiring ----------
 
-test('a .excalidraw artifact opens as a canvas, and a text artifact still opens as text', () => {
-  assert.match(detailSrc, /const DRAW_EXT = \/\\\.excalidraw\$\/i;/, 'detail.js knows the extension');
-  const m = /const DRAW_EXT = \/(.+)\/(\w*);/.exec(detailSrc);
-  const DRAW_EXT = new RegExp(m[1], m[2]);
-  assert.ok(DRAW_EXT.test('flow.excalidraw'), 'a drawing');
+test('a .excalidraw artifact opens as a canvas, and a text artifact still opens as text', async () => {
+  // the extension table moved to util.js classifyFile (see file-kinds.test.js)
+  const { classifyFile } = await import(pathToFileURL(path.join(__dirname, '..', 'ui', 'js', 'util.js')).href);
+  assert.strictEqual(classifyFile('flow.excalidraw'), 'drawing', 'a drawing');
   for (const n of ['notes.md', 'server.js', 'flow.excalidraw.svg', 'report.html']) {
-    assert.ok(!DRAW_EXT.test(n), n + ' is not routed to the canvas');
+    assert.notStrictEqual(classifyFile(n), 'drawing', n + ' is not routed to the canvas');
   }
   // openArtifact takes the canvas branch BEFORE any of the preview branches
-  const at = detailSrc.indexOf('if (DRAW_EXT.test(name)) return openDrawing');
-  assert.ok(at > -1 && at < detailSrc.indexOf('IMG_EXT.test(name)'));
+  const at = detailSrc.indexOf("if (kind === 'drawing') return openDrawing");
+  assert.ok(at > -1 && at < detailSrc.indexOf("kind === 'image'"));
   // and the file screen mounts one or the other by that flag — nothing else changes
   assert.match(filepaneSrc, /\(open\.draw \? mountDrawing : mountFileEditor\)\(body, \{/);
 });
