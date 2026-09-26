@@ -74,6 +74,7 @@ const { parseWhen, nextAfter, dueWindows, pickWindows, describeWhen, normalizeSc
 const { createSampler } = require(path.join(__dirname, 'sysload.js'));
 const { workerBrief, listPlaybooks, resolvePlaybook, playbooksDir, PACKAGED_PLAYBOOKS_DIR, parsePlaybook, attrVar, attrCardKey, PLACEHOLDERS, FRONTMATTER } = require(path.join(__dirname, 'playbooks.js'));
 const names = require(path.join(__dirname, 'names.js'));
+const { createConversation } = require(path.join(__dirname, 'conversation.js'));
 const { STATE_DIR_NAME, migrateStateDir, migrateHomeStateDir } = require(path.join(__dirname, 'statedir.js'));
 const gitrev = require(path.join(__dirname, 'gitrev.js'));
 const { charterPath, readCharter, writeCharter } = require(path.join(__dirname, 'charter.js'));
@@ -605,6 +606,35 @@ function ensureMinting(lts) {
     lt.prefix = p || uniquePrefixIn(lts, prefixFrom(lt.name), lt.id);
     if (!Number.isInteger(lt.cardSeq) || lt.cardSeq < 0) lt.cardSeq = 0;
   }
+}
+
+// ---------- conversation & identity (server/conversation.js) ----------
+// Who is talking — and, from there, what a say sets in motion — lives in one
+// module bound to this board, so every route asks the same question the same way.
+const conversation = createConversation({ board: () => board });
+
+/**
+ * resolveHookAgent(body) — the agent a turn-end hook POST came from:
+ * { lt, worker } with at most one set. The hook's fields mapped onto identify().
+ */
+function resolveHookAgent(body) {
+  const tmux = typeof body.tmux_session === 'string' ? body.tmux_session : null;
+  const who = conversation.identify({
+    sessionId: body.session_id,
+    key: body.session,
+    session: tmux,
+    // only an OLD hook (no tmux_session field at all) may be adopted by cwd
+    cwd: tmux === null && body.cwd ? path.resolve(String(body.cwd)) : '',
+  });
+  return { lt: who.kind === 'lieutenant' ? who.lt : null, worker: who.kind === 'worker' ? who.worker : null };
+}
+
+/**
+ * callerOf(fields) — identify() for a CLI caller: bc-axi sends its tmux
+ * `session` and `window` (the window is absent from an older bc-axi).
+ */
+function callerOf(fields) {
+  return conversation.identify({ session: fields.session, window: fields.window });
 }
 
 // ---------- the line (the captain's voice channel) ----------
@@ -4762,27 +4792,21 @@ const server = http.createServer(async (req, res) => {
     // BEFORE lieutenant attribution so a worker's first POST can never be
     // mis-adopted); (4) tmux attribution — the hook runs inside the agent's
     // pane, so its tmux_session names the owning lieutenant's ref.session
-    // exactly (adopts/refreshes resumeId; works for any number of founders);
+    // exactly — never for a worker's `:w-<card>` key, whose pane shares that
+    // session (adopts/refreshes resumeId; works for any number of founders);
     // (5) legacy adoption — only for old hooks whose payload carries no
     // tmux_session field: exactly one ref-bearing lieutenant missing its
     // resumeId, and never a session_id whose cwd is not that lieutenant's
     // ref.cwd (a stray claude in the workspace must not become a lieutenant).
     // Anything else is some other agent in the workspace: acknowledged, ignored.
+    // The steps are conversation.identify's (resolveHookAgent).
     if (route === 'POST /api/turn-end') {
       const body = JSON.parse(await readBody(req) || '{}');
       const sid = body.session_id ? String(body.session_id) : '';
-      const sname = body.session ? String(body.session) : '';
-      const tmux = typeof body.tmux_session === 'string' ? body.tmux_session : null;
-      let lt = sid ? board.lieutenants.find((l) => isHarnessRef(l.ref) && l.ref.resumeId === sid) : null;
-      // A lieutenant's hook posts its state key, which for a window-granular
-      // ref is `session:lt` — matching on ref.session alone never saw it, and
-      // a codex lieutenant (born without a resumeId) had no other way in.
-      if (!lt && sname) lt = board.lieutenants.find((l) => isHarnessRef(l.ref) && refKey(l.ref) === sname);
+      const hook = resolveHookAgent(body);
+      const lt = hook.lt;
       if (!lt) {
-        let w = sid ? board.workers.find((x) => x.ref.resumeId === sid) : null;
-        // A window-granular worker's hook posts the `session:window` key —
-        // never the bare session name it shares with its lieutenant.
-        if (!w && sname) w = board.workers.find((x) => workerName(x.ref) === sname);
+        const w = hook.worker;
         if (w) {
           if (sid && w.ref.resumeId !== sid) w.ref.resumeId = sid; // hook payload is ground truth
           w.lastTurnEnd = now();
@@ -4812,19 +4836,6 @@ const server = http.createServer(async (req, res) => {
           if (stopped || statusChanged) broadcast();
           return sendJson(res, 200, { ok: true, lieutenant: null, worker: w.card });
         }
-      }
-      // Worker hooks are excluded from tmux attribution: a worker's pane sits
-      // in the lieutenant session it cohabits, so its tmux_session IS that
-      // lieutenant's — without this guard a stale worker POST (its record
-      // already gone) would corrupt the lieutenant's resumeId. The WINDOW part
-      // of the key tells them apart: `:lt` is the lieutenant's own window,
-      // `:w-<card>` is a worker's (names.js — workerWindow / LIEUTENANT_WINDOW).
-      const keyWindow = sname.includes(':') ? sname.slice(sname.indexOf(':') + 1) : '';
-      const workerKey = !!keyWindow && keyWindow !== names.LIEUTENANT_WINDOW;
-      if (!lt && tmux && !workerKey) lt = board.lieutenants.find((l) => isHarnessRef(l.ref) && l.ref.session === tmux);
-      if (!lt && tmux === null && sid) {
-        const cands = board.lieutenants.filter((l) => isHarnessRef(l.ref) && !l.ref.resumeId);
-        if (cands.length === 1 && body.cwd && path.resolve(String(body.cwd)) === cands[0].ref.cwd) lt = cands[0];
       }
       if (!lt) return sendJson(res, 200, { ok: true, lieutenant: null });
       if (sid && lt.ref.resumeId !== sid) lt.ref.resumeId = sid; // hook payload is ground truth
@@ -5298,14 +5309,14 @@ const server = http.createServer(async (req, res) => {
       const attachments = resolveAttachments(body.attachments);
       if (!text.trim() && !attachments.length) return sendJson(res, 400, { error: 'text or attachments required' });
       // Default author, most-identified first: explicit body.author; then the
-      // CALLER resolved from its tmux session (like drain/ack — so a lieutenant
-      // posting to another's chat or card is stamped as itself, not the target);
-      // then the target's lieutenant (unidentified callers — the interlocutor
-      // is the owning lieutenant, card threads included).
+      // CALLER resolved from its tmux session + window (like drain/ack — so a
+      // lieutenant posting to another's chat or card is stamped as itself, and
+      // a worker as `worker <card>`, never as the lieutenant whose session it
+      // shares); then the target's lieutenant (unidentified callers).
       const lt = targetLieutenant(target);
-      const sess = body.session ? String(body.session) : '';
-      const caller = sess ? board.lieutenants.find((l) => l.ref && l.ref.session === sess) : null;
-      const msg = { author: String(body.author || (caller && caller.name) || (lt && lt.name) || 'agent').slice(0, 60), text, ts: now() };
+      const who = callerOf(body);
+      const caller = who.kind === 'lieutenant' ? who.lt : null;
+      const msg = { author: String(body.author || conversation.callerName(who) || (lt && lt.name) || 'agent').slice(0, 60), text, ts: now() };
       if (attachments.length) msg.attachments = attachments;
       appendMessage(target, msg);
       const m = /^card:(.+)$/.exec(target);
@@ -5314,7 +5325,7 @@ const server = http.createServer(async (req, res) => {
         if (card) {
           card.updated = now(); if (!card.threadStart) card.threadStart = msg.ts;
           // A card-thread say from anyone but the owning lieutenant — its own
-          // worker (whose session resolves to no lieutenant), a peer, raw
+          // worker (identified by its window, never as the owner), a peer, raw
           // tooling — must WAKE the owner: the thread alone notifies nobody.
           // Default-notify: only a session-identified owner is exempt (author
           // names can't be trusted — an unidentified worker is stamped with
@@ -5411,10 +5422,8 @@ const server = http.createServer(async (req, res) => {
       if (!lt) return sendJson(res, 404, { error: 'unknown lieutenant: ' + (id || '(none)') });
       const note = String(body.note || '').trim().slice(0, 2000);
       // Who is handing it over: explicit actor, else the CALLER resolved from
-      // its tmux session (like say/drain/ack), else the captain.
-      const sess = body.session ? String(body.session) : '';
-      const caller = sess ? board.lieutenants.find((l) => l.ref && l.ref.session === sess) : null;
-      const from = String(body.actor || (caller && caller.name) || 'user').trim().slice(0, 60);
+      // its tmux session + window (like say/drain/ack), else the captain.
+      const from = String(body.actor || conversation.callerName(callerOf(body)) || 'user').trim().slice(0, 60);
       board.line = lt.id;
       // The receiver finds out because it was TOLD — same durable queue as
       // everything else, so it wakes and greets him in its own voice.
@@ -5515,7 +5524,8 @@ const server = http.createServer(async (req, res) => {
       // rather than erroring, so tooling and peeks keep working.
       if (lt && !findLieutenant(lt)) return sendJson(res, 404, { error: 'unknown lieutenant: ' + lt });
       if (!lt && sess) {
-        const owner = board.lieutenants.find((l) => l.ref && l.ref.session === sess);
+        const who = callerOf({ session: sess, window: url.searchParams.get('window') });
+        const owner = who.kind === 'lieutenant' ? who.lt : null;
         // A session-identified caller drains ONLY its own queue. If the session
         // resolves to no lieutenant (a worker, a stale ref, a non-lieutenant
         // tmux), return nothing — draining every queue here is exactly what let
@@ -5544,8 +5554,11 @@ const server = http.createServer(async (req, res) => {
       // Identity-scoped ack: a lieutenant commits only within its own queue.
       let ackOwner = body.lieutenant || '';
       if (!ackOwner && body.session) {
-        const owner = board.lieutenants.find((l) => l.ref && l.ref.session === body.session);
-        if (owner) ackOwner = owner.id;
+        const who = callerOf(body);
+        // A worker shares its lieutenant's session but owns no queue: unscoped,
+        // its ack could commit (and so discard) the lieutenant's pending items.
+        if (who.kind === 'worker') return sendJson(res, 409, { error: 'a worker has no delivery queue — acks belong to its lieutenant' });
+        if (who.kind === 'lieutenant') ackOwner = who.lt.id;
       }
       const r = commitAck(seq, ackOwner || null);
       if (r.error) return sendJson(res, r.code || 400, { error: r.error });

@@ -36,14 +36,22 @@ const DEFAULT_PORT = 4780;
 
 function die(msg) { console.error(msg); process.exit(1); }
 
-// A lieutenant's identity is its tmux session (recorded as ref.session at init/
-// spawn). drain/ack self-scope to it so one lieutenant never drains another's
-// queue. Empty outside tmux (raw tooling/tests) — the server then falls back to
-// its explicit-lieutenant or all-queues behavior.
-function currentTmuxSession() {
-  if (!process.env.TMUX) return '';
-  try { return execFileSync('tmux', ['display-message', '-p', '#S'], { encoding: 'utf8' }).trim(); }
-  catch (e) { return ''; }
+// A caller's identity is its tmux session AND window (recorded as ref.session /
+// ref.window at init/spawn): a worker is a window inside its lieutenant's
+// session, so the session alone would make it the lieutenant. drain/ack/say
+// self-scope to it so one agent never drains or speaks as another. Empty
+// outside tmux (raw tooling/tests): the caller is then unidentified, and the
+// server decides what an unidentified drain or ack may do (--lieutenant names
+// one explicitly). TMUX_PANE pins the pane this process runs in, not whichever
+// window has focus.
+function currentTmuxCaller() {
+  if (!process.env.TMUX) return {};
+  const pane = process.env.TMUX_PANE ? ['-t', process.env.TMUX_PANE] : [];
+  try {
+    const out = execFileSync('tmux', ['display-message', '-p', ...pane, '#S\n#W'], { encoding: 'utf8' });
+    const [session = '', window = ''] = out.split('\n').map((x) => x.trim());
+    return session ? (window ? { session, window } : { session }) : {};
+  } catch (e) { return {}; }
 }
 
 // ---------- args ----------
@@ -1604,10 +1612,10 @@ async function cmdSay() {
   const text = readInput(opts.textFile);
   const body = { target, text_md: text };
   // Author self-identification, like drain/ack: the server resolves the
-  // caller's tmux session to its lieutenant so a say to another lieutenant's
-  // chat or card is stamped as the CALLER, not the target. --actor overrides.
-  const sess = currentTmuxSession();
-  if (sess) body.session = sess;
+  // caller's tmux session + window to its agent so a say to another
+  // lieutenant's chat or card is stamped as the CALLER, not the target, and a
+  // worker is never taken for its lieutenant. --actor overrides.
+  Object.assign(body, currentTmuxCaller());
   if (opts.actor) body.author = opts.actor;
   await request('POST', '/api/message', body);
   console.log('said -> ' + target);
@@ -1630,8 +1638,7 @@ async function cmdLinePass() {
   const id = positional[0];
   if (!id) die('usage: bc-axi line pass <lieutenant-id> --note "<what he wants from them>"');
   const body = { lieutenant: id, note: opts.note || '' };
-  const sess = currentTmuxSession();
-  if (sess) body.session = sess;
+  Object.assign(body, currentTmuxCaller());
   if (opts.actor) body.actor = opts.actor;
   const r = await request('POST', '/api/line', body);
   console.log('the line is with ' + r.name + ' (' + r.lieutenant + ') — they were woken with the note.');
@@ -1646,9 +1653,9 @@ async function cmdDrain() {
   // board flips the message from queued/unseen to seen/responding.
   // Default output is agent-ergonomic (card context + next-action hint per
   // item); --json prints the raw QueueItems, one JSON line each.
-  const sess = currentTmuxSession();
+  const me = opts.lieutenant ? {} : currentTmuxCaller();
   const q = opts.lieutenant ? '?lieutenant=' + encodeURIComponent(opts.lieutenant)
-    : (sess ? '?session=' + encodeURIComponent(sess) : '');
+    : (me.session ? '?' + new URLSearchParams(me) : '');
   const r = await request('GET', '/api/feed' + q);
   if (opts.json) { for (const it of r.items) console.log(JSON.stringify(it)); return; }
   if (!r.items.length) { console.log('queue empty — nothing pending.'); return; }
@@ -1756,8 +1763,7 @@ async function cmdAck() {
   const seq = parseInt(positional[0], 10);
   if (!Number.isInteger(seq) || seq < 0) die('usage: bc-axi ack <seq>   (highest queue seq you have HANDLED)');
   const body = { seq };
-  const sess = currentTmuxSession();
-  if (opts.lieutenant) body.lieutenant = opts.lieutenant; else if (sess) body.session = sess;
+  if (opts.lieutenant) body.lieutenant = opts.lieutenant; else Object.assign(body, currentTmuxCaller());
   const r = await request('POST', '/api/feed/ack', body);
   console.log('acked ' + seq + ' (lieutenant=' + r.lieutenant + ' committed=' + r.ack + ')');
 }
