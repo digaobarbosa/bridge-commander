@@ -20,7 +20,7 @@ const SELF_DIR = path.dirname(fs.realpathSync(process.argv[1]));
 // BC_SERVER_JS is a test-only seam: it lets tests point auto-boot at a
 // deliberately-crashing script to exercise the boot-failure path.
 const SERVER_JS = process.env.BC_SERVER_JS || path.join(SELF_DIR, '..', 'server', 'server.js');
-const { STATE_DIR_NAME, LEGACY_STATE_DIR_NAME, migrateStateDir, resolveStateDir, migrateHomeStateDir, isWorkspace } =
+const { STATE_DIR_NAME, LEGACY_STATE_DIR_NAME, migrateStateDir, resolveStateDir, migrateHomeStateDir, isWorkspace, isId } =
   require(path.join(SELF_DIR, '..', 'server', 'layout.js'));
 const gitrev = require(path.join(SELF_DIR, '..', 'server', 'gitrev.js'));
 // The playbooks a workspace is seeded with, and the worker-duties skill that
@@ -366,7 +366,7 @@ function slugId(s) {
 // The id is checked against the SERVER's rule first, so a `--id ../../foo`
 // never reaches the filesystem on its way to a 400.
 function seedCharter(id, source) {
-  if (!/^[\w][\w.-]*$/.test(id)) die('bad lieutenant id (use [A-Za-z0-9_.-]): ' + id);
+  if (!isId(id)) die('bad lieutenant id (use [A-Za-z0-9_.-]): ' + id);
   const file = charterPath(WORKSPACE, id);
   if (fs.existsSync(file)) console.log('charter left alone — ' + file + ' already exists (edit it to replace it)');
   else console.log('charter written to ' + writeCharter(WORKSPACE, id, readInput(source)));

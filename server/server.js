@@ -76,7 +76,7 @@ const { workerBrief, listPlaybooks, resolvePlaybook, playbooksDir, PACKAGED_PLAY
 // layout.js: where things live in a workspace — the state dir, the charter,
 // and the session names (still read as `names.<fn>` below).
 const names = require(path.join(__dirname, 'layout.js'));
-const { STATE_DIR_NAME, migrateStateDir, migrateHomeStateDir } = require(path.join(__dirname, 'layout.js'));
+const { STATE_DIR_NAME, migrateStateDir, migrateHomeStateDir, isId } = require(path.join(__dirname, 'layout.js'));
 const gitrev = require(path.join(__dirname, 'gitrev.js'));
 const { charterPath, readCharter, writeCharter } = require(path.join(__dirname, 'layout.js'));
 const { ONBOARDING_STEPS } = require(path.join(__dirname, 'firstrun.js'));
@@ -634,7 +634,7 @@ function createLieutenant(body) {
   const name = String(body.name || '').trim();
   if (!name) return { error: 'name required' };
   const id = body.id ? String(body.id) : lieutenantIdFrom(name);
-  if (!/^[\w][\w.-]*$/.test(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])' };
+  if (!isId(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])' };
   if (findLieutenant(id)) return { error: 'lieutenant exists: ' + id, code: 409 };
   if (body.avatar !== undefined && body.avatar !== null && !validAvatar(body.avatar)) {
     return { error: 'avatar must be an integer 0-63' };
@@ -765,7 +765,7 @@ async function spawnLieutenant(body) {
   const name = String(body.name || '').trim();
   if (!name) return { error: 'name required' };
   const id = body.id ? String(body.id) : lieutenantIdFrom(name);
-  if (!/^[\w][\w.-]*$/.test(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])' };
+  if (!isId(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])' };
   // revive:true is what makes `bc-axi init --onboard` re-runnable: the founding
   // lieutenant already exists, and the question is only whether her session is
   // still up. A live one is left strictly alone (spawning over a live session
@@ -2134,7 +2134,7 @@ async function addProject(body) {
   const source = String((body && body.source) || '').trim();
   if (!source) return { error: 'source required (git URL or local path)' };
   const name = String((body && body.name) || path.basename(source.replace(/\/+$/, '')).replace(/\.git$/, '')).trim();
-  if (!/^[\w][\w.-]*$/.test(name)) return { error: 'bad project name: ' + name + ' (use [A-Za-z0-9_.-], or pass --name)' };
+  if (!isId(name)) return { error: 'bad project name: ' + name + ' (use [A-Za-z0-9_.-], or pass --name)' };
   if (findProject(name)) return { error: 'project exists: ' + name, code: 409 };
   if (addingProjects.has(name)) return { error: 'project add already in progress: ' + name, code: 409 };
   const dest = path.join(WORKSPACE, 'projects', name);

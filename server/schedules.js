@@ -27,8 +27,8 @@
 // lose a window nor double-fire one — the windows are a function of the cursor
 // and the clock, not of when the process happened to be awake.
 
-// A schedule name, and the shape every id on this board has.
-const NAME_RE = /^[\w][\w.-]*$/;
+// A schedule name, and the shape every id on this board has (layout.js).
+const { ID_RE: NAME_RE } = require('./layout.js');
 const OVERLAP = ['skip', 'queue', 'restart'];
 const CATCHUP = ['latest', 'all', 'none'];
 

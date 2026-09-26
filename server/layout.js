@@ -6,11 +6,20 @@
 //   <ws>/.bridge-commander/          the state dir (+ the legacy-name migration)
 //   <ws>/lieutenants/<id>/README.md  a lieutenant's charter
 //   bc-<disc>-lt-<id>                a lieutenant's tmux session (+ worker windows)
+//   ids                              one shape for every id a path is built from
 
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
+
+// ---------- ids ----------
+// The id shape the whole board uses: lieutenant, project, playbook, hook,
+// schedule. Starts with a word character, so no id can be `..`, empty, or a
+// leading `-` or `.`, and every path built from one stays where it was built.
+const ID_RE = /^[\w][\w.-]*$/;
+/** isId(s) -> true when `s` is a legal board id. */
+function isId(s) { return typeof s === 'string' && ID_RE.test(s); }
 
 // ---------- the state dir ----------
 // Canonical state-dir names + one-shot rename migrations from the pre-rename
@@ -141,6 +150,7 @@ function workerWindow(cardId) {
 const LIEUTENANT_WINDOW = 'lt';
 
 module.exports = {
+  ID_RE, isId,
   STATE_DIR_NAME, LEGACY_STATE_DIR_NAME,
   migrateStateDir, resolveStateDir, migrateHomeStateDir, isWorkspace,
   charterPath, readCharter, writeCharter,
