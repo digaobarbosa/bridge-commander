@@ -30,7 +30,9 @@ them drift.
   with the turn-end hook (`POST /api/turn-end`) re-nudging a lieutenant that ends a turn with
   items still unacked. Only ack removes; a dead session loses nothing; a server restart is a
   non-event. `server/delivery.js` owns all of it — queues, cursors, wakes, the owed projection —
-  reading the queue files once at boot; the server is their only writer.
+  reading the queue files once at boot; the server is their only writer. What a drained item
+  says to its reader — a head and a next-action hint per kind — is `server/feedtext.js`,
+  rendered at drain time; `bc-axi drain` only prints it.
 - **The harness port** is the only seam to agent sessions — seven verbs (`spawn`, `send`,
   `alive`, `resumable`, `resume`, `kill`, `onTurnEnd`); see [harness/README.md](harness/README.md).
   Builtins: `claude` and `codex` over tmux, plus an in-memory `fake` for tests.

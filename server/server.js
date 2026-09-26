@@ -90,6 +90,7 @@ const { createConversation, parseTarget, CAPTAIN } = require(path.join(__dirname
 const { permissionMode, summarize, createPermissions } = require(path.join(__dirname, 'permissions.js'));
 const { readJsonl, sealJsonl } = require(path.join(__dirname, 'jsonl.js'));
 const { createDelivery } = require(path.join(__dirname, 'delivery.js'));
+const feedtext = require(path.join(__dirname, 'feedtext.js'));
 const { execFile, execFileSync } = require('child_process');
 
 // ---------- args ----------
@@ -3569,7 +3570,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ----- feed.drain: pending QueueItems past the committed ack cursor -----
+    // Each item goes out with its `head` and `hint` (feedtext.js), rendered
+    // against the card as it stands now; the stored item is never touched.
     if (route === 'GET /api/feed') {
+      const served = (items) => items.map((it) => Object.assign({}, it, feedtext.describe(it, findCard)));
       let lt = url.searchParams.get('lieutenant') || '';
       const sess = url.searchParams.get('session') || '';
       // Session-scoped drain: a lieutenant identifies itself by its tmux session
@@ -3586,11 +3590,11 @@ const server = http.createServer(async (req, res) => {
       }
       // No identity at all (raw tooling): a read-only peek at every queue. It is
       // not a lieutenant starting its turn, so no wake flag or cursor moves.
-      if (!lt) return sendJson(res, 200, { items: delivery.pending(), head: delivery.head() });
+      if (!lt) return sendJson(res, 200, { items: served(delivery.pending()), head: delivery.head() });
       // Draining is SEEING: the drained cursor moves, the UI flips queued→seen.
       const r = delivery.drain(lt);
       if (r.seen) broadcast();
-      return sendJson(res, 200, { items: r.items, head: delivery.head() });
+      return sendJson(res, 200, { items: served(r.items), head: delivery.head() });
     }
 
     // ----- feed.ack: commit the cursor AFTER the items were handled -----
