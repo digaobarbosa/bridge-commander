@@ -41,7 +41,9 @@ them drift.
   `{error, code}` answers `code`, anything else a 200.
 - **The harness port** is the only seam to agent sessions — seven verbs (`spawn`, `send`,
   `alive`, `resumable`, `resume`, `kill`, `onTurnEnd`); see [harness/README.md](harness/README.md).
-  Builtins: `claude` and `codex` over tmux, plus an in-memory `fake` for tests.
+  Builtins: `claude` and `codex` over tmux, plus an in-memory `fake` for tests. server.js
+  binds it once to the workspace's harness state dir and turn-end URL, so callers pass only
+  real choices; harness file paths, the state key (`keyOf`) and tmux calls stay behind it.
 - **Workers**: `bc-axi card start <id>` is ONE atomic op — isolated worktree
   (`treehouse get --lease` when available, else `git worktree add`), a real worker session
   launched with the card's brief — the card's playbook, a markdown file from

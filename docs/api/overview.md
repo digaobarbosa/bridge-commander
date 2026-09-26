@@ -167,13 +167,17 @@ file-backed `fake` for tests; adding a harness is implementing these seven verbs
 else. A verb a harness cannot honor THROWS with the reason — never silently succeeds.
 Harness working state (session ids, prompts, turn-end logs) lives in the workspace's
 `.bridge-commander/harness/` — never global; spawned session names are unique per workspace.
+The server BINDS the port to that dir and its turn-end callback URL once
+(`getHarness(name, env)` / `harnessFor(ref, env)`), so no call passes them and none can
+forget them; the port also owns the state key (`keyOf(ref)`: `session` or
+`session:window`) and the spawnable-name rule (`isSpawnableSession(name)`).
 
 **Optional capability verbs.** Beyond the seven REQUIRED verbs a harness MAY expose extra
 verbs for features not every harness can honor. The port never validates them (requiring
 one would force every harness, `fake` included, to implement it); the server
 capability-checks at the call site (`typeof impl.openPane === 'function'`) and degrades
 gracefully when the verb is absent. Current optional verbs (pane viewing, slash commands,
-session status, window adoption):
+session status, window adoption, the brief file, pane pids):
 
 | Verb | Signature | Called by | Purpose |
 |---|---|---|---|
@@ -184,6 +188,8 @@ session status, window adoption):
 | `harness.runCommand` | `ref, line → string` | ⚙️ | run one slash-command line in the session (pass-through or emulated per harness) and return the reply text. Unknown names throw — and so does a command whose argument is missing or unrecognised, BEFORE it does anything: claude's `/output-style` writes the style into the session's own `.claude/settings.local.json`, so a typo must not sit there waiting to surprise the next conversation. The setting is read at process start, so the reply says it applies the next time that session STARTS, naming no command to get there (`/reset` exists only for lieutenant targets) — no harness verb restarts a session on the caller's behalf |
 | `harness.status` | `ref → {model, contextUsed, contextWindow, rateLimits?}` | ⚙️ | session vitals; the server caches the result at each turn-end and serves it on the board payload (the lane/card context bars) |
 | `harness.adoptWindow` | `ref, window, taken? → HarnessRef\|null` | ⚙️ supervision | migrate a session-granular ref to window granularity without restarting the agent — the tmux adapters rename the session's first window (the lieutenants registered before their ref carried a window) — `taken` names windows that belong to someone else and must never be adopted; `null` = the agent's window cannot be identified, keep the old ref |
+| `harness.brief` | `ref → path\|null` | ⚙️ card.start | the file the brief was persisted to at spawn, attached to the card as its `brief` artifact on start and resume (deduped by uri); `null` = none, nothing attached |
+| `harness.panePids` | `ref\|session → [{window, pid}]` | ⚙️ sysload | every pane of the ref's SESSION (all windows), so the load panel can attribute each window to its agent; `[]` when the session is gone. A harness without it has no load rows |
 
 ## Invariants
 

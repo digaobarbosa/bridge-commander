@@ -69,7 +69,7 @@ function assertCleanRef(ref, harness) {
 
 test('every subject exposes the seven verbs and the optional ones the server uses', () => {
   for (const impl of [...SUBJECTS.map((x) => x.impl), fake]) {
-    for (const verb of VERBS.concat(['openPane', 'paneSnapshot', 'paneInput', 'commands', 'runCommand', 'status', 'adoptWindow'])) {
+    for (const verb of VERBS.concat(['openPane', 'paneSnapshot', 'paneInput', 'commands', 'runCommand', 'status', 'adoptWindow', 'brief'])) {
       assert.strictEqual(typeof impl[verb], 'function', verb);
     }
   }
@@ -114,6 +114,16 @@ for (const sub of SUBJECTS) {
       const w = await h.spawn(cwd, 'go', { session: 'bc-shape', window: 'w-1', stateDir, installHooks: false });
       assert.strictEqual(w.window, 'w-1');
       assertCleanRef(w, n);
+    }));
+  });
+
+  test(`${n}: brief names the prompt file spawn persisted, and null when there is none`, async () => {
+    await withDirs((cwd, stateDir) => withMock(sub.ready, async () => {
+      const ref = await h.spawn(cwd, 'the brief', { session: 'bc-brief', window: 'w-1', stateDir, installHooks: false });
+      const file = await h.brief(ref, { stateDir });
+      assert.strictEqual(file, path.join(stateDir, 'bc-brief:w-1.prompt'));
+      assert.strictEqual(fs.readFileSync(file, 'utf8'), 'the brief');
+      assert.strictEqual(await h.brief({ ...ref, window: 'w-2' }, { stateDir }), null);
     }));
   });
 
@@ -253,6 +263,27 @@ for (const sub of SUBJECTS) {
   });
 }
 
+// panePids — the load panel's pane pids, through the port instead of a tmux
+// call in the server. Exact-match target, every window of the session.
+for (const sub of SUBJECTS) {
+  const h = sub.impl;
+  test(`${sub.name}: panePids lists every pane of the session by exact name; [] when tmux cannot say`, async () => {
+    const tmuxMod = require('../tmux.js');
+    const original = tmuxMod.tryTmux;
+    const calls = [];
+    let answer = 'lt\t200\nw-c1\t100\n';
+    tmuxMod.tryTmux = async (...args) => { calls.push(args); return answer; };
+    try {
+      const ref = { harness: sub.name, session: 'bc-lt-ada', window: 'lt', cwd: '/tmp' };
+      assert.deepStrictEqual(await h.panePids(ref), [{ window: 'lt', pid: 200 }, { window: 'w-c1', pid: 100 }]);
+      assert.deepStrictEqual(calls[0], ['list-panes', '-s', '-t', '=bc-lt-ada:', '-F', '#{window_name}\t#{pane_pid}']);
+      assert.deepStrictEqual(await h.panePids('bc-lt-ada'), [{ window: 'lt', pid: 200 }, { window: 'w-c1', pid: 100 }], 'a bare session name too');
+      answer = null;
+      assert.deepStrictEqual(await h.panePids(ref), []);
+    } finally { tmuxMod.tryTmux = original; }
+  });
+}
+
 // ---------- the fake, where the same promises apply ----------
 test('fake: spawn returns a clean ref; resume with no memory comes back with NO resumeId key', async () => {
   fake.reset();
@@ -264,6 +295,16 @@ test('fake: spawn returns a clean ref; resume with no memory comes back with NO 
   const fresh = await fake.resume({ harness: 'fake', session: 'bc-fnoid', window: 'lt', cwd: '/tmp/x' });
   assert.ok(!('resumeId' in fresh), JSON.stringify(fresh));
   assertCleanRef(fresh, 'fake');
+});
+
+test('fake: brief names the prompt file spawn persisted in opts.stateDir, and null without one', async () => {
+  fake.reset();
+  await withDirs(async (cwd, stateDir) => {
+    const ref = await fake.spawn(cwd, 'the brief', { session: 'bc-fbrief', window: 'w-1', stateDir });
+    assert.strictEqual(fake.brief(ref, { stateDir }), path.join(stateDir, 'bc-fbrief:w-1.prompt'));
+    assert.strictEqual(fake.brief(ref), null, 'no stateDir, no file to name');
+    assert.strictEqual(fake.brief({ ...ref, window: 'w-2' }, { stateDir }), null);
+  });
 });
 
 test('fake: send to a dead session throws; kill of a missing one is a no-op', async () => {

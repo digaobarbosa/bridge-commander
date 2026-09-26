@@ -55,9 +55,14 @@ function makeRef(harness, session, window, cwd, resumeId) {
   return ref;
 }
 
+// The brief spawn persists (its source of truth — it never rides argv).
+function promptFile(stateDir, key) {
+  return path.join(stateDir, `${key}.prompt`);
+}
+
 /**
  * tmuxAdapter(profile) -> harness impl (the seven verbs plus the optional
- * pane, command, status and adoptWindow verbs).
+ * pane, command, status, brief, panePids and adoptWindow verbs).
  */
 function tmuxAdapter(profile) {
   const callbackOf = (opts) => opts.callbackUrl || process.env.BC_TURNEND_URL || '';
@@ -93,8 +98,8 @@ function tmuxAdapter(profile) {
     };
     if (profile.prepare) await profile.prepare(cwdAbs, key, ctx);
 
-    const promptFile = path.join(stateDir, `${key}.prompt`);
-    fs.writeFileSync(promptFile, prompt);
+    const briefFile = promptFile(stateDir, key);
+    fs.writeFileSync(briefFile, prompt);
     // Recorded so resume() can replay them — a worker pinned to a model by its
     // playbook must not come back on the default one, nor a worker born asking
     // permission come back skipping it.
@@ -110,7 +115,7 @@ function tmuxAdapter(profile) {
       await s.verifyLive(target, profile.settle);
     } catch (err) {
       await s.killPane(session, window);
-      try { fs.unlinkSync(promptFile); } catch { /* best-effort */ }
+      try { fs.unlinkSync(briefFile); } catch { /* best-effort */ }
       throw err;
     }
     return makeRef(profile.name, session, window, cwdAbs, ctx.resumeId);
@@ -118,7 +123,7 @@ function tmuxAdapter(profile) {
 
   /** send(ref, text) — verified submit; Enter is retried, never the text. Throws when it provably failed. */
   async function send(ref, text) {
-    const name = s.stateKey(ref.session, ref.window);
+    const name = s.keyOf(ref);
     if (!(await alive(ref))) throw new Error(`session ${name} is not alive`);
     const verdict = await t.submit(s.paneTarget(ref.session, ref.window), text, submitOpts());
     if (verdict === 'pending') throw new Error(`text not submitted to ${name} (Enter swallowed; text left in composer)`);
@@ -140,7 +145,7 @@ function tmuxAdapter(profile) {
   // The resume id to use: the relay's record (refreshed every turn) beats the
   // ref's, which may be stale or — for codex — never adopted.
   function resumeIdOf(ref, stateDir) {
-    return s.readSessionId(stateDir, s.stateKey(ref.session, ref.window)) || ref.resumeId || undefined;
+    return s.readSessionId(stateDir, s.keyOf(ref)) || ref.resumeId || undefined;
   }
 
   /** resumable(ref, opts?) -> bool — would resume restore memory? Introspection only. */
@@ -152,7 +157,7 @@ function tmuxAdapter(profile) {
   async function resume(ref, opts = {}) {
     if (await alive(ref)) return { ...ref };
     const stateDir = s.stateDirOf(opts);
-    const key = s.stateKey(ref.session, ref.window);
+    const key = s.keyOf(ref);
     const resumeId = resumeIdOf(ref, stateDir);
     // The spawn's launch facts are replayed, not rebuilt; opts wins over the
     // record, and a missing or corrupt record is no flags, never a throw.
@@ -184,6 +189,12 @@ function tmuxAdapter(profile) {
     await s.killPane(ref.session, ref.window);
   }
 
+  /** brief(ref, opts?) -> path | null — the brief spawn persisted for this agent, when it is on disk. */
+  function brief(ref, opts = {}) {
+    const file = promptFile(s.stateDirOf(opts), s.keyOf(ref));
+    return fs.existsSync(file) ? file : null;
+  }
+
   /** commands(ref?) — the shared trio plus the profile's own. */
   function commands(ref) {
     const own = profile.commands ? profile.commands(ref) : [];
@@ -198,7 +209,7 @@ function tmuxAdapter(profile) {
   /** runCommand(ref, line, opts?) -> reply text — /help, /status, the profile's handlers, then pass-through. */
   function runCommand(ref, command, opts = {}) {
     return runSlashCommand(ref, command, opts, {
-      key: s.stateKey(ref.session, ref.window),
+      key: s.keyOf(ref),
       commands, status, send,
       handlers: profile.handlers || {},
       passthrough: ['/compact'].concat(profile.passthrough || []),
@@ -210,8 +221,8 @@ function tmuxAdapter(profile) {
     spawn, send, alive, resumable, resume, kill,
     onTurnEnd: s.onTurnEnd,
     openPane: s.openPane, paneSnapshot: s.paneSnapshot, paneInput: s.paneInput,
-    adoptWindow: s.adoptWindow,
-    commands, runCommand, status,
+    adoptWindow: s.adoptWindow, panePids: s.panePids,
+    commands, runCommand, status, brief,
   };
 }
 

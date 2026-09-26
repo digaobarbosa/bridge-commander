@@ -24,7 +24,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { STATE_DIR_NAME, findWorkspace, toEpochSecs, stateKey, readSessionId } = require('./util.js');
+const { STATE_DIR_NAME, findWorkspace, toEpochSecs, keyOf, readSessionId } = require('./util.js');
 
 const TAIL_BYTES = 256 * 1024;
 
@@ -244,7 +244,7 @@ function codexRateLimits(rl) {
 // opts.stateDir comes from the caller that knows where harness state lives
 // (codex-tmux status()); without it only the ref can answer.
 function codexThreadId(ref, opts = {}) {
-  const rec = ref && ref.session ? readSessionId(opts.stateDir, stateKey(ref.session, ref.window)) : null;
+  const rec = ref && ref.session ? readSessionId(opts.stateDir, keyOf(ref)) : null;
   if (rec) return rec;
   return (ref && ref.resumeId) || null;
 }

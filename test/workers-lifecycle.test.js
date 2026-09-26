@@ -98,7 +98,7 @@ function rig(opts = {}) {
     ownerSession: (card) => 'bc-lt-' + card.owner,
     workerWindow: (id) => 'w-' + id,
     log: () => {},
-    config: { stateDir: tmp, harnessStateDir: tmp, turnendUrl: 'http://127.0.0.1:1/api/turn-end',
+    config: { stateDir: tmp,
       teardownMs: 1000, restartTeardownMs: 500, staleSecs: 30 * 60 },
   };
   const W = createWorkers(deps);

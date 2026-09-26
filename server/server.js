@@ -67,7 +67,8 @@ const crypto = require('crypto');
 // The harness port — the ONLY seam the server speaks to agent sessions through
 // (docs/api/overview.md, "harness port"). Lazy builtins: requiring port.js
 // drags in no tmux/claude machinery until a ref is actually dispatched.
-const { isHarnessRef, harnessFor, getHarness } = require(path.join(__dirname, '..', 'harness', 'port.js'));
+const port = require(path.join(__dirname, '..', 'harness', 'port.js'));
+const { isHarnessRef, keyOf, isSpawnableSession } = port;
 const { createWorktree, releaseWorktree, worktreeToolFor } = require(path.join(__dirname, 'worktrees.js'));
 const { createWorkers } = require(path.join(__dirname, 'workers.js'));
 const { runHooks, runTeardown, listAllHooks, runNamedHook, runningHook, readRuns, lastRuns, hookKey,
@@ -159,9 +160,8 @@ const PID_FILE = path.join(STATE_DIR, 'server.pid');
 const UPLOADS_DIR = path.join(STATE_DIR, 'uploads');
 const UI_DIR = path.join(__dirname, '..', 'ui');
 // Harness working state (session ids, prompts, turn-end logs) lives in the
-// WORKSPACE, never in the harness's global last-resort dir — two boards on one
-// machine must never share it. BC_HARNESS_STATE stays an explicit override.
-const HARNESS_STATE_DIR = process.env.BC_HARNESS_STATE || path.join(STATE_DIR, 'harness');
+// WORKSPACE (layout.js harnessStateDir); the port is bound to it below.
+const HARNESS_STATE_DIR = names.harnessStateDir(STATE_DIR);
 fs.mkdirSync(QUEUE_DIR, { recursive: true });
 fs.mkdirSync(CHAT_DIR, { recursive: true });
 fs.mkdirSync(HARNESS_STATE_DIR, { recursive: true });
@@ -261,6 +261,12 @@ const LOOPBACKS = ['127.0.0.1', 'localhost', '::1'];
 const BIND_HOST = opts.host || configHost() || '127.0.0.1';
 // Turn-end hooks (workspace-level and per-worker-spawn) POST here.
 const TURNEND_URL = 'http://127.0.0.1:' + PORT + '/api/turn-end';
+// The harness port BOUND to this workspace: every verb gets the state dir and
+// the turn-end callback from here, so no call site passes them and none can
+// forget them. The rest of the server asks for harnesses only through these two.
+const HARNESS_ENV = Object.freeze({ stateDir: HARNESS_STATE_DIR, callbackUrl: TURNEND_URL });
+function harnessFor(ref) { return port.harnessFor(ref, HARNESS_ENV); }
+function getHarness(name) { return port.getHarness(name, HARNESS_ENV); }
 
 // The commit this process is RUNNING, decided once here at boot and never
 // re-read: a merge into the checkout below moves the files, not this record,
@@ -753,8 +759,7 @@ function respawnPrompt(lt) {
 // a model comes back on it, respawn after respawn.
 function ltLaunchOpts(lt, extra) {
   const opts = Object.assign(
-    { stateDir: HARNESS_STATE_DIR, callbackUrl: TURNEND_URL, installHooks: false,
-      permissionMode: configPermissionMode() },
+    { installHooks: false, permissionMode: configPermissionMode() },
     extra || {}
   );
   const model = lt && validModel(lt.model);
@@ -778,7 +783,7 @@ async function respawnFresh(lt, harness) {
   const impl = getHarness(harness || lt.ref.harness);
   // Keep the session name (an incarnation, not a new entity) when it is
   // spawnable; a founder's foreign name gets a workspace-scoped one.
-  const session = /^bc-[A-Za-z0-9_-]+$/.test(lt.ref.session)
+  const session = isSpawnableSession(lt.ref.session)
     ? lt.ref.session : names.lieutenantSession(WORKSPACE, lt.id);
   const window = lt.ref.window || names.LIEUTENANT_WINDOW;
   try { await harnessFor(lt.ref).kill({ ...lt.ref, window }); }
@@ -1246,7 +1251,7 @@ function resolvePaneRef(kind, id, want) {
   return { ref: lt.ref, reason: '' };
 }
 const panes = new Map(); // paneKey -> { clients: Set<res>, handle, last }
-function paneKey(ref) { return ref.harness + '/' + ref.session + (ref.window ? ':' + ref.window : ''); }
+function paneKey(ref) { return ref.harness + '/' + keyOf(ref); }
 function paneWrite(res, event, data) { res.write(sseFrame(event, data)); }
 function paneStream(req, res, ref, reason) {
   res.writeHead(200, SSE_HEADERS);
@@ -1323,16 +1328,24 @@ function sysloadTargets() {
     if (w.done || !isHarnessRef(w.ref)) continue;
     const card = findCard(w.card);
     out.push({ kind: 'worker', id: w.card, label: (card && card.title) || w.card,
-      session: w.ref.session, window: w.ref.window || null });
+      session: w.ref.session, window: w.ref.window || null, ref: w.ref });
   }
   for (const lt of board.lieutenants) {
     if (!isHarnessRef(lt.ref)) continue;
     out.push({ kind: 'lieutenant', id: lt.id, label: lt.name,
-      session: lt.ref.session, window: lt.ref.window || null });
+      session: lt.ref.session, window: lt.ref.window || null, ref: lt.ref });
   }
   return out;
 }
-const sysload = createSampler({ workspace: WORKSPACE, targets: sysloadTargets, intervalMs: SYSLOAD_MS });
+// Pane pids come through the port (its optional panePids verb): a harness
+// without it contributes no rows, and an unknown one throws into the sampler,
+// which reads that as no rows too.
+function sysloadPanePids(target) {
+  const impl = harnessFor(target.ref);
+  return typeof impl.panePids === 'function' ? impl.panePids(target.ref) : [];
+}
+const sysload = createSampler({ workspace: WORKSPACE, targets: sysloadTargets, panePids: sysloadPanePids,
+  intervalMs: SYSLOAD_MS });
 
 // Named ping (not an SSE comment): comments are invisible to EventSource, so
 // the client's staleness watchdog couldn't see the stream is alive. Pane
@@ -1661,13 +1674,13 @@ async function runChatCommand(target, text) {
     // the FULL line goes to the harness — pass-through commands (/compact,
     // claude's /autocompact) may carry arguments; `name` only did the match
     const impl = getHarness(r.ref.harness);
-    const result = await impl.runCommand(r.ref, text, { stateDir: HARNESS_STATE_DIR });
+    const result = await impl.runCommand(r.ref, text);
     // /status also fetches the structured status (a cheap transcript read) so the
     // reply carries both the formatted text (fallback) and the payload the UI
     // renders as model + context bar + rate lines — never parsing the prose.
     let extra;
     if (name === '/status' && typeof impl.status === 'function') {
-      try { const st = await impl.status(r.ref, { stateDir: HARNESS_STATE_DIR }); if (st && typeof st === 'object') extra = { status: st }; } catch {}
+      try { const st = await impl.status(r.ref); if (st && typeof st === 'object') extra = { status: st }; } catch {}
     }
     reply(r.ref.harness, String(result == null ? name + ' done' : result), extra);
   } catch (e) {
@@ -1686,7 +1699,7 @@ async function refreshAgentStatus(rec) {
   try { impl = getHarness(rec.ref.harness); } catch { return false; }
   if (typeof impl.status !== 'function') return false;
   try {
-    const st = await impl.status(rec.ref, { stateDir: HARNESS_STATE_DIR });
+    const st = await impl.status(rec.ref);
     if (!st || typeof st !== 'object') return false;
     rec.agentStatus = Object.assign({}, st, { ts: now() });
     return true;
@@ -2136,7 +2149,7 @@ function ownerSession(card) {
   const lt = board.lieutenants.find((l) => l.id === card.owner);
   // Mirror the supervision respawn rule: a founder's foreign session name is
   // not spawnable — those workers get the workspace-scoped lieutenant name.
-  return lt && isHarnessRef(lt.ref) && /^bc-[A-Za-z0-9_-]+$/.test(lt.ref.session)
+  return lt && isHarnessRef(lt.ref) && isSpawnableSession(lt.ref.session)
     ? lt.ref.session
     : names.lieutenantSession(WORKSPACE, card.owner);
 }
@@ -2145,9 +2158,10 @@ function ownerSession(card) {
 // refKey — the harness state key an agent's turn-end hook posts as `session`:
 // the bare tmux session for a session-granular ref, `session:window` for a
 // window-granular one. Lieutenants are window-granular too (their own `lt`
-// window — names.LIEUTENANT_WINDOW), so this is NOT worker-only.
-function refKey(ref) { return ref.window ? ref.session + ':' + ref.window : ref.session; }
-function workerName(ref) { return refKey(ref); }
+// window — names.LIEUTENANT_WINDOW), so this is NOT worker-only. Both are the
+// port's keyOf: the harness owns the key's shape.
+function refKey(ref) { return keyOf(ref); }
+function workerName(ref) { return keyOf(ref); }
 function findWorker(cardId) { return workers.find(cardId); }
 
 // ---------- event dedupe keys (POST /api/cards/<id>/events `key`) ----------
@@ -2351,7 +2365,7 @@ const workers = createWorkers({
   permissionPending: (cardId) => permissions.has((it) => it.card === cardId),
   log: (m) => console.error(now() + ' ' + m),
   config: {
-    stateDir: STATE_DIR, harnessStateDir: HARNESS_STATE_DIR, turnendUrl: TURNEND_URL,
+    stateDir: STATE_DIR,
     teardownMs: TEARDOWN_TIMEOUT_MS, restartTeardownMs: RESTART_TEARDOWN_TIMEOUT_MS,
     staleSecs: BC_WORKER_STALE_SECS,
   },

@@ -85,6 +85,24 @@ function stateKey(session, window) {
 }
 
 /**
+ * keyOf(ref) — a ref's state key. The port exports this one, so the server,
+ * the fake and the adapters can never disagree about the key's shape.
+ */
+function keyOf(ref) {
+  return stateKey(ref.session, ref.window);
+}
+
+/**
+ * isSpawnableSession(name) — would a spawn accept this tmux session name?
+ * `bc-` plus characters tmux never reads as target syntax (no '.' or ':').
+ * A founder's foreign session (the tmux it was typed into) fails it, so the
+ * server knows to mint a workspace-scoped name before a respawn.
+ */
+function isSpawnableSession(name) {
+  return typeof name === 'string' && /^bc-[A-Za-z0-9_-]+$/.test(name);
+}
+
+/**
  * readSessionId(stateDir, key) -> string | null — the resume id the turn-end
  * relay recorded for this agent (refreshed every turn, so it beats the ref's).
  */
@@ -119,5 +137,5 @@ async function excludeFromGit(dir, entry) {
 
 module.exports = {
   STATE_DIR_NAME, tmuxSession, readStdin, findWorkspace, toEpochSecs,
-  shellQuote, stateKey, readSessionId, excludeFromGit,
+  shellQuote, stateKey, keyOf, isSpawnableSession, readSessionId, excludeFromGit,
 };

@@ -11,10 +11,14 @@
 //   onTurnEnd(ref, hook, opts?) -> unsubscribe()   turn-boundary detection
 //
 // opts is one bag for spawn, resumable, resume and onTurnEnd: stateDir,
-// callbackUrl, extraArgs, allowRoot, installHooks, session, window.
+// callbackUrl, extraArgs, allowRoot, installHooks, session, window. The first
+// two are plumbing: a server binds them once (getHarness(name, env) /
+// harnessFor(ref, env), see "binding" below) and passes only the rest.
 //
 // A HarnessRef is plain JSON: { harness, session, window?, cwd, resumeId? },
-// with window and resumeId either absent or strings.
+// with window and resumeId either absent or strings. keyOf(ref) is its state
+// key (`session` or `session:window`) — the name a turn-end relay posts and
+// every per-agent state file carries. Nobody outside the harness builds it.
 //
 // A verb a harness cannot honor THROWS with the reason, never silently
 // succeeds. The optional capability verbs (pane viewing, slash commands,
@@ -22,13 +26,15 @@
 // for them lives in ONE place, harness/README.md, and the inventory in
 // docs/api/overview.md.
 
+const { keyOf, isSpawnableSession } = require('./util.js');
+
 const VERBS = ['spawn', 'send', 'alive', 'resumable', 'resume', 'kill', 'onTurnEnd'];
 
 // ---------- paneInput payload validation (the port contract, in one place) ----------
 // Lives HERE, not in an implementation, because every harness that offers
 // paneInput must enforce the SAME contract: a fake that is laxer than the real
 // thing turns route tests green against payloads tmux would choke on. port.js
-// has no dependencies, so both the tmux adapters and the fake can require it.
+// depends only on util.js, so both the tmux adapters and the fake can require it.
 //
 // KEY_RE — tmux's key-name grammar. Anchored, and no branch can begin with '-':
 // tmux is spawned via execFile (an argv array, so no shell) and sendKey passes
@@ -96,7 +102,7 @@ function registerHarness(name, impl) {
   return impl;
 }
 
-function getHarness(name) {
+function lookup(name) {
   if (registry.has(name)) return registry.get(name);
   if (Object.prototype.hasOwnProperty.call(BUILTINS, name)) {
     const impl = validateImpl(name, require(BUILTINS[name]));
@@ -104,6 +110,47 @@ function getHarness(name) {
     return impl;
   }
   throw new Error(`unknown harness "${name}" (known: ${[...new Set([...registry.keys(), ...Object.keys(BUILTINS)])].join(', ')})`);
+}
+
+// ---------- binding ----------
+// Two opts are plumbing, not choices: where harness state lives (stateDir) and
+// where turn ends are POSTed (callbackUrl). A board has exactly one of each, and
+// a call that forgot stateDir used to land silently in the global last-resort
+// dir, shared by every board on the machine. A BOUND instance carries both, so
+// its verbs take only the real per-call choices (permissionMode, extraArgs,
+// session, window, …). The binding wins over whatever a caller passes.
+//
+// OPTS_AT — which argument of each verb is its opts bag. A verb not listed
+// takes no plumbing and is passed through as it is, optional verbs included,
+// so a capability check (`typeof impl.openPane`) reads the same bound or not.
+const OPTS_AT = { spawn: 2, resumable: 1, resume: 1, onTurnEnd: 2, status: 1, runCommand: 2, brief: 1 };
+const bindings = new WeakMap(); // env -> Map(impl -> bound instance)
+
+function bind(impl, env) {
+  if (!env || typeof env.stateDir !== 'string' || !env.stateDir) {
+    throw new TypeError('a harness binding needs a stateDir');
+  }
+  let cache = bindings.get(env);
+  if (!cache) bindings.set(env, (cache = new Map()));
+  if (cache.has(impl)) return cache.get(impl);
+  const plumbing = { stateDir: env.stateDir };
+  if (env.callbackUrl) plumbing.callbackUrl = env.callbackUrl;
+  const out = {};
+  for (const [verb, fn] of Object.entries(impl)) {
+    const at = OPTS_AT[verb];
+    out[verb] = typeof fn !== 'function' || at === undefined ? fn
+      : (...args) => { args[at] = { ...args[at], ...plumbing }; return fn.apply(impl, args); };
+  }
+  cache.set(impl, out);
+  return out;
+}
+
+// getHarness(name, env?) — the implementation registered under name; bound to
+// env ({ stateDir, callbackUrl? }) when one is given. The unbound form is for
+// tests and embedders that pass opts themselves.
+function getHarness(name, env) {
+  const impl = lookup(name);
+  return env ? bind(impl, env) : impl;
 }
 
 // isHarnessRef — structural check for a persisted/deserialized ref.
@@ -117,11 +164,12 @@ function isHarnessRef(ref) {
     && (ref.resumeId === undefined || typeof ref.resumeId === 'string');
 }
 
-// harnessFor(ref) — dispatch helper: the implementation a ref belongs to.
-function harnessFor(ref) {
+// harnessFor(ref, env?) — dispatch helper: the implementation a ref belongs
+// to, bound to env when one is given (see getHarness).
+function harnessFor(ref, env) {
   if (!isHarnessRef(ref)) throw new TypeError('not a HarnessRef: ' + JSON.stringify(ref));
-  return getHarness(ref.harness);
+  return getHarness(ref.harness, env);
 }
 
 module.exports = { VERBS, registerHarness, getHarness, isHarnessRef, harnessFor,
-  validatePaneInput, KEY_RE, PANE_INPUT_MAX };
+  keyOf, isSpawnableSession, validatePaneInput, KEY_RE, PANE_INPUT_MAX };

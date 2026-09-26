@@ -80,6 +80,15 @@ function resolveStateDir(ws) {
   return nu;
 }
 
+// harnessStateDir(stateDir) — where the harness keeps its per-agent files
+// (prompts, session ids, turn-end logs): inside the workspace, never the
+// harness's global last-resort dir, so two boards on one machine never share
+// it. BC_HARNESS_STATE stays an explicit override. The server binds the port
+// to it and the CLI installs its hooks against it — one rule for both.
+function harnessStateDir(stateDir) {
+  return process.env.BC_HARNESS_STATE || path.join(stateDir, 'harness');
+}
+
 // Home last-resort dir holds the captain.md seed and the harness fallback state.
 // Same non-destructive rule. `home` defaults to os.homedir() (override for tests).
 function migrateHomeStateDir(home) {
@@ -168,7 +177,7 @@ const LIEUTENANT_WINDOW = 'lt';
 module.exports = {
   ID_RE, isId, slugBase,
   STATE_DIR_NAME, LEGACY_STATE_DIR_NAME,
-  migrateStateDir, resolveStateDir, migrateHomeStateDir, isWorkspace,
+  migrateStateDir, resolveStateDir, migrateHomeStateDir, isWorkspace, harnessStateDir,
   ONBOARDING_STEPS,
   charterPath, readCharter, writeCharter,
   workspaceDisc, lieutenantSession, workerWindow, LIEUTENANT_WINDOW,
