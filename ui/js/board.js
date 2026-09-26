@@ -10,6 +10,7 @@ import { openLieutenantChat } from './chat.js';
 import { openCardPane } from './pane.js';
 import { avatarGridHtml, wireAvatarGrid } from './avatars.js';
 import { selectionOn, isSelected, enterSelection, pick } from './selection.js';
+import { openPopover } from './popover.js';
 
 const boardEl = document.getElementById('board');
 
@@ -202,43 +203,25 @@ function orderComment(cardId, to) {
 }
 
 // ---------- move / actions menu ----------
-const menuEl = document.getElementById('move-menu');
 export function openMoveMenu(cardId, x, y) {
   const c = cards().find((k) => k.id === cardId);
   if (!c) return;
-  menuEl.textContent = '';
-  const head = document.createElement('div');
-  head.className = 'mm-head';
-  head.textContent = 'move to';
-  menuEl.appendChild(head);
-  for (const col of columns()) {
-    const b = document.createElement('button');
-    b.textContent = (col.id === c.column ? '● ' : '') + col.title;
-    if (col.id === c.column) b.className = 'cur';
-    else b.onclick = async () => { closeMoveMenu(); try { await api.moveCard(cardId, col.id, orderComment(cardId, col.id)); } catch (e) { alert(e.message); } };
-    menuEl.appendChild(b);
-  }
-  const sep = document.createElement('div');
-  sep.className = 'mm-sep';
-  menuEl.appendChild(sep);
-  // The way INTO selection mode, on both the board and the table — nothing has
-  // to sit on screen the rest of the time for this to be reachable.
-  const many = document.createElement('button');
-  many.textContent = '☑ select cards';
-  many.onclick = () => { closeMoveMenu(); enterSelection(cardId); render(); };
-  menuEl.appendChild(many);
-  const kill = document.createElement('button');
-  kill.className = 'danger';
-  kill.textContent = '✕ archive';
-  kill.onclick = async () => { closeMoveMenu(); try { await api.archiveCard(cardId); } catch (e) { alert(e.message); } };
-  menuEl.appendChild(kill);
-  menuEl.hidden = false;
-  const r = menuEl.getBoundingClientRect();
-  menuEl.style.left = Math.max(8, Math.min(x, window.innerWidth - r.width - 8)) + 'px';
-  menuEl.style.top = Math.max(8, Math.min(y, window.innerHeight - r.height - 8)) + 'px';
+  const move = (col) => async () => {
+    try { await api.moveCard(cardId, col.id, orderComment(cardId, col.id)); } catch (e) { alert(e.message); }
+  };
+  openPopover({ x, y }, [
+    { head: 'move to' },
+    ...columns().map((col) => col.id === c.column
+      ? { label: '● ' + col.title, current: true }
+      : { label: col.title, onClick: move(col) }),
+    { sep: true },
+    // The way INTO selection mode, on both the board and the table — nothing has
+    // to sit on screen the rest of the time for this to be reachable.
+    { label: '☑ select cards', onClick: () => { enterSelection(cardId); render(); } },
+    { label: '✕ archive', danger: true,
+      onClick: async () => { try { await api.archiveCard(cardId); } catch (e) { alert(e.message); } } },
+  ], { id: 'move-menu' });
 }
-export function closeMoveMenu() { menuEl.hidden = true; }
-document.addEventListener('click', (e) => { if (!menuEl.hidden && !menuEl.contains(e.target)) closeMoveMenu(); });
 
 // ---------- new card modal ----------
 const ncOverlay = document.getElementById('nc-overlay');

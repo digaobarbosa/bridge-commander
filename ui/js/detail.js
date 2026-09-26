@@ -8,6 +8,7 @@ import { openCardThread, syncChatToMain } from './chat.js';
 import { openFile, closeFile, fileKey, fileDirty, fileMerges, fileResolve, fileUpdate, fileNotice } from './filepane.js';
 import { openMoveMenu } from './board.js';
 import { archivedCard, unarchive } from './archive.js';
+import { openPopover } from './popover.js';
 
 const isDesktop = () => window.innerWidth > 760; // matches the chat.js layout breakpoint
 
@@ -146,9 +147,7 @@ document.addEventListener('click', (e) => {
     t.closest('#table tbody tr') ||           // table/archive rows switch cards the same way
     t.closest('#archive tbody tr') ||
     t.closest('#lt-overlay') ||               // new-lieutenant modal
-    t.closest('#move-menu') ||                // transient popovers dismiss on their own
-    t.closest('#owner-menu') ||
-    t.closest('#playbook-menu') ||
+    t.closest('.popover') ||                  // transient popovers dismiss on their own
     t.closest('#notif-panel') ||
     t.closest('#settings-panel') ||
     t.closest('#label-picker') ||
@@ -194,7 +193,6 @@ stripEl.onkeydown = (e) => {
 };
 
 document.getElementById('dt-menu-btn').onclick = (e) => {
-  e.stopPropagation();
   if (S.openCardId) {
     const r = e.target.getBoundingClientRect();
     openMoveMenu(S.openCardId, r.left, r.bottom + 4);
@@ -713,101 +711,46 @@ avExpand.onclick = () => { avModal.classList.toggle('expanded'); };
 avOverlay.onclick = (e) => { if (e.target === avOverlay) closeArtifact(); };
 
 // ---------- owner menu (reassign the owning lieutenant) ----------
-// Popover twin of the board's move-menu (shares its look — see app.css): lists
-// the OTHER lieutenants by name with their color dot; picking one PATCHes
-// {owner} and the SSE board push repaints chip + tile live. Opened by the ✎ on
-// the owner chip, which only renders while no worker is bound (the server
-// refuses owner changes otherwise). Closes on select / outside click / Esc
-// (main.js).
-const omEl = document.getElementById('owner-menu');
-function openOwnerMenu(cardId, x, y) {
+// Lists the OTHER lieutenants by name with their color dot; picking one
+// PATCHes {owner} and the SSE board push repaints chip + tile live. Opened by
+// the ✎ on the owner chip, which only renders while no worker is bound (the
+// server refuses owner changes otherwise).
+function openOwnerMenu(cardId, anchor) {
   const c = card(cardId);
   if (!c) return;
-  omEl.textContent = '';
-  const head = document.createElement('div');
-  head.className = 'mm-head';
-  head.textContent = 'hand card to';
-  omEl.appendChild(head);
   const others = lieutenants().filter((l) => l.id !== c.owner);
-  if (!others.length) {
-    const none = document.createElement('div');
-    none.className = 'mm-none';
-    none.textContent = 'no other lieutenant';
-    omEl.appendChild(none);
-  }
-  for (const l of others) {
-    const b = document.createElement('button');
-    b.type = 'button';
-    const dot = document.createElement('span');
-    dot.className = 'dot';
-    dot.style.background = lieutenantColor(l.id);
-    b.appendChild(dot);
-    b.appendChild(document.createTextNode(l.name || l.id));
-    b.onclick = async () => {
-      closeOwnerMenu();
-      try { await api.patchCard(cardId, { owner: l.id }); }
-      catch (e) { alert(e.message); }
-    };
-    omEl.appendChild(b);
-  }
-  omEl.hidden = false;
-  const r = omEl.getBoundingClientRect();
-  omEl.style.left = Math.max(8, Math.min(x, window.innerWidth - r.width - 8)) + 'px';
-  omEl.style.top = Math.max(8, Math.min(y, window.innerHeight - r.height - 8)) + 'px';
+  openPopover(anchor, [
+    { head: 'hand card to' },
+    ...(others.length ? [] : [{ note: 'no other lieutenant' }]),
+    ...others.map((l) => ({ label: l.name || l.id, dot: lieutenantColor(l.id), onClick: () => patchOrSay(cardId, { owner: l.id }) })),
+  ], { id: 'owner-menu' });
 }
-export function closeOwnerMenu() { omEl.hidden = true; }
-export function ownerMenuOpen() { return !omEl.hidden; }
-document.addEventListener('click', (e) => { if (!omEl.hidden && !omEl.contains(e.target)) closeOwnerMenu(); });
+async function patchOrSay(cardId, body) {
+  try { await api.patchCard(cardId, body); } catch (e) { alert(e.message); }
+}
 
 // ---------- playbook menu (pick the playbook card.start renders) ----------
-// Same popover as the owner menu. The list is fetched on every open, never
-// cached: playbooks/ is a folder the captain edits, and a playbook dropped in a
-// minute ago must be pickable now. "none" is offered on purpose — clearing the
-// playbook is a real state, it just means the card cannot start.
-const bmEl = document.getElementById('playbook-menu');
-async function openPlaybookMenu(cardId, x, y) {
+// The list is fetched on every open, never cached: playbooks/ is a folder the
+// captain edits, and a playbook dropped in a minute ago must be pickable now.
+// "none" is offered on purpose — clearing the playbook is a real state, it just
+// means the card cannot start.
+async function openPlaybookMenu(cardId, anchor) {
   const c = card(cardId);
   // Backlog only, the same rule the ✎ is drawn by — a card that moved while the
   // panel was open must not pick up an editor through a stale button.
   if (!c || c.column !== 'backlog') return;
-  bmEl.textContent = '';
-  const head = document.createElement('div');
-  head.className = 'mm-head';
-  head.textContent = 'playbook';
-  bmEl.appendChild(head);
-  bmEl.hidden = false;
-  bmEl.style.left = Math.max(8, Math.min(x, window.innerWidth - 200)) + 'px';
-  bmEl.style.top = Math.max(8, y) + 'px';
+  const pop = openPopover(anchor, [{ head: 'playbook' }], { id: 'playbook-menu' });
   let ids = [];
   try { ids = (await api.playbooks()).playbooks || []; }
   catch (e) { ids = []; }
-  if (bmEl.hidden) return; // closed while the fetch was in flight
-  if (!ids.length) {
-    const none = document.createElement('div');
-    none.className = 'mm-none';
-    none.textContent = 'no playbooks in playbooks/';
-    bmEl.appendChild(none);
-  }
-  for (const id of ['', ...ids]) {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.textContent = id || '— none';
-    if (id === (c.playbook || '')) b.className = 'cur';
-    b.onclick = async () => {
-      closePlaybookMenu();
-      try { await api.patchCard(cardId, { playbook: id }); }
-      catch (e) { alert(e.message); }
-    };
-    bmEl.appendChild(b);
-  }
-  // re-clamp: the list only now has its real height
-  const r = bmEl.getBoundingClientRect();
-  bmEl.style.left = Math.max(8, Math.min(x, window.innerWidth - r.width - 8)) + 'px';
-  bmEl.style.top = Math.max(8, Math.min(y, window.innerHeight - r.height - 8)) + 'px';
+  if (!pop.isOpen()) return; // closed while the fetch was in flight
+  pop.set([
+    { head: 'playbook' },
+    ...(ids.length ? [] : [{ note: 'no playbooks in playbooks/' }]),
+    ...['', ...ids].map((id) => ({ label: id || '— none', current: id === (c.playbook || ''),
+      onClick: () => patchOrSay(cardId, { playbook: id }) })),
+  ]);
 }
-export function closePlaybookMenu() { bmEl.hidden = true; }
-export function playbookMenuOpen() { return !bmEl.hidden; }
-document.addEventListener('click', (e) => { if (!bmEl.hidden && !bmEl.contains(e.target)) closePlaybookMenu(); });
 
 // Opening the card clears its unread: level-1 events and lieutenant replies both
 // derive from the same per-card read marker server-side, so one POST covers
@@ -918,16 +861,14 @@ export function renderDetail() {
     const edit = ownerChip.querySelector('.owner-edit');
     if (edit) edit.onclick = (e) => {
       e.stopPropagation(); // the chip click is the owner filter, not the menu
-      const r = edit.getBoundingClientRect();
-      openOwnerMenu(c.id, r.left, r.bottom + 4);
+      openOwnerMenu(c.id, edit);
     };
   }
   if (attrsChanged) {
     const playbookEdit = attrsEl.querySelector('.attr-playbook .owner-edit');
     if (playbookEdit) playbookEdit.onclick = (e) => {
       e.stopPropagation();
-      const r = playbookEdit.getBoundingClientRect();
-      openPlaybookMenu(c.id, r.left, r.bottom + 4);
+      openPlaybookMenu(c.id, playbookEdit);
     };
   }
 

@@ -1096,24 +1096,22 @@ a.a-uri { color: var(--accent); }
 #mmd-close { position: fixed; top: 10px; right: 12px; z-index: 1; color: var(--dim); font-size: 20px; padding: 6px 10px; }
 #mmd-close:hover { color: var(--text); }
 
-/* ---------- move menu (owner + playbook menus share the look) ---------- */
-#move-menu, #owner-menu, #playbook-menu {
-  position: fixed; z-index: 80; min-width: 190px; display: flex; flex-direction: column;
+/* ---------- popovers (popover.js): move, owner, playbook, ⋯ and mode menus ---------- */
+.popover {
+  position: fixed; z-index: 80; min-width: 170px; display: flex; flex-direction: column;
   background: var(--bg2); border: 1px solid var(--line2); border-radius: 10px; padding: 5px;
   box-shadow: var(--shadow); animation: pop-in .12s ease-out;
 }
-#move-menu .mm-head, #owner-menu .mm-head, #playbook-menu .mm-head { color: var(--faint); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; padding: 5px 10px 3px; }
-#move-menu button, #owner-menu button, #playbook-menu button { text-align: left; font-size: 12.5px; padding: 7px 10px; border-radius: 7px; }
-#move-menu button:hover, #owner-menu button:hover, #playbook-menu button:hover { background: var(--panel2); }
-#move-menu button.cur { color: var(--faint); cursor: default; }
-#move-menu button.danger { color: var(--danger); }
-#move-menu button.danger:hover { background: rgba(239, 100, 97, .1); }
-#move-menu .mm-sep { height: 1px; background: var(--line); margin: 4px 6px; }
-#owner-menu button { display: flex; align-items: center; gap: 7px; }
-#owner-menu button .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
-#owner-menu .mm-none { color: var(--faint); font-size: 12.5px; padding: 7px 10px; }
-#playbook-menu button.cur { color: var(--accent); }
-#playbook-menu .mm-none { color: var(--faint); font-size: 12.5px; padding: 7px 10px; }
+.popover .pop-head { color: var(--faint); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; padding: 5px 10px 3px; }
+.popover .pop-note { color: var(--faint); font-size: 12.5px; padding: 7px 10px; }
+.popover .pop-sep { height: 1px; background: var(--line); margin: 4px 6px; }
+.popover button { display: flex; align-items: center; gap: 7px; text-align: left; font-size: 12.5px; padding: 7px 10px; border-radius: 7px; }
+.popover button:hover:not(:disabled) { background: var(--panel2); }
+.popover button.cur { color: var(--accent); }
+.popover button:disabled { color: var(--faint); cursor: default; }
+.popover button.danger { color: var(--danger); }
+.popover button.danger:hover { background: rgba(239, 100, 97, .1); }
+.popover button .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .attr-owner .owner-edit, .attr-playbook .owner-edit { border: none; background: none; cursor: pointer; padding: 0 2px; font-size: 11px; opacity: .6; }
 .attr-owner .owner-edit:hover, .attr-playbook .owner-edit:hover { opacity: 1; }
 .attr-playbook.none .v { color: var(--faint); font-style: italic; }
@@ -1757,7 +1755,7 @@ table.tv { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 8
   .fp-sw button { padding: 8px 12px; font-size: 13px; }
   .fp-dd-list { max-height: 220px; }
   /* the mode switcher collapses to ONE button — the current mode; tapping it
-     opens the #mode-menu dropdown (main.js) */
+     opens the mode-menu popover (main.js) */
   #view-seg button { display: none; }
   #view-seg button.on { display: inline-flex; padding: 5px 9px; font-size: 13px; border-left: none; }
   /* Six config tabs are wider than a phone, and `flex: none` + `overflow:
@@ -1765,14 +1763,6 @@ table.tv { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 8
      exists and cannot be tapped. The strip scrolls sideways instead; the buttons
      keep their size, so the thumb targets do not shrink as tabs are added. */
   #ss-tabs { max-width: 100%; overflow-x: auto; }
+  /* menu rows sized for a thumb */
+  .popover button { font-size: 13px; padding: 8px 12px; }
 }
-
-/* mobile board-mode dropdown — the move menu's look, anchored under the switcher */
-#mode-menu {
-  position: fixed; z-index: 80; min-width: 150px; display: flex; flex-direction: column;
-  background: var(--bg2); border: 1px solid var(--line2); border-radius: 10px; padding: 5px;
-  box-shadow: var(--shadow); animation: pop-in .12s ease-out;
-}
-#mode-menu button { text-align: left; font-size: 13px; padding: 8px 12px; border-radius: 7px; }
-#mode-menu button:hover { background: var(--panel2); }
-#mode-menu button.cur { color: var(--accent); }
