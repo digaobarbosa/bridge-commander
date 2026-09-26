@@ -21,10 +21,10 @@ import { openMonitor, closeMonitor, monitorOpen } from './monitor.js';
 import { closeLog, logOpen } from './logview.js';
 import { renderNotifications, onOpenCard as notifOnOpenCard } from './notify.js';
 import { renderLabelManager, renderPicker, pickerIsOpen, closeLabelPicker } from './labels.js';
-import { renderPlaybooks } from './pbmanager.js';
-import { renderProjects } from './projmanager.js';
-import { renderLieutenants } from './ltmanager.js';
-import { renderAutomation } from './automation.js';
+import { renderPlaybooks, initPlaybooks } from './pbmanager.js';
+import { renderProjects, initProjects } from './projmanager.js';
+import { renderLieutenants, initLieutenants } from './ltmanager.js';
+import { renderAutomation, initAutomation } from './automation.js';
 import './resize.js'; // draggable side-panel widths
 import './keepalivesettings.js'; // the pocket switch: hold the audio session open
 
@@ -101,6 +101,17 @@ document.getElementById('config-open').onclick = () => {
   setWsTab('labels'); // never remembered: the gear always lands on labels
   setBoardMode('settings');
 };
+
+// ---------- the list panels ----------
+// They look nothing up at import — each is handed its elements here, once — so
+// a module can be loaded without the page it paints into.
+{
+  const $ = (id) => document.getElementById(id);
+  initPlaybooks({ list: $('pb-list'), dir: $('pb-dir'), ref: $('pb-ref') });
+  initProjects({ list: $('pj-list') });
+  initLieutenants({ list: $('lt-list') });
+  initAutomation();
+}
 
 // ---------- config screen tabs ----------
 // One tab per section, one section visible. The tab is a class toggle over

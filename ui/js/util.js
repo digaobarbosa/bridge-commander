@@ -272,6 +272,16 @@ export function cardArtifacts(card) {
   return v.filter((e) => e && typeof e === 'object' && typeof e.uri === 'string' && e.uri);
 }
 
+/**
+ * How a hook run or a schedule firing ended, in the words `bc-axi` prints for
+ * it. One wording for every screen that says it — the hooks card, the ▶ note,
+ * the schedule card and its firings.
+ */
+export function runOutcome(r) {
+  return r.skipped ? 'skipped' : r.timedOut ? 'timed out' : r.error ? 'failed to start'
+    : r.canceled ? 'restarted mid-run' : r.code === null ? 'killed' : 'exit ' + r.code;
+}
+
 // First match wins, so the order is the dispatch order: a drawing is JSON on
 // disk but opens as a canvas, and audio must be claimed before the binary list.
 const FILE_KINDS = [
