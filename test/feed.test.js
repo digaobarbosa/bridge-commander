@@ -81,6 +81,35 @@ test('queue and ack cursor survive a server restart', async () => {
   }
 });
 
+// A crash mid-append leaves a torn last line. It used to make the whole queue
+// read as empty (pending items vanished) and the whole archive disappear.
+test('a torn last line costs that line only: queue, seq and archive survive', async () => {
+  const torn = '{"seq":3,"ts":"2026-01-01T00:00:00.000Z","lieu';
+  const s = await startServer({
+    seed: (dir) => {
+      const state = path.join(dir, '.bridge-commander');
+      fs.mkdirSync(path.join(state, 'queue'), { recursive: true });
+      const item = (seq) => JSON.stringify({ seq, ts: '2026-01-01T00:00:00.000Z', lieutenant: LT, kind: 'message', text: 't' + seq });
+      fs.writeFileSync(path.join(state, 'queue', LT + '.jsonl'), item(1) + '\n' + item(2) + '\n' + torn);
+      const rec = { ts: '2026-01-01T00:00:00.000Z', actor: 'user', reason: 'killed', card: { id: 'old', title: 'Old' } };
+      fs.writeFileSync(path.join(state, 'archive.jsonl'), JSON.stringify(rec) + '\n{"ts":"2026');
+    },
+  });
+  try {
+    await s.api('POST', '/api/lieutenants', { name: 'Ada', id: LT });
+    let r = await s.api('GET', '/api/feed?lieutenant=' + LT);
+    assert.deepStrictEqual(r.body.items.map((e) => e.seq), [1, 2]);
+    // the torn item's seq is never reissued, and the next append is its own line
+    await s.api('POST', '/api/feedback', { target: 'lieutenant:' + LT, text: 'after' });
+    r = await s.api('GET', '/api/feed?lieutenant=' + LT);
+    assert.deepStrictEqual(r.body.items.map((e) => e.seq), [1, 2, 4]);
+    const a = await s.api('GET', '/api/archive');
+    assert.deepStrictEqual(a.body.archive.map((x) => x.card.id), ['old']);
+  } finally {
+    await s.stop();
+  }
+});
+
 test('the seq is global across lieutenants; drain filters by lieutenant, acks stay per-queue', async () => {
   const s = await startServerWithLieutenant();
   try {

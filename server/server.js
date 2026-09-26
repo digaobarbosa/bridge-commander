@@ -80,6 +80,7 @@ const { charterPath, readCharter, writeCharter } = require(path.join(__dirname, 
 const { ONBOARDING_STEPS } = require(path.join(__dirname, 'firstrun.js'));
 const { proxyTts } = require(path.join(__dirname, 'ttsproxy.js'));
 const { proxyStt, proxySttUpgrade } = require(path.join(__dirname, 'sttproxy.js'));
+const { readJsonl, sealJsonl } = require(path.join(__dirname, 'jsonl.js'));
 const { execFile, execFileSync } = require('child_process');
 
 // ---------- args ----------
@@ -153,6 +154,9 @@ fs.mkdirSync(QUEUE_DIR, { recursive: true });
 fs.mkdirSync(CHAT_DIR, { recursive: true });
 fs.mkdirSync(HARNESS_STATE_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+// A crash mid-append leaves a torn last line; end it so the next append starts clean.
+sealJsonl(ARCHIVE_FILE);
+for (const f of fs.readdirSync(CHAT_DIR)) if (f.endsWith('.jsonl')) sealJsonl(path.join(CHAT_DIR, f));
 
 // Upload size cap (decoded bytes). Over-cap uploads are rejected 413.
 const UPLOAD_MAX_BYTES = parseInt(process.env.BC_UPLOAD_MAX_BYTES, 10) > 0
@@ -863,11 +867,7 @@ async function retireLieutenant(id, body) {
 function queueFile(lt) { return path.join(QUEUE_DIR, lt + '.jsonl'); }
 function ackFile(lt) { return path.join(QUEUE_DIR, lt + '.ack'); }
 function drainedFile(lt) { return path.join(QUEUE_DIR, lt + '.drained'); }
-function readQueue(lt) {
-  try {
-    return fs.readFileSync(queueFile(lt), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
-  } catch (e) { return []; }
-}
+function readQueue(lt) { return readJsonl(queueFile(lt)); }
 function queueIds() {
   const ids = new Set(board.lieutenants.map((l) => l.id));
   try {
@@ -876,9 +876,18 @@ function queueIds() {
   return [...ids];
 }
 // The queue seq is global across every lieutenant's queue (QueueItems are
-// seq-ordered board-wide). Recovered from the files at boot.
+// seq-ordered board-wide). Recovered from the files at boot: a torn line still
+// names its seq (it is the first key), and a cursor can sit past every readable
+// item, so both count — a reused seq at or below the ack cursor would be lost.
 let qseq = 0;
-for (const lt of queueIds()) for (const it of readQueue(lt)) if (it.seq > qseq) qseq = it.seq;
+for (const lt of queueIds()) {
+  const seen = (seq) => { if (seq > qseq) qseq = seq; };
+  const torn = (line) => { const m = /^\{"seq":(\d+)/.exec(line); if (m) seen(Number(m[1])); };
+  sealJsonl(queueFile(lt));
+  for (const it of readJsonl(queueFile(lt), torn)) seen(it.seq);
+  seen(readAck(lt));
+  seen(readDrained(lt));
+}
 function readAck(lt) {
   try { return parseInt(fs.readFileSync(ackFile(lt), 'utf8'), 10) || 0; }
   catch (e) { return 0; }
@@ -955,16 +964,7 @@ function chatFile(lt) { return path.join(CHAT_DIR, lt + '.jsonl'); }
 // A crash mid-append can leave one torn line behind. That line is skipped and
 // the rest of the conversation is served — the file is never rewritten to
 // repair it, because append-only means append-only.
-function readChatLog(lt) {
-  let raw;
-  try { raw = fs.readFileSync(chatFile(lt), 'utf8'); } catch (e) { return []; }
-  const out = [];
-  for (const l of raw.split('\n')) {
-    if (!l) continue;
-    try { out.push(JSON.parse(l)); } catch (e) {}
-  }
-  return out;
-}
+function readChatLog(lt) { return readJsonl(chatFile(lt)); }
 // The one writer. Appends the line, then extends the in-memory tail — so the
 // served board reflects the message without re-reading the file.
 function chatAppend(ltId, msg) {
@@ -2051,11 +2051,7 @@ function uriBasenameServer(uri) {
   return i >= 0 ? s.slice(i + 1) : s;
 }
 
-function readArchive() {
-  try {
-    return fs.readFileSync(ARCHIVE_FILE, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
-  } catch (e) { return []; }
-}
+function readArchive() { return readJsonl(ARCHIVE_FILE); }
 
 function archiveCard(card, body, actorDefault) {
   const actor = String((body && body.actor) || actorDefault || 'agent').slice(0, 60);
