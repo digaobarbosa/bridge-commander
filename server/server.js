@@ -1185,9 +1185,16 @@ function setStatus(card, body) {
 }
 
 // ---------- SSE clients ----------
+// Every stream the board serves (board, pane peek, sysload) opens the same way
+// and speaks the same named-event frame, so a proxy or client quirk is fixed once.
+const SSE_HEADERS = { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' };
+/** sseFrame(event, data) -> one named SSE frame; `data` defaults to {}. */
+function sseFrame(event, data) {
+  return 'event: ' + event + '\ndata: ' + JSON.stringify(data === undefined ? {} : data) + '\n\n';
+}
 const sseClients = new Set();
 function sseSend(event, data) {
-  const payload = 'event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n';
+  const payload = sseFrame(event, data);
   for (const res of sseClients) res.write(payload);
 }
 function broadcast() { sseSend('board', publicBoard('user')); }
@@ -1262,11 +1269,9 @@ function resolvePaneRef(kind, id, want) {
 }
 const panes = new Map(); // paneKey -> { clients: Set<res>, handle, last }
 function paneKey(ref) { return ref.harness + '/' + ref.session + (ref.window ? ':' + ref.window : ''); }
-function paneWrite(res, event, data) {
-  res.write('event: ' + event + '\ndata: ' + JSON.stringify(data === undefined ? {} : data) + '\n\n');
-}
+function paneWrite(res, event, data) { res.write(sseFrame(event, data)); }
 function paneStream(req, res, ref, reason) {
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  res.writeHead(200, SSE_HEADERS);
   if (!ref) { paneWrite(res, 'no-pane', { reason }); return res.end(); }
   let impl;
   try { impl = harnessFor(ref); }
@@ -1355,8 +1360,9 @@ const sysload = createSampler({ workspace: WORKSPACE, targets: sysloadTargets, i
 // the client's staleness watchdog couldn't see the stream is alive. Pane
 // streams piggyback on the same ping so proxies don't drop them either.
 setInterval(() => {
-  for (const res of sseClients) res.write('event: ping\ndata: {}\n\n');
-  for (const hub of panes.values()) for (const res of hub.clients) res.write('event: ping\ndata: {}\n\n');
+  const ping = sseFrame('ping');
+  for (const res of sseClients) res.write(ping);
+  for (const hub of panes.values()) for (const res of hub.clients) res.write(ping);
 }, 25000).unref();
 
 // ---------- helpers ----------
@@ -5586,9 +5592,9 @@ const server = http.createServer(async (req, res) => {
     // pane streams: connect to watch, disconnect to release. Each sample lands
     // as one `sample` event; samples flow every ~2s, so no extra ping rides here.
     if (route === 'GET /api/sysload/stream') {
-      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+      res.writeHead(200, SSE_HEADERS);
       const unsubscribe = sysload.subscribe((sample) => {
-        res.write('event: sample\ndata: ' + JSON.stringify(sample) + '\n\n');
+        res.write(sseFrame('sample', sample));
       });
       req.on('close', unsubscribe);
       return;
@@ -5596,8 +5602,8 @@ const server = http.createServer(async (req, res) => {
 
     // ----- SSE -----
     if (route === 'GET /api/events') {
-      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-      res.write('event: board\ndata: ' + JSON.stringify(publicBoard('user')) + '\n\n');
+      res.writeHead(200, SSE_HEADERS);
+      res.write(sseFrame('board', publicBoard('user')));
       sseClients.add(res);
       req.on('close', () => sseClients.delete(res));
       return;
