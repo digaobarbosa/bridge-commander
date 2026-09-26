@@ -2022,29 +2022,30 @@ function moveCard(card, body, actorDefault) {
 }
 
 function patchCard(card, body) {
+  // Validate every field before applying any: a refused patch must leave nothing
+  // in memory for the next unrelated saveBoard to persist.
   // Owner reassignment is allowed ONLY while no worker is bound to the card
   // (live or recorded): a worker's session/worktree belong to the owning
   // lieutenant's supervision, so mid-work handovers stay forbidden.
-  if (body.owner !== undefined) {
-    const newOwner = String(body.owner).replace(/^lieutenant:/, '');
-    if (newOwner !== card.owner) {
-      if (findWorker(card.id)) {
-        return { error: 'owner change refused: card has a worker bound (session/worktree) — finish or archive first' };
-      }
-      if (!board.lieutenants.some((l) => l.id === newOwner)) {
-        return { error: 'unknown lieutenant: ' + newOwner };
-      }
-      const prev = card.owner;
-      card.owner = newOwner;
-      card.events.push(mkEvent(
-        { actor: body.actor, text: 'owner: ' + prev + ' → ' + newOwner }, { kind: 'moved' }));
+  const newOwner = body.owner !== undefined ? String(body.owner).replace(/^lieutenant:/, '') : card.owner;
+  if (newOwner !== card.owner) {
+    if (findWorker(card.id)) {
+      return { error: 'owner change refused: card has a worker bound (session/worktree) — finish or archive first' };
+    }
+    if (!board.lieutenants.some((l) => l.id === newOwner)) {
+      return { error: 'unknown lieutenant: ' + newOwner };
     }
   }
-  if (body.playbook !== undefined) {
-    const pb = checkPlaybook(body.playbook);
-    if (pb.error) return { error: pb.error };
-    card.playbook = pb.playbook;
+  const pb = body.playbook !== undefined ? checkPlaybook(body.playbook) : null;
+  if (pb && pb.error) return { error: pb.error };
+
+  if (newOwner !== card.owner) {
+    const prev = card.owner;
+    card.owner = newOwner;
+    card.events.push(mkEvent(
+      { actor: body.actor, text: 'owner: ' + prev + ' → ' + newOwner }, { kind: 'moved' }));
   }
+  if (pb) card.playbook = pb.playbook;
   if (body.title !== undefined) card.title = String(body.title).slice(0, 200);
   if (body.body !== undefined) card.body = String(body.body);
   if (body.type !== undefined && CARD_TYPES.includes(body.type)) card.type = body.type;
@@ -4152,7 +4153,7 @@ function validateSchedule(body) {
   if (!SCHEDULE_NAME_RE.test(name)) {
     return { error: 'bad schedule name "' + name + '" (letters, digits, _ . - ; starts with a letter, digit or _)' };
   }
-  if (findSchedule(name)) return { error: 'schedule "' + name + '" already exists', status: 409 };
+  if (findSchedule(name)) return { error: 'schedule "' + name + '" already exists', code: 409 };
   const hook = String(body.hook || '').trim();
   if (!HOOK_NAME_RE.test(hook)) return { error: 'a schedule fires a NAMED hook — give one with --hook' };
   if (!namedHookFile(WORKSPACE, hook)) {
@@ -4788,21 +4789,35 @@ const server = http.createServer(async (req, res) => {
       const lt = findLieutenant(decodeURIComponent(ltRoute[1]));
       if (!lt) return sendJson(res, 404, { error: 'unknown lieutenant: ' + decodeURIComponent(ltRoute[1]) });
       const body = JSON.parse(await readBody(req) || '{}');
-      // Prefix first, and refused before anything else applies: it is the only
-      // field a peer can veto (two lieutenants may not share one), so a rejected
-      // pick must not leave half a patch behind. Past cards keep the id they
-      // were minted with — a prefix change is about what comes next.
+      // Every field is checked before any applies, so a refused patch leaves no
+      // half-applied lieutenant for the next unrelated saveBoard to persist.
+      // Prefix is the only field a peer can veto (two lieutenants may not share
+      // one). Past cards keep the id they were minted with — a prefix change is
+      // about what comes next.
+      let prefix;
       if (body.prefix !== undefined) {
-        const p = validPrefix(body.prefix);
-        if (!p) return sendJson(res, 400, { error: BAD_PREFIX });
-        const clash = prefixOwner(p, lt.id);
-        if (clash) return sendJson(res, 409, { error: prefixTakenMsg(p, clash) });
-        lt.prefix = p;
+        prefix = validPrefix(body.prefix);
+        if (!prefix) return sendJson(res, 400, { error: BAD_PREFIX });
+        const clash = prefixOwner(prefix, lt.id);
+        if (clash) return sendJson(res, 409, { error: prefixTakenMsg(prefix, clash) });
       }
+      if (body.ref !== undefined && body.ref !== null && !isHarnessRef(body.ref)) {
+        return sendJson(res, 400, { error: 'bad ref (want {harness, session, cwd, resumeId?} or null)' });
+      }
+      if (body.avatar !== undefined && body.avatar !== null && !validAvatar(body.avatar)) {
+        return sendJson(res, 400, { error: 'avatar must be an integer 0-63 or null' });
+      }
+      // null / "" clears the model back to the harness's own default.
+      const clearModel = body.model === null || body.model === '';
+      const model = body.model !== undefined && !clearModel ? validModel(body.model) : null;
+      if (body.model !== undefined && !clearModel && !model) return sendJson(res, 400, { error: BAD_MODEL });
+      const harness = body.harness !== undefined && body.harness !== null ? String(body.harness) : '';
+      if (harness) {
+        try { getHarness(harness); } catch (e) { return sendJson(res, 400, { error: String((e && e.message) || e) }); }
+      }
+
+      if (prefix) lt.prefix = prefix;
       if (body.ref !== undefined) {
-        if (body.ref !== null && !isHarnessRef(body.ref)) {
-          return sendJson(res, 400, { error: 'bad ref (want {harness, session, cwd, resumeId?} or null)' });
-        }
         // A re-run of `bc-axi init` re-sends the founder's session-granular ref
         // (the caller's tmux session is all it can see). Keep the window this
         // lieutenant was already pinned to — losing it would put the ref back
@@ -4814,11 +4829,8 @@ const server = http.createServer(async (req, res) => {
       }
       if (body.name !== undefined && String(body.name).trim()) lt.name = String(body.name).trim().slice(0, 60);
       if (body.color !== undefined && validColor(body.color)) lt.color = body.color;
-      if (body.avatar !== undefined) {
-        if (body.avatar === null) delete lt.avatar;
-        else if (validAvatar(body.avatar)) lt.avatar = body.avatar;
-        else return sendJson(res, 400, { error: 'avatar must be an integer 0-63 or null' });
-      }
+      if (body.avatar === null) delete lt.avatar;
+      else if (body.avatar !== undefined) lt.avatar = body.avatar;
       // "" / null clears the pick — the lieutenant is back to the board's voice.
       if (body.voice !== undefined) {
         const v = validVoice(body.voice);
@@ -4827,20 +4839,13 @@ const server = http.createServer(async (req, res) => {
       // The model is stored, not applied: it rides `--model` on the next spawn
       // or resume this lieutenant gets. Set BEFORE the harness switch below, so
       // a captain who moves harness and model in one call lands on both.
-      // null / "" clears it back to the harness's own default.
-      if (body.model !== undefined) {
-        if (body.model === null || body.model === '') delete lt.model;
-        else {
-          const m = validModel(body.model);
-          if (!m) return sendJson(res, 400, { error: BAD_MODEL });
-          lt.model = m;
-        }
-      }
+      if (clearModel) delete lt.model;
+      else if (model) lt.model = model;
       // Last, because it is the only field that costs the lieutenant its
       // session: everything above is already on the record the respawn prompt
       // is built from.
-      if (body.harness !== undefined && body.harness !== null && String(body.harness) !== '') {
-        const sw = await switchLieutenantHarness(lt, String(body.harness), body.actor);
+      if (harness) {
+        const sw = await switchLieutenantHarness(lt, harness, body.actor);
         if (sw.error) { saveBoard(); broadcast(); return sendJson(res, sw.code || 400, { error: sw.error }); }
         saveBoard(); broadcast();
         return sendJson(res, 200, { ok: true, lieutenant: lt, switched: sw.switched, event: sw.event });
@@ -5270,7 +5275,7 @@ const server = http.createServer(async (req, res) => {
     if (route === 'POST /api/schedules') {
       const body = JSON.parse(await readBody(req) || '{}');
       const v = validateSchedule(body);
-      if (v.error) return sendJson(res, v.status || 400, { error: v.error });
+      if (v.error) return sendJson(res, v.code || 400, { error: v.error });
       board.schedules.push(v.schedule);
       board.events.push(mkEvent({
         text: 'schedule ' + v.schedule.name + ' added — hook ' + v.schedule.hook + ', '
@@ -5723,7 +5728,10 @@ const server = http.createServer(async (req, res) => {
 
     sendJson(res, 404, { error: 'not found' });
   } catch (e) {
-    sendJson(res, 400, { error: String(e.message || e) });
+    // A malformed body (JSON) or URL escape is the caller's fault; anything else,
+    // e.g. saveBoard failing on disk, is ours and must not read as a bad request.
+    const code = e instanceof SyntaxError || e instanceof URIError ? 400 : 500;
+    sendJson(res, code, { error: String(e.message || e) });
   }
 });
 

@@ -476,6 +476,33 @@ test('prefix patch: applies, refuses one another lieutenant holds, leaves minted
   }
 });
 
+// Prefix, name and color are valid; the avatar / model / harness is not. None of
+// the valid fields may stay in memory for the next unrelated save to persist.
+test('lieutenant patch is all-or-nothing: a bad avatar, model or harness applies nothing, on disk too', async () => {
+  const s = await startServer();
+  try {
+    await s.api('POST', '/api/lieutenants', { name: 'Monica', id: 'monica', color: '#111111' });
+    const good = { prefix: 'NEW', name: 'Renamed', color: '#123456' };
+    for (const bad of [{ avatar: 99 }, { model: 'two words' }, { harness: 'no-such-harness' }]) {
+      const r = await s.api('PATCH', '/api/lieutenants/monica', Object.assign({}, good, bad));
+      assert.strictEqual(r.status, 400, JSON.stringify(bad));
+    }
+    // an unrelated mutation saves the board
+    assert.strictEqual((await s.api('POST', '/api/lieutenants', { name: 'Waldir', id: 'waldir' })).status, 200);
+
+    const lt = (await s.api('GET', '/api/lieutenants')).body.lieutenants.find((l) => l.id === 'monica');
+    const stored = JSON.parse(fs.readFileSync(path.join(s.dir, '.bridge-commander', 'board.json'), 'utf8'))
+      .lieutenants.find((l) => l.id === 'monica');
+    for (const got of [lt, stored]) {
+      assert.strictEqual(got.prefix, 'MON');
+      assert.strictEqual(got.name, 'Monica');
+      assert.strictEqual(got.color, '#111111');
+    }
+  } finally {
+    await s.stop();
+  }
+});
+
 test('prefix + counter are backfilled for lieutenants that predate them, without touching their cards', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-test-'));
   const s = await startServer({
