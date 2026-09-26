@@ -16,6 +16,7 @@ import { onModeSwitch, forgetFile, fileOpen, fileName, fileQuote } from './filep
 import { renderLtSwitcher, ltSwitcherOpen, closeLtSwitcher, ltSettingsOpen, closeLtSettings } from './ltswitcher.js';
 import { renderDetail, openDetail, closeDetail, detailOpen, auxDetailKey, closeArtifact, artifactOpen, onArtifactClose, artifactWritten } from './detail.js';
 import { openPopover, closePopover, closeTopPopover } from './popover.js';
+import { MODE_BTN, SCREENS, boardModeFor, switcherModeFor } from './modes.js';
 import { closePane, paneOpen } from './pane.js';
 import { openMonitor, closeMonitor, monitorOpen } from './monitor.js';
 import { closeLog, logOpen } from './logview.js';
@@ -139,15 +140,7 @@ for (const b of document.querySelectorAll('#ss-tabs button')) {
   b.onclick = () => setWsTab(b.dataset.tab);
 }
 // ---- board region mode: kanban ⇄ table ⇄ archived ⇄ automation ⇄ file ⇄ settings ----
-// Board and table are two views over the LIVE cards; 🧊 is the archived
-// snapshots' own read-only mode; ⚡ is the clock and the scripts it fires, which
-// is watched rather than configured and so is a mode rather than a config tab.
-// Those four are the switcher, and the choice sticks per browser.
-// 'file' and 'settings' are the screens: not in the switcher (you enter them by
-// opening a file, or from the gear), and never remembered — MODE_BTN is the
-// whole rule, so a reload comes back to the last switcher mode.
-const MODE_BTN = { board: 'vs-board', table: 'vs-table', archive: 'vs-arch', auto: 'vs-auto' };
-const SCREENS = ['file', 'settings'];
+// Which modes exist and which are remembered is modes.js; this is the wiring.
 // Entering ⚡ is a fresh look at the clock, not last visit's answer — the same
 // contract setWsTab gives a config section. The render loop below hands this to
 // renderAutomation once and clears it, so the board events that follow repaint
@@ -158,7 +151,7 @@ function setBoardMode(mode) {
   // The ⚡ screen's panel belongs to that screen: leaving the mode takes it with
   // us rather than leaving a schedule floating over the kanban.
   if (mode !== S.boardMode && auxDetailKey()) closeDetail();
-  if (!MODE_BTN[mode] && !SCREENS.includes(mode)) mode = 'board';
+  mode = boardModeFor(mode);
   if (mode !== 'file') forgetFile(); // anything else leaves the file screen
   S.boardMode = mode;
   if (MODE_BTN[mode]) try { localStorage.setItem('bc-board-mode', mode); } catch (e) {}
@@ -179,7 +172,7 @@ function setBoardMode(mode) {
 function lastSwitcherMode() {
   let m = null;
   try { m = localStorage.getItem('bc-board-mode'); } catch (e) {}
-  return MODE_BTN[m] ? m : 'board';
+  return switcherModeFor(m);
 }
 function leaveScreen() { setBoardMode(lastSwitcherMode()); }
 // On a phone the board tab IS the main area, so tapping it while that area
