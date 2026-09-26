@@ -78,8 +78,7 @@ const { STATE_DIR_NAME, migrateStateDir, migrateHomeStateDir } = require(path.jo
 const gitrev = require(path.join(__dirname, 'gitrev.js'));
 const { charterPath, readCharter, writeCharter } = require(path.join(__dirname, 'charter.js'));
 const { ONBOARDING_STEPS } = require(path.join(__dirname, 'firstrun.js'));
-const { proxyTts } = require(path.join(__dirname, 'ttsproxy.js'));
-const { proxyStt, proxySttUpgrade } = require(path.join(__dirname, 'sttproxy.js'));
+const { makeProxy, engineUrl } = require(path.join(__dirname, 'proxy.js'));
 const { execFile, execFileSync } = require('child_process');
 
 // ---------- args ----------
@@ -183,9 +182,6 @@ const DEFAULT_PORT = 4780;
 // The one prefix the TTS engine is served under, both ends of it: what the
 // browser is handed as its engine address, and what the proxy strips.
 const TTS_PREFIX = '/api/tts';
-// Same idea for the STT engine, http and websocket both. Nothing is handed to
-// the UI under this one — ui/stt-test.html is the only page that speaks it.
-const STT_PREFIX = '/api/stt';
 // ---------- workspace config (.bridge-commander/config.json) ----------
 function readConfig() {
   try {
@@ -216,9 +212,8 @@ function userConfig() {
 // Anything malformed (or a missing url) reads as "not configured".
 function ttsConfig() {
   const t = readConfig().tts;
-  if (!t || typeof t !== 'object' || Array.isArray(t)) return null;
-  const url = typeof t.url === 'string' ? t.url.trim().replace(/\/+$/, '') : '';
-  if (!/^https?:\/\/\S+$/.test(url)) return null;
+  const url = engineUrl(t);
+  if (!url) return null;
   const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
   return {
     url,
@@ -227,17 +222,13 @@ function ttsConfig() {
     params: t.params && typeof t.params === 'object' && !Array.isArray(t.params) ? t.params : {},
   };
 }
-// External STT engine (whisper API), optional: config.json
-//   "stt": { "url": "http://127.0.0.1:8878" }
-// Anything malformed (or a missing url) reads as "not configured", and the
-// /api/stt routes 404 like they were never there.
-function sttConfig() {
-  const t = readConfig().stt;
-  if (!t || typeof t !== 'object' || Array.isArray(t)) return null;
-  const url = typeof t.url === 'string' ? t.url.trim().replace(/\/+$/, '') : '';
-  if (!/^https?:\/\/\S+$/.test(url)) return null;
-  return { url };
-}
+// The engines themselves, on the board's own origin (server/proxy.js). No
+// engine configured means no route at all: the prefix falls through to the
+// ordinary 404. STT is config.json "stt": { "url": "http://127.0.0.1:8878" },
+// and nothing is handed to the UI for it — ui/stt-test.html is the only page
+// that speaks it, over http and websocket both.
+const ttsProxy = makeProxy({ prefix: TTS_PREFIX, idleEnv: 'BC_TTS_IDLE_MS', urlOf: () => engineUrl(readConfig().tts) });
+const sttProxy = makeProxy({ prefix: '/api/stt', idleEnv: 'BC_STT_IDLE_MS', urlOf: () => engineUrl(readConfig().stt) });
 // Port: --port flag > config.json "port" > 4780. The resolved port is written
 // back into config.json when absent, so the CLI and UI can always find it.
 const cfg = readConfig();
@@ -4295,20 +4286,11 @@ const server = http.createServer(async (req, res) => {
     // ----- reads -----
     if (route === 'GET /api/board') return sendJson(res, 200, publicBoard(url.searchParams.get('user') || 'user'));
     if (route === 'GET /api/config') return sendJson(res, 200, userConfig());
-    // ----- the TTS engine, on the board's own origin -----
-    // Any method, any path under the prefix, streamed both ways. No engine
-    // configured means no route at all: this falls through to the ordinary 404
-    // and the board is as silent as it is with no tts block.
-    if (p === TTS_PREFIX || p.startsWith(TTS_PREFIX + '/')) {
-      const t = ttsConfig();
-      // p, not a decoded path: what the browser encoded is what the engine gets.
-      if (t) return proxyTts(req, res, t.url, p.slice(TTS_PREFIX.length) + url.search);
-    }
-    // ----- the STT engine, same deal (the websocket half is on 'upgrade') -----
-    if (p === STT_PREFIX || p.startsWith(STT_PREFIX + '/')) {
-      const t = sttConfig();
-      if (t) return proxyStt(req, res, t.url, p.slice(STT_PREFIX.length) + url.search);
-    }
+    // ----- the TTS and STT engines, on the board's own origin -----
+    // Any method, any path under the prefix, streamed both ways (the STT
+    // websocket half is on 'upgrade').
+    if (ttsProxy.handle(req, res, p, url.search)) return;
+    if (sttProxy.handle(req, res, p, url.search)) return;
     if (route === 'GET /api/status') {
       let pending = 0;
       for (const lt of queueIds()) pending += pendingItems(lt).length;
@@ -5626,11 +5608,7 @@ const server = http.createServer(async (req, res) => {
 // with no upgrade handler does anyway.
 function onUpgrade(req, socket, head) {
   const u = new URL(req.url, 'http://localhost');
-  const p = u.pathname;
-  if (p === STT_PREFIX || p.startsWith(STT_PREFIX + '/')) {
-    const t = sttConfig();
-    if (t) return proxySttUpgrade(req, socket, head, t.url, p.slice(STT_PREFIX.length) + u.search);
-  }
+  if (sttProxy.upgrade(req, socket, head, u.pathname, u.search)) return;
   socket.destroy();
 }
 server.on('upgrade', onUpgrade);

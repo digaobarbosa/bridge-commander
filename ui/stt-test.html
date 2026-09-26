@@ -6,7 +6,7 @@
 <title>STT — is this fast enough to talk to?</title>
 <!--
   A bench for the whisper engine, proxied through the board's own origin so it
-  works over https in the headset (see server/sttproxy.js). One utterance goes
+  works over https in the headset (see server/proxy.js). One utterance goes
   down both paths at once — the websocket, partial by partial, and a single
   POST at the end — so the two can be compared on the same words.
 
