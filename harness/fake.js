@@ -51,7 +51,7 @@
 // the real tmux adapters persist) whenever opts.stateDir is given — distinct
 // from BC_FAKE_STATE, and honored even without it, mirroring the real
 // harnesses closely enough for callers (card.start's brief-artifact
-// auto-attach) to be exercised under test without tmux.
+// auto-attach, through the brief verb) to be exercised under test without tmux.
 
 const crypto = require('node:crypto');
 const fs = require('node:fs');
@@ -333,6 +333,15 @@ async function adoptWindow(ref, window) {
   return { ...ref, window };
 }
 
+// brief(ref, opts?) -> path | null — OPTIONAL capability verb: the
+// <key>.prompt spawn wrote into opts.stateDir, when it is there. Read the way
+// the tmux adapter reads it, so a marker-only (cross-process) session answers too.
+function brief(ref, opts = {}) {
+  if (!opts.stateDir) return null;
+  const file = path.join(opts.stateDir, `${keyOf(ref)}.prompt`);
+  return fs.existsSync(file) ? file : null;
+}
+
 // ---------- pane viewing (OPTIONAL capability verbs — see port.js) ----------
 // openPane emits deterministic counter frames on the interval — each frame
 // differs from the last, so change-detecting consumers always deliver — letting
@@ -426,7 +435,7 @@ function reset() {
   sessions.clear();
 }
 
-const impl = { spawn, send, alive, resumable, resume, onTurnEnd, kill, adoptWindow, transcript, reset };
+const impl = { spawn, send, alive, resumable, resume, onTurnEnd, kill, adoptWindow, brief, transcript, reset };
 // Pane verbs are OPTIONAL by contract; BC_FAKE_NO_PANE simulates a harness
 // that never implemented them (capability-absent degradation under test).
 if (!process.env.BC_FAKE_NO_PANE) {

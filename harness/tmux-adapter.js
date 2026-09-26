@@ -55,9 +55,14 @@ function makeRef(harness, session, window, cwd, resumeId) {
   return ref;
 }
 
+// The brief spawn persists (its source of truth — it never rides argv).
+function promptFile(stateDir, key) {
+  return path.join(stateDir, `${key}.prompt`);
+}
+
 /**
  * tmuxAdapter(profile) -> harness impl (the seven verbs plus the optional
- * pane, command, status and adoptWindow verbs).
+ * pane, command, status, brief, panePids and adoptWindow verbs).
  */
 function tmuxAdapter(profile) {
   const callbackOf = (opts) => opts.callbackUrl || process.env.BC_TURNEND_URL || '';
@@ -93,8 +98,8 @@ function tmuxAdapter(profile) {
     };
     if (profile.prepare) await profile.prepare(cwdAbs, key, ctx);
 
-    const promptFile = path.join(stateDir, `${key}.prompt`);
-    fs.writeFileSync(promptFile, prompt);
+    const briefFile = promptFile(stateDir, key);
+    fs.writeFileSync(briefFile, prompt);
     // Recorded so resume() can replay them — a worker pinned to a model by its
     // playbook must not come back on the default one, nor a worker born asking
     // permission come back skipping it.
@@ -110,7 +115,7 @@ function tmuxAdapter(profile) {
       await s.verifyLive(target, profile.settle);
     } catch (err) {
       await s.killPane(session, window);
-      try { fs.unlinkSync(promptFile); } catch { /* best-effort */ }
+      try { fs.unlinkSync(briefFile); } catch { /* best-effort */ }
       throw err;
     }
     return makeRef(profile.name, session, window, cwdAbs, ctx.resumeId);
@@ -184,6 +189,12 @@ function tmuxAdapter(profile) {
     await s.killPane(ref.session, ref.window);
   }
 
+  /** brief(ref, opts?) -> path | null — the brief spawn persisted for this agent, when it is on disk. */
+  function brief(ref, opts = {}) {
+    const file = promptFile(s.stateDirOf(opts), s.keyOf(ref));
+    return fs.existsSync(file) ? file : null;
+  }
+
   /** commands(ref?) — the shared trio plus the profile's own. */
   function commands(ref) {
     const own = profile.commands ? profile.commands(ref) : [];
@@ -211,7 +222,7 @@ function tmuxAdapter(profile) {
     onTurnEnd: s.onTurnEnd,
     openPane: s.openPane, paneSnapshot: s.paneSnapshot, paneInput: s.paneInput,
     adoptWindow: s.adoptWindow,
-    commands, runCommand, status,
+    commands, runCommand, status, brief,
   };
 }
 

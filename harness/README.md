@@ -14,7 +14,7 @@ Seven verbs, nothing else:
 | `onTurnEnd` | `(ref, hook, opts?) → unsubscribe()` | turn-boundary detection, push not poll |
 
 `opts` is ONE bag across `spawn`, `resumable`, `resume`, `onTurnEnd` and
-`runCommand`/`status`: `stateDir`, `callbackUrl`, `extraArgs`, `allowRoot`,
+`runCommand`/`status`/`brief`: `stateDir`, `callbackUrl`, `extraArgs`, `allowRoot`,
 `permissionMode`, `installHooks`, `session`, `window`. All verbs may be async. Zero dependencies —
 plain Node (>= 18; uses `node:test`, `fetch`). Beyond the seven, a harness MAY
 expose **optional capability verbs** — see below. This README is the one place
@@ -45,7 +45,7 @@ The port also exports `keyOf(ref)` — the state key (`session` or
 `isSpawnableSession(name)`, the `bc-<id>` rule `spawn` enforces. Nothing outside
 the harness builds either.
 
-## Optional capability verbs (pane viewing, slash commands, session status, window adoption)
+## Optional capability verbs (pane viewing, slash commands, session status, window adoption, brief)
 
 Optional verbs are features not every harness can honor, so `port.js` never
 validates them — adding one to the required list would force every harness
@@ -56,8 +56,14 @@ and degrades gracefully when the verb is absent (the pane endpoints answer
 
 **The inventory lives in one place:** [`docs/api/overview.md`](../docs/api/overview.md), which
 lists every optional verb with its signature and the endpoint it serves — `openPane`,
-`paneSnapshot`, `paneInput`, `commands`, `runCommand`, `status`, `adoptWindow`. Add a verb
+`paneSnapshot`, `paneInput`, `commands`, `runCommand`, `status`, `adoptWindow`, `brief`. Add a verb
 there; what follows is how to implement them, not what they are.
+
+`brief(ref, opts?)` names the file the brief was persisted to at spawn
+(`<stateDir>/<key>.prompt` for the tmux adapters and the fake) — or `null` when
+there is none — so the server can attach it to the card without building a
+harness path itself. It reads `opts.stateDir` like `status`; a bound instance
+supplies it.
 
 `runCommand(ref, line, opts?)` and `status(ref, opts?)` take the same `opts` bag;
 `stateDir` matters there, because codex resolves its thread-id from the

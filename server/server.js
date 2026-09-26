@@ -2291,7 +2291,7 @@ const workers = createWorkers({
   permissionPending: (cardId) => permissions.has((it) => it.card === cardId),
   log: (m) => console.error(now() + ' ' + m),
   config: {
-    stateDir: STATE_DIR, harnessStateDir: HARNESS_STATE_DIR,
+    stateDir: STATE_DIR,
     teardownMs: TEARDOWN_TIMEOUT_MS, restartTeardownMs: RESTART_TEARDOWN_TIMEOUT_MS,
     staleSecs: BC_WORKER_STALE_SECS,
   },

@@ -123,7 +123,7 @@ function lookup(name) {
 // OPTS_AT — which argument of each verb is its opts bag. A verb not listed
 // takes no plumbing and is passed through as it is, optional verbs included,
 // so a capability check (`typeof impl.openPane`) reads the same bound or not.
-const OPTS_AT = { spawn: 2, resumable: 1, resume: 1, onTurnEnd: 2, status: 1, runCommand: 2 };
+const OPTS_AT = { spawn: 2, resumable: 1, resume: 1, onTurnEnd: 2, status: 1, runCommand: 2, brief: 1 };
 const bindings = new WeakMap(); // env -> Map(impl -> bound instance)
 
 function bind(impl, env) {

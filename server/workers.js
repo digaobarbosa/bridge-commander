@@ -159,7 +159,7 @@ const PR_URL_RE = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/g;
  * @param {(cardId: string) => string} deps.workerWindow
  * @param {(w: object) => Promise<boolean>} [deps.refreshStatus]
  * @param {(msg: string) => void} [deps.log]
- * @param {object} deps.config {stateDir, harnessStateDir, teardownMs, restartTeardownMs, staleSecs}
+ * @param {object} deps.config {stateDir, teardownMs, restartTeardownMs, staleSecs}
  */
 function createWorkers(deps) {
   const cfg = deps.config || {};
@@ -218,11 +218,18 @@ function createWorkers(deps) {
     }, { kind: 'started' });
   }
 
-  // The brief the harness persisted at spawn, attached once: a resume never
-  // regenerates it, so the uri dedup keeps this idempotent.
-  function attachBrief(card, ref) {
-    const briefFile = path.join(cfg.harnessStateDir, refKey(ref) + '.prompt');
-    if (!fs.existsSync(briefFile)) return;
+  // The brief the harness persisted at spawn — its optional brief verb, so the
+  // server never builds a harness file path. A harness without it (or one that
+  // cannot answer) simply attaches nothing.
+  async function briefOf(ref) {
+    const impl = deps.harnessFor(ref);
+    if (typeof impl.brief !== 'function') return null;
+    try { return (await impl.brief(ref)) || null; } catch (e) { return null; }
+  }
+  // Attached once: a resume never regenerates the brief, so the uri dedup
+  // keeps this idempotent.
+  function attachBrief(card, briefFile) {
+    if (!briefFile) return;
     if (!Array.isArray(card.attributes.artifacts)) card.attributes.artifacts = [];
     const uri = 'file://' + briefFile;
     if (!card.attributes.artifacts.some((a) => a && a.uri === uri)) {
@@ -561,6 +568,7 @@ function createWorkers(deps) {
       await deps.worktrees.release(wt, project.path).catch(() => {}); // no spawnless lease left behind
       return { error: 'worker spawn failed: ' + errText(e), code: 502 };
     }
+    const brief = await briefOf(ref);
     if (!deps.findCard(card.id)) { // archived while provisioning/spawn were in flight
       Promise.resolve().then(() => plan.impl.kill(ref)).catch(() => {});
       await deps.worktrees.release(wt, project.path).catch(() => {});
@@ -571,7 +579,7 @@ function createWorkers(deps) {
     // Cleared when this run cuts none, so nothing downstream reads the last run's branch.
     if (plan.branch) card.attributes.branch = plan.branch;
     else delete card.attributes.branch;
-    attachBrief(card, ref);
+    attachBrief(card, brief);
     const worker = { card: card.id, ref, worktree: wt, project: project.name, spawnedAt: iso(), done: false };
     stamp(card, worker);
     if (plan.branch) worker.branch = plan.branch;
@@ -656,6 +664,7 @@ function createWorkers(deps) {
     } catch (e) {
       return { error: 'worker resume failed: ' + errText(e), code: 502 };
     }
+    const brief = await briefOf(ref);
     if (!deps.findCard(card.id)) { // archived while the resume was in flight
       Promise.resolve().then(() => deps.harnessFor(ref).kill(ref)).catch(() => {});
       return { error: 'card left the board during resume: ' + card.id, code: 409 };
@@ -663,7 +672,7 @@ function createWorkers(deps) {
     existing.ref = ref;
     stamp(card, existing);
     transition(existing, 'revive', { done: false });
-    attachBrief(card, ref);
+    attachBrief(card, brief);
     enterWorking(card, 'worker ' + refKey(ref) + ' resumed in ' + existing.worktree.path);
     return { worker: existing, resumed: true };
   }
