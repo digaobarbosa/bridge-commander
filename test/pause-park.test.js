@@ -6,7 +6,7 @@
 //   card.park: the narrow lieutenant door out of Working — Backlog, legal ONLY
 //     when the recorded worker is absent or dead (liveness re-checked server
 //     side); a live worker refuses loudly. worker pause --park composes both.
-// Uses the file-backed fake harness + real git worktrees (like workers.test.js)
+// Uses the file-backed fake harness + real git worktrees (like workers-helper.js)
 // and a fast supervision tick where died-vs-paused detection matters.
 const test = require('node:test');
 const assert = require('node:assert');
