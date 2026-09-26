@@ -9,13 +9,17 @@
 //              (verified 2.1.202) and refreshed from Stop-hook payloads.
 //
 // Launch: `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude
-// --dangerously-skip-permissions --session-id <uuid>` (mined from firstmate's
-// fm-spawn.sh). A fresh cwd shows the folder-trust dialog even in bypass mode;
-// the settle accepts it.
+// --permission-mode <mode> --session-id <uuid>` (mined from firstmate's
+// fm-spawn.sh). <mode> is opts.permissionMode (default 'auto'); 'bypass' is the
+// old `--dangerously-skip-permissions` launch. Every other mode keeps claude's
+// permission prompts, and the PermissionRequest hook relays them to the board.
+// A fresh cwd shows the folder-trust dialog in every mode; the settle accepts it.
 //
 // Turn boundaries: prepare() installs a Stop hook in
 // <cwd>/.claude/settings.local.json running harness/turnend-hook.js, which
-// appends to <stateDir>/<key>.turnend.jsonl and POSTs the callback URL.
+// appends to <stateDir>/<key>.turnend.jsonl and POSTs the callback URL. With a
+// callback URL it also installs the PermissionRequest hook running
+// harness/permission-hook.js, which holds the prompt open on /api/permission.
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -23,7 +27,8 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { claudeStatus } = require('./agent-status.js');
 const { tmuxAdapter } = require('./tmux-adapter.js');
-const { installTurnEndHook, writeOutputStyle } = require('./claude-settings.js');
+const { shellQuote } = require('./util.js');
+const { installHooks, writeOutputStyle } = require('./claude-settings.js');
 
 const TRUST_RE = /Yes, I trust this folder|Quick safety check/;
 
@@ -47,13 +52,15 @@ const TRUST_RE = /Yes, I trust this folder|Quick safety check/;
 const RESUME_RE = /Resume from summary|Resume full session as-is/;
 
 // UI_READY_RE matches signatures only the main UI renders (composer prompt,
-// busy footer, permission-mode footer) and the trust screen does not.
+// busy footer, permission-mode footer) and the trust screen does not. The
+// footer depends on the mode: "bypass permissions on", "auto mode on",
+// "accept edits on"; default mode shows none, so only `\n❯` catches it.
 //
 // ⚠ It is nearly wrong on the resume picker, which draws its own `❯` — and is
 // saved only by `\n❯` demanding column zero while the picker indents. Do not
 // relax that anchor: the picker would then read as READY and every unattended
 // revival would leave a lieutenant sitting on an unanswered menu forever.
-const UI_READY_RE = /bypass permissions|esc (to )?interrupt|\n❯/i;
+const UI_READY_RE = /bypass permissions|auto mode on|accept edits on|esc (to )?interrupt|\n❯/i;
 
 // FATAL_RE — what a pane shows when this launch is never going to come up, so
 // waiting the remaining 44 seconds only delays a wrong guess:
@@ -67,13 +74,19 @@ const UI_READY_RE = /bypass permissions|esc (to )?interrupt|\n❯/i;
 //              for them.
 //   missing    the shell answering "command not found" — no binary at all.
 //   bypass     the one-time "WARNING: Claude Code running in Bypass Permissions
-//              mode" consent modal, raised BY --dangerously-skip-permissions.
+//              mode" consent modal, raised BY --dangerously-skip-permissions
+//              (permissionMode 'bypass' only; other modes never show it).
 //              Its preselected option is `1. No, exit`, so it is emphatically
 //              not one to answer with a blind Enter, and it is not ours to
 //              accept on anyone's behalf: it is a person saying yes to an agent
 //              that skips permission prompts on their machine.
 const FATAL_RE = /cannot be used with root\/sudo privileges|Choose the text style|To change this later, run \/theme|claude: command not found|command not found: claude|Bypass Permissions mode|Yes, I accept/;
-const SETTLE = { trustRe: TRUST_RE, resumeRe: RESUME_RE, readyRe: UI_READY_RE, fatalRe: FATAL_RE, label: 'claude' };
+// DECLINE_RE — a menu whose cursor sits on a "No". Claude 2.1.282 preselects
+// "No, exit" on the folder-trust screen, where Enter quits claude to the shell
+// and the launch times out at 45s. The settle walks the cursor off it first.
+const DECLINE_RE = /❯\s*(\d+\.\s*)?No\b/;
+const SETTLE = { trustRe: TRUST_RE, resumeRe: RESUME_RE, readyRe: UI_READY_RE, fatalRe: FATAL_RE,
+  declineRe: DECLINE_RE, label: 'claude' };
 
 // sandboxPrefix(allowRoot) — claude refuses --dangerously-skip-permissions as
 // uid 0 and exits, so as root there is no session to have unless the caller has
@@ -86,11 +99,20 @@ function sandboxPrefix(allowRoot) {
   return asRoot ? 'IS_SANDBOX=1 ' : '';
 }
 
-// The launch prefix every claude line carries: the sandbox consent (above) and
-// the switch that kills claude's dim prompt-suggestion ghost text, which would
-// otherwise read as pending composer input.
-function launchPrefix(allowRoot) {
-  return sandboxPrefix(allowRoot) + 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false ';
+// launchPrefix(mode, allowRoot) — everything on a claude line before the
+// session flags: the sandbox consent, the switch that kills claude's dim
+// prompt-suggestion ghost text (it would read as pending composer input), and
+// the permission flags. Only bypass needs the root escape hatch: claude's uid-0
+// refusal is about skipping permissions, and no other mode skips them.
+function launchPrefix(mode, allowRoot) {
+  const bypass = mode === 'bypass';
+  return (bypass ? sandboxPrefix(allowRoot) : '')
+    + 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude '
+    + (bypass ? '--dangerously-skip-permissions' : '--permission-mode ' + shellQuote(mode));
+}
+// A spawn without a mode, or a record from before modes existed, runs in 'auto'.
+function permissionModeOf(v) {
+  return typeof v === 'string' && v ? v : 'auto';
 }
 
 // ---------- slash commands ----------
@@ -239,18 +261,18 @@ const profile = {
   settle: SETTLE,
   // `--session-id <uuid>` makes the resume id known at birth (verified 2.1.202).
   idAtBirth: () => crypto.randomUUID(),
-  // opts.installHooks: false — the cwd already carries a workspace-level hook,
-  // and a settings file holds only ONE bc Stop entry (claude-settings.js).
+  // opts.installHooks: false — the cwd already carries workspace-level hooks,
+  // and a settings file holds only ONE bc entry per event (claude-settings.js).
   async prepare(cwd, key, ctx) {
-    if (ctx.opts.installHooks !== false) await installTurnEndHook(cwd, key, ctx.stateDir, ctx.callbackUrl);
+    if (ctx.opts.installHooks !== false) await installHooks(cwd, key, ctx.stateDir, ctx.callbackUrl);
   },
-  launch: (ctx) => launchPrefix(ctx.allowRoot)
-    + `claude --dangerously-skip-permissions --session-id ${ctx.resumeId}`
+  launch: (ctx) => launchPrefix(permissionModeOf(ctx.permissionMode), ctx.allowRoot)
+    + ` --session-id ${ctx.resumeId}`
     + (ctx.extra ? ' ' + ctx.extra : ''),
   // `--resume <id>` keeps the SAME id (no fork), so the ref survives any number
-  // of death/resume cycles. No id: a fresh claude, memory lost.
-  resumeLaunch: (id, ctx) => launchPrefix(ctx.allowRoot)
-    + 'claude --dangerously-skip-permissions'
+  // of death/resume cycles. No id: a fresh claude, memory lost. The mode is the
+  // spawn's (replayed by the adapter), so an agent never comes back looser.
+  resumeLaunch: (id, ctx) => launchPrefix(permissionModeOf(ctx.permissionMode), ctx.allowRoot)
     + (id ? ` --resume ${id}` : '')
     + (ctx.extra ? ' ' + ctx.extra : ''),
   status: (ref) => claudeStatus(ref),

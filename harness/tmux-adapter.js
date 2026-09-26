@@ -7,13 +7,14 @@
 //
 // Profile shape:
 //   name                         'claude' | 'codex' — the ref's `harness`
-//   settle                       { trustRe, resumeRe?, readyRe, fatalRe, label } (tmux-session.js)
+//   settle                       { trustRe, resumeRe?, readyRe, fatalRe, declineRe?, label } (tmux-session.js)
 //   idAtBirth() -> string|undefined
 //                                the resume id known before launch (claude mints
 //                                one for --session-id; codex has none — the first
 //                                turn-end delivers it)
 //   prepare?(cwd, key, ctx)      per-launch setup before the pane exists (claude:
-//                                install the Stop hook); runs on spawn AND resume
+//                                install the Stop and PermissionRequest hooks);
+//                                runs on spawn AND resume
 //   launch(ctx) -> string        the fresh launch line
 //   resumeLaunch(id, ctx) -> string
 //                                the resume launch line; id undefined = no memory
@@ -24,9 +25,11 @@
 //   handlers?                    { '/name': (ref, line, opts) -> reply } — emulated commands
 //   passthrough?                 extra names typed literally into the session
 //
-// ctx = { opts, stateDir, key, callbackUrl, resumeId, extra, allowRoot }:
+// ctx = { opts, stateDir, key, callbackUrl, resumeId, extra, allowRoot, permissionMode }:
 // `extra` is the already shell-quoted extra flags, `allowRoot` the caller's
-// consent — on resume both are replayed from the spawn's record.
+// consent, `permissionMode` the caller's mode (undefined = the profile's
+// default; codex ignores it) — on resume all three are replayed from the
+// spawn's record, and opts wins over it.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -76,7 +79,7 @@ function tmuxAdapter(profile) {
     }
   }
 
-  /** spawn(cwd, prompt, opts?) -> HarnessRef. opts: session, window, stateDir, callbackUrl, extraArgs, allowRoot, installHooks. */
+  /** spawn(cwd, prompt, opts?) -> HarnessRef. opts: session, window, stateDir, callbackUrl, extraArgs, allowRoot, installHooks, permissionMode. */
   async function spawn(cwd, prompt, opts = {}) {
     const cwdAbs = path.resolve(cwd);
     if (!fs.existsSync(cwdAbs)) throw new Error(`spawn cwd does not exist: ${cwdAbs}`);
@@ -86,13 +89,15 @@ function tmuxAdapter(profile) {
     const ctx = {
       opts, stateDir, key, callbackUrl: callbackOf(opts), resumeId: profile.idAtBirth(),
       extra: quote(opts.extraArgs || []), allowRoot: !!opts.allowRoot,
+      permissionMode: opts.permissionMode || undefined,
     };
     if (profile.prepare) await profile.prepare(cwdAbs, key, ctx);
 
     const promptFile = path.join(stateDir, `${key}.prompt`);
     fs.writeFileSync(promptFile, prompt);
     // Recorded so resume() can replay them — a worker pinned to a model by its
-    // playbook must not come back on the default one.
+    // playbook must not come back on the default one, nor a worker born asking
+    // permission come back skipping it.
     s.recordSpawnArgs(stateDir, key, opts);
 
     const target = s.paneTarget(session, window);
@@ -155,6 +160,7 @@ function tmuxAdapter(profile) {
     const ctx = {
       opts, stateDir, key, callbackUrl: callbackOf(opts), resumeId,
       extra: quote(opts.extraArgs || rec.args), allowRoot: !!(opts.allowRoot || rec.allowRoot),
+      permissionMode: opts.permissionMode || rec.permissionMode || undefined,
     };
     await s.killPane(ref.session, ref.window); // clear any dead pane still holding the name
     if (profile.prepare) await profile.prepare(ref.cwd, key, ctx);

@@ -19,7 +19,7 @@ const SUBJECTS = [
     impl: require('../claude-tmux.js'),
     idAtBirth: true,
     extra: ['/autocompact', '/output-style'],
-    ready: '⏵⏵ bypass permissions on (shift+tab to cycle)\n❯ ',
+    ready: '⏵⏵ auto mode on (shift+tab to cycle)\n❯ ',
     // the consent modal --dangerously-skip-permissions raises: "No, exit" preselected
     modal: '  WARNING: Claude Code running in Bypass Permissions mode\n\n  ❯ 1. No, exit\n    2. Yes, I accept',
     modalRe: /Yes, I accept/,

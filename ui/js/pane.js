@@ -10,9 +10,12 @@
 // is involved — keys go out, the polled frames come back, and the server bursts
 // the poll for a moment after input so the echo does not sit behind the 1s
 // baseline.
-import { card, lieutenant } from './state.js';
+import { card, lieutenant, workerFor } from './state.js';
 import { ansiToHtml } from './ansi.js';
 import { keyForEvent } from './panekeys.js';
+import { terminalLink, cardTarget, lieutenantTarget } from './terminal.js';
+import { getTerminalMode, onTerminalMode } from './terminalsettings.js';
+import { push as toast } from './toast.js';
 
 const overlay = document.getElementById('pane-overlay');
 const titleEl = document.getElementById('pane-title');
@@ -20,8 +23,28 @@ const liveEl = document.getElementById('pane-live');
 const preEl = document.getElementById('pane-body');
 const msgEl = document.getElementById('pane-msg');
 const hintEl = document.getElementById('pane-hint');
+const termEl = document.getElementById('pane-term');
 let es = null;
 let inputUrl = null;
+let termTarget = null;          // { session, window } of what the drawer shows
+
+// ---------- ⌨ open in a real terminal ----------
+// Off (the default) or no known session: the button is not there at all.
+function drawTerm() {
+  const link = overlay.hidden ? null : terminalLink(getTerminalMode(), termTarget);
+  termEl.hidden = !link;
+  termEl.dataset.copy = (link && link.copy) || '';
+  if (link && link.href) termEl.href = link.href; else termEl.removeAttribute('href');
+}
+termEl.onclick = (e) => {
+  const cmd = termEl.dataset.copy;
+  if (!cmd) return;              // an href: the browser hands it to the terminal app
+  e.preventDefault();
+  navigator.clipboard.writeText(cmd).then(
+    () => toast({ emoji: '⌨', text: 'tmux command copied — paste it in a terminal' }),
+    () => toast({ emoji: '⌨', text: 'could not copy: ' + cmd }));
+};
+onTerminalMode(drawTerm);
 
 function stop() { if (es) { es.close(); es = null; } }
 function setLive(on) {
@@ -191,20 +214,26 @@ export function openCardPane(cardId, window_) {
   const base = '/api/cards/' + encodeURIComponent(cardId) + '/pane/';
   const q = pick ? '?window=' + encodeURIComponent(pick) : '';
   drawTabs(names, pick, (name) => openCardPane(cardId, name));
+  termTarget = cardTarget(c, workerFor(cardId), pick);
   open(base + 'stream' + q, String(at.session || (c && c.title) || cardId), base + 'input' + q);
+  drawTerm();
 }
 export function openLieutenantPane(id) {
   const l = lieutenant(id);
   const base = '/api/lieutenants/' + encodeURIComponent(id) + '/pane/';
   drawTabs([], null, () => {}); // a lieutenant is one session, never tabbed
+  termTarget = lieutenantTarget(l);
   open(base + 'stream', String((l && l.ref && l.ref.session) || (l && l.name) || id), base + 'input');
+  drawTerm();
 }
 export function closePane() {
   stop();
   inputUrl = null;
   drawTabs([], null, () => {});
+  termTarget = null;
   preEl.blur();
   overlay.hidden = true;
+  drawTerm();
 }
 export function paneOpen() { return !overlay.hidden; }
 

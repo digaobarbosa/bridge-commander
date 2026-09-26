@@ -53,36 +53,39 @@ function spawnArgsFile(stateDir, key) {
 // The launch facts a resume has to replay, taken straight off the spawn's opts:
 // the extra flags (--model/--effort, pinned by the card's playbook) and the
 // caller's allowRoot consent (the IS_SANDBOX=1 prefix without which claude
-// refuses to come back as uid 0). Written as an object; a bare array is the
-// older record's shape and still reads as flags-only.
+// refuses to come back as uid 0) and the permission mode (claude only; a
+// resume that drops it comes back in the default mode). Written as an object;
+// a bare array is the older record's shape and still reads as flags-only.
 function recordSpawnArgs(stateDir, key, opts = {}) {
   const file = spawnArgsFile(stateDir, key);
   try {
     const rec = { args: (opts.extraArgs || []).map(String) };
     if (opts.allowRoot) rec.allowRoot = true;
-    if (rec.args.length || rec.allowRoot) fs.writeFileSync(file, JSON.stringify(rec) + '\n');
+    if (typeof opts.permissionMode === 'string' && opts.permissionMode) rec.permissionMode = opts.permissionMode;
+    if (rec.args.length || rec.allowRoot || rec.permissionMode) fs.writeFileSync(file, JSON.stringify(rec) + '\n');
     else fs.rmSync(file, { force: true });
   } catch {
     // best-effort: the record is an optimisation, never a precondition
   }
 }
-// -> { args: string[], allowRoot: boolean }. Missing, unreadable or corrupt
+// -> { args: string[], allowRoot: boolean, permissionMode: string|null }. Missing, unreadable or corrupt
 // reads as "nothing extra" and never throws: a resume that cannot read a hint
 // must still resume.
 function recordedSpawnArgs(stateDir, key) {
   try {
     const v = JSON.parse(fs.readFileSync(spawnArgsFile(stateDir, key), 'utf8'));
-    if (Array.isArray(v)) return { args: v.filter((a) => typeof a === 'string'), allowRoot: false };
+    if (Array.isArray(v)) return { args: v.filter((a) => typeof a === 'string'), allowRoot: false, permissionMode: null };
     if (v && typeof v === 'object') {
       return {
         args: Array.isArray(v.args) ? v.args.filter((a) => typeof a === 'string') : [],
         allowRoot: !!v.allowRoot,
+        permissionMode: typeof v.permissionMode === 'string' && v.permissionMode ? v.permissionMode : null,
       };
     }
   } catch {
     // fall through to the empty record
   }
-  return { args: [], allowRoot: false };
+  return { args: [], allowRoot: false, permissionMode: null };
 }
 
 function newSessionName() {
@@ -211,6 +214,8 @@ async function adoptWindow(ref, window, taken = []) {
 //   sig.trustRe — matches the trust screen (checked FIRST: a trust screen may
 //                 contain composer-like glyphs, so it must win over readyRe)
 //   sig.readyRe — matches signatures only the main UI renders
+//   sig.declineRe — optional: the menu cursor sits on a "No", so Down goes
+//                 before Enter
 //   sig.label   — the agent name for error messages ('claude', 'codex')
 //
 // Both signatures are tested against the TAIL of the pane — the current
@@ -233,7 +238,8 @@ async function launchAndSettle(target, launchCmd, sig) {
   await t.sendKey(target, 'Enter');
 
   // Screens that stand between the launch and the UI, each one a menu whose
-  // PRESELECTED option is the one we want, so Enter answers all of them. They
+  // wanted option is preselected (or one Down away, see declineRe), so Enter
+  // answers all of them. They
   // are checked before readyRe because a dialog can carry composer-like glyphs
   // and would otherwise be mistaken for the main UI.
   const menus = [sig.trustRe, sig.resumeRe].filter(Boolean);
@@ -257,6 +263,13 @@ async function launchAndSettle(target, launchCmd, sig) {
     }
     if (SHELLS.has(cmd)) continue; // agent not up yet (or it already exited — captured by timeout)
     if (menus.some((re) => re.test(tail))) {
+      // A menu can preselect a No (claude 2.1.282's trust screen: Enter there
+      // quits the agent). Walk the cursor off it before answering.
+      if (sig.declineRe && sig.declineRe.test(tail)) {
+        await t.sendKey(target, 'Down');
+        await t.sleep(300);
+        continue;
+      }
       await t.sendKey(target, 'Enter');
       await t.sleep(1000);
       continue;

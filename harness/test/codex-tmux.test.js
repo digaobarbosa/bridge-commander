@@ -40,6 +40,19 @@ test('launch line: both bypass flags and the notify relay wired to the state dir
     + `-c 'notify=${notify}' '--model' 'm'`);
 });
 
+// codex has no board-relayed approval hook, so a board configured to ask
+// permission still launches codex on its bypass flags — spawn and resume alike.
+test('permissionMode is ignored: codex keeps its bypass flags in every mode', async () => {
+  const { lines } = await launchLines(async (cwd, stateDir) => {
+    await codex.spawn(cwd, 'go', { session: 'bc-pm', stateDir, permissionMode: 'default' });
+    await codex.resume({ harness: 'codex', session: 'bc-pm', cwd, resumeId: 't-1' }, { stateDir, permissionMode: 'acceptEdits' });
+  });
+  for (const line of lines) {
+    assert.match(line, /--dangerously-bypass-approvals-and-sandbox /);
+    assert.doesNotMatch(line, /permission-mode/);
+  }
+});
+
 test('resume line: `codex resume <thread-id>` with a known id, a bare codex without one', async () => {
   const { lines } = await launchLines(async (cwd, stateDir) => {
     await codex.resume({ harness: 'codex', session: 'bc-cr', cwd, resumeId: 'thread-9' }, { stateDir });

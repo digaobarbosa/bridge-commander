@@ -57,7 +57,9 @@ const profile = {
   settle: SETTLE,
   idAtBirth: () => undefined, // codex assigns the thread-id; the first notify delivers it
   // No prepare: the relay rides the launch line, so opts.installHooks has
-  // nothing to install (or clobber) in any cwd.
+  // nothing to install (or clobber) in any cwd. ctx.permissionMode is ignored
+  // too: codex has no board-relayed approval hook, so it keeps its bypass
+  // flags whatever the board is configured for.
   launch: (ctx) => 'codex ' + launchFlags(ctx),
   resumeLaunch: (id, ctx) => (id ? `codex resume ${id} ` : 'codex ') + launchFlags(ctx),
   // The thread-id comes from the relay's record first, the ref second — the
