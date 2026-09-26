@@ -495,6 +495,48 @@ test('a workspace directory that does not exist YET still resolves through the l
   }
 });
 
+// The same link, one level down: a CARD artifact added through a symlinked
+// directory (`bc-axi card artifact add --uri /tmp/x.md` on macOS) read fine and
+// could never be saved — the gate refuses a path whose realpath differs. The
+// board stores the real directory at add time; a symlinked LEAF is still refused.
+test('a card artifact added through a symlinked directory saves; a symlinked leaf still does not', async () => {
+  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bc-linkart-')));
+  const real = path.join(tmp, 'real');
+  const link = path.join(tmp, 'link');
+  fs.mkdirSync(real);
+  fs.symlinkSync(real, link);
+  const s = await startServerWithLieutenant();
+  try {
+    fs.writeFileSync(path.join(real, 'notes.md'), 'v1\n');
+    for (const given of [path.join(link, 'notes.md'), uriOf(path.join(link, 'notes.md'))]) {
+      const { id, uri } = await cardWithArtifact(s, given, 'notes');
+      assert.strictEqual(uri, uriOf(path.join(real, 'notes.md')), 'stored through the real directory: ' + given);
+      const got = await get(s, uri);
+      assert.strictEqual(got.status, 200, JSON.stringify(got.body));
+      const w = await put(s, uri, got.body.content + 'more\n', got.body.version);
+      assert.strictEqual(w.status, 200, JSON.stringify(w.body));
+      // the path the caller knows still names the entry
+      const rm = await s.api('DELETE', '/api/cards/' + id + '/artifacts', { uri: given });
+      assert.strictEqual(rm.body.removed, true, JSON.stringify(rm.body));
+    }
+    assert.strictEqual(fs.readFileSync(path.join(real, 'notes.md'), 'utf8'), 'v1\nmore\nmore\n');
+
+    fs.writeFileSync(path.join(real, 'target.md'), 'the real file\n');
+    fs.symlinkSync(path.join(real, 'target.md'), path.join(real, 'leaf.md'));
+    const { uri } = await cardWithArtifact(s, path.join(link, 'leaf.md'), 'leaf');
+    assert.strictEqual(uri, uriOf(path.join(real, 'leaf.md')), 'the directory is followed, the leaf is not');
+    const got = await get(s, uri);
+    assert.strictEqual(got.status, 200, JSON.stringify(got.body));
+    const w = await put(s, uri, 'overwritten\n', got.body.version);
+    assert.strictEqual(w.status, 403, JSON.stringify(w.body));
+    assert.match(w.body.error, /symlink/);
+    assert.strictEqual(fs.readFileSync(path.join(real, 'target.md'), 'utf8'), 'the real file\n');
+  } finally {
+    await s.stop();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 // ---------- what the gate refuses ----------
 // One test per row, named by the row: each is a reason this is a gate and not
 // a workspace file API, and a failing row must name itself rather than let a
