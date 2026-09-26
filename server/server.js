@@ -68,11 +68,11 @@ const { isHarnessRef, harnessFor, getHarness } = require(path.join(__dirname, '.
 const { createWorktree, releaseWorktree, worktreeToolFor } = require(path.join(__dirname, 'worktrees.js'));
 const { runHooks, runTeardown, listAllHooks, runNamedHook, runningHook, readRuns, lastRuns, hookKey,
   hooksDir, namedHookFile, cancelNamedHook, traceSkip, lastRunsFor,
-  TEARDOWN_TIMEOUT_MS: TEARDOWN_DEFAULT_MS, HOOK_NAME_RE, LIFECYCLE_EVENTS } = require(path.join(__dirname, 'hooks.js'));
+  TEARDOWN_TIMEOUT_MS: TEARDOWN_DEFAULT_MS, HOOK_NAME_RE } = require(path.join(__dirname, 'hooks.js'));
 const { parseWhen, nextAfter, dueWindows, pickWindows, describeWhen, normalizeSchedules,
   NAME_RE: SCHEDULE_NAME_RE, OVERLAP, CATCHUP } = require(path.join(__dirname, 'schedules.js'));
 const { createSampler } = require(path.join(__dirname, 'sysload.js'));
-const { workerBrief, listPlaybooks, resolvePlaybook, playbooksDir, PACKAGED_PLAYBOOKS_DIR, parsePlaybook, attrVar, attrCardKey, PLACEHOLDERS, FRONTMATTER } = require(path.join(__dirname, 'playbooks.js'));
+const { workerBrief, listPlaybooks, resolvePlaybook, playbooksDir, parsePlaybook, attrVar, attrCardKey, PLACEHOLDERS, FRONTMATTER } = require(path.join(__dirname, 'playbooks.js'));
 // layout.js: where things live in a workspace — the state dir, the charter,
 // and the session names (still read as `names.<fn>` below).
 const names = require(path.join(__dirname, 'layout.js'));
@@ -80,6 +80,7 @@ const { STATE_DIR_NAME, migrateStateDir, migrateHomeStateDir, isId, ONBOARDING_S
   charterPath, readCharter, writeCharter } = require(path.join(__dirname, 'layout.js'));
 const gitrev = require(path.join(__dirname, 'gitrev.js'));
 const { makeProxy, engineUrl } = require(path.join(__dirname, 'proxy.js'));
+const { createFileGate } = require(path.join(__dirname, 'filegate.js'));
 const { execFile, execFileSync } = require('child_process');
 
 // ---------- args ----------
@@ -101,10 +102,10 @@ const opts = parseArgs(process.argv.slice(2));
 
 // ---------- paths (workspace-scoped; no global state) ----------
 // Resolved AND real: every path the board hands out is built from this one, and
-// hookTarget() compares a hook's containing directory against realpathSync of
-// itself. A workspace reached through a symlinked parent (/tmp on macOS,
-// ~/work → /mnt/data/work anywhere) would fail that comparison for the board's
-// OWN hooks, so the link is followed once here rather than at each call site.
+// the file gate (filegate.js) compares a hook's containing directory against
+// realpathSync of itself. A workspace reached through a symlinked parent (/tmp
+// on macOS, ~/work → /mnt/data/work anywhere) would fail that comparison for the
+// board's OWN hooks, so the link is followed once here rather than at each call site.
 // A workspace that is not on disk YET is the same question one level up: `--workspace
 // ~/work/newboard` through a ~/work → /mnt/data/work link has a link to follow even
 // though the board's own directory does not exist. So this resolves the deepest
@@ -162,22 +163,6 @@ const UPLOAD_MAX_BYTES = parseInt(process.env.BC_UPLOAD_MAX_BYTES, 10) > 0
 // preview cap; over-cap → 413.
 const ARTIFACT_MAX_BYTES = parseInt(process.env.BC_ARTIFACT_MAX_BYTES, 10) > 0
   ? parseInt(process.env.BC_ARTIFACT_MAX_BYTES, 10) : 25 * 1024 * 1024;
-// Extension → Content-Type for raw artifact byte serving. Images, video, and
-// audio render inline in the viewer; pdf may render inline; everything else
-// downloads.
-const ARTIFACT_MIME = {
-  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
-  '.webp': 'image/webp', '.svg': 'image/svg+xml', '.bmp': 'image/bmp', '.avif': 'image/avif',
-  '.pdf': 'application/pdf',
-  '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
-  '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.wav': 'audio/wav',
-  '.ogg': 'audio/ogg', '.oga': 'audio/ogg', '.opus': 'audio/ogg', '.flac': 'audio/flac',
-  // A rendered page and the things it pulls in beside itself.
-  '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
-  '.json': 'application/json', '.txt': 'text/plain; charset=utf-8',
-  '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf',
-};
 
 const DEFAULT_PORT = 4780;
 // The one prefix the TTS engine is served under, both ends of it: what the
@@ -1387,9 +1372,6 @@ function sendBytes(req, res, data, headers) {
   res.writeHead(200, { ...base, 'Content-Length': data.length });
   res.end(data);
 }
-// Content-derived version for a file the UI may edit: the GET hands it out,
-// the PUT demands it back, and a mismatch is a 409 instead of a lost edit.
-const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 function sendJson(res, code, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
@@ -4163,127 +4145,16 @@ function serveStatic(res, rel) {
   res.end(data);
 }
 
-// The one uri the artifact routes accept that is not listed on a card: a
-// playbook. The config screen edits them in the same editor a card artifact
-// opens in, which means the same GET, the same version check and the same 409 —
-// a second file API would be a second place to get all of that wrong. So the
-// widening is exactly one shape and nothing else: `<playbooks dir>/<name>.md`,
-// one level deep, no symlink. The directory is DERIVED here, never taken from
-// the client.
-//
-// Returns 'workspace' | 'packaged' | '' — the same two populations
-// resolvePlaybook picks between, and the difference is what may be written.
-// The packaged set is a git checkout of this repo: readable, so the captain can
-// open one and copy it, and never written in place.
-function playbookSource(uri) {
-  if (typeof uri !== 'string' || !uri.startsWith('file://')) return '';
-  const file = uri.slice('file://'.length);
-  // path.resolve is idempotent on a clean absolute path — a `..` segment or a
-  // relative path changes it, so `<dir>/../../board.json` never gets this far.
-  if (path.resolve(file) !== file) return '';
-  if (path.extname(file) !== '.md') return '';
-  const dir = path.dirname(file);
-  const source = dir === playbooksDir(STATE_DIR) ? 'workspace'
-    : dir === PACKAGED_PLAYBOOKS_DIR ? 'packaged' : '';
-  if (!source) return '';
-  // A symlink IN the dir is not a file in the dir: what it points at is what
-  // would be read or written. Refused here rather than followed. (ENOENT is
-  // fine — that is the copy-to-workspace create, and PUT guards the dir itself.)
-  try { if (fs.lstatSync(file).isSymbolicLink()) return ''; }
-  catch (e) { if (e.code !== 'ENOENT') return ''; }
-  return source;
-}
-
-// The second — and last — uri the artifact routes accept that is no card's:
-// a lieutenant's charter, `<workspace>/lieutenants/<id>/README.md`. The config
-// screen edits it in the same editor a playbook opens in, so it rides the same
-// GET, the same version check and the same 409.
-//
-// The widening is exactly one shape. charterPath() BUILDS the only acceptable
-// path from the workspace root and a REGISTERED id, and the uri has to equal
-// it — which is what refuses an unregistered id, another file in that folder, a
-// subdirectory of it, and a directory prefix from the client all at once.
-// Returns the path when it is one, '' otherwise.
-function charterFile(uri) {
-  if (typeof uri !== 'string' || !uri.startsWith('file://')) return '';
-  const file = uri.slice('file://'.length);
-  // path.resolve is idempotent on a clean absolute path — a `..` segment or a
-  // relative path changes it, so `<dir>/../../board.json` never gets this far.
-  if (path.resolve(file) !== file) return '';
-  if (!board.lieutenants.some((l) => charterPath(WORKSPACE, l.id) === file)) return '';
-  // A symlink named README.md is not the charter: what it points at is what
-  // would be read or written. Refused here rather than followed. (ENOENT is
-  // fine — a lieutenant that has never written its memory file still opens it.)
-  try { if (fs.lstatSync(file).isSymbolicLink()) return ''; }
-  catch (e) { if (e.code !== 'ENOENT') return ''; }
-  return file;
-}
-
-// The third — and last — uri the artifact routes accept that is no card's: a
-// HOOK file. The hooks tab's ✎ opens one in the same editor a playbook opens
-// in, which is where "he asks a lieutenant to help build one" happens: a file
-// on a screen he can point at.
-//
-// The widening is exactly one shape, and it is the namespace hooks.js already
-// defines: an executable file under <workspace>/.bridge-commander/hooks/, ONE
-// level deep (a named hook) or TWO (a lifecycle hook, in its event's
-// directory). The containing directory is BUILT here from STATE_DIR and
-// compared for equality — never taken from the client — the way charterFile()
-// does it, and the two names in it have to look like ids, so a traversal never
-// survives the comparison.
-//
-// Returns the path when the uri is one, '' otherwise. A file that is not there
-// YET is still one (that is the create), which is why the leaf check tolerates
-// ENOENT and nothing else: a symlink, a directory and a socket all fail
-// isFile() and are refused rather than followed.
-// Three answers, because two of them are different things:
-//   null      — not a hook path at all. Falls through to the other allowlists,
-//               and the caller gets the ordinary "unknown artifact" refusal.
-//   {file}    — a hook path the board reads and writes.
-//   {error}   — a hook path that is LEGAL and whose tree is not there. Answering
-//               "unknown artifact" to a legal path is a lie: the name is fine,
-//               the id is fine, the only thing missing is a directory. So it
-//               says which one, and what would have fired it.
-function hookTarget(uri) {
-  if (typeof uri !== 'string' || !uri.startsWith('file://')) return null;
-  const file = uri.slice('file://'.length);
-  // path.resolve is idempotent on a clean absolute path — a `..` segment or a
-  // relative path changes it, so `<dir>/../../board.json` never gets this far.
-  if (path.resolve(file) !== file) return null;
-  if (!HOOK_NAME_RE.test(path.basename(file))) return null;
-  const dir = path.dirname(file);
-  const root = hooksDir(WORKSPACE);
-  // '' = a named hook, one level deep. Otherwise the EVENT directory it sits in.
-  let event = '';
-  if (dir !== root) {
-    if (path.dirname(dir) !== root || !HOOK_NAME_RE.test(path.basename(dir))) return null;
-    event = path.basename(dir);
-  }
-  let real;
-  try { real = fs.realpathSync(dir); }
-  catch (e) {
-    if (e.code !== 'ENOENT') return null;
-    // The directory is not there. `hooks/` is a CONSTANT the board owns, so the
-    // write below makes it — the same one level `charterFile` makes for a
-    // lieutenant that never wrote its memory file, and the path the card names
-    // when it says a new hook is a file a lieutenant writes.
-    if (!event) return { file };
-    // An event directory is NOT a constant: creating one invents a lifecycle
-    // event, and a typo'd event is a hook that silently never fires, forever,
-    // with nothing to notice it. So this stays a refusal — one that names the
-    // event and the ones that exist, instead of pretending the path is unknown.
-    return { code: 400, error: 'no hook event directory "' + event + '" — the board fires '
-      + LIFECYCLE_EVENTS.join(', ') + '. Create ' + dir + ' yourself if that is really the event: '
-      + 'one invented here would be a hook that never runs' };
-  }
-  // The directory has to be reached without following a link: a symlinked
-  // hooks/ (or event dir) points somewhere else, and somewhere else is the
-  // whole thing this refuses. Not a hook path, so it refuses as one.
-  if (real !== dir) return null;
-  try { if (!fs.lstatSync(file).isFile()) return null; }
-  catch (e) { if (e.code !== 'ENOENT') return null; }
-  return { file };
-}
+// ---------- the file gate (server/filegate.js) ----------
+// Which files the artifact routes may read and write: a card's listed
+// artifacts, the workspace's playbooks, charters and hooks — nothing else.
+const files = createFileGate({
+  workspace: WORKSPACE,
+  cards: () => board.cards,
+  lieutenants: () => board.lieutenants,
+  attachment: readAttachmentMeta,
+  maxBytes: ARTIFACT_MAX_BYTES,
+});
 
 // ---------- server ----------
 const server = http.createServer(async (req, res) => {
@@ -4359,151 +4230,36 @@ const server = http.createServer(async (req, res) => {
     // so there is no directory for a relative path to sit in — which is why
     // artifact pages had to inline their assets as base64. `/artifacts/<dir>/<rel>`
     // gives the page a folder, and its siblings load the way every relative path
-    // on the web does. Scoped to the artifact's own directory: <dir> must be the
-    // directory of a listed artifact, and the resolved file must stay inside it —
-    // not as a security claim, but because "this URL means this folder" is what
-    // makes a relative path mean anything.
+    // on the web does. Scoped by the file gate to the directory of a listed
+    // artifact.
     const adir = /^\/artifacts\/([^/]+)\/(.+)$/.exec(p);
     if (adir && req.method === 'GET') {
       let dir, rel;
       try { dir = decodeURIComponent(adir[1]); rel = decodeURIComponent(adir[2]); }
       catch (e) { return sendJson(res, 400, { error: 'bad artifact path' }); }
-      const listed = dir && path.resolve(dir) === dir &&
-        board.cards.some((c) => Array.isArray(c.attributes && c.attributes.artifacts) &&
-          c.attributes.artifacts.some((a) => a && typeof a.uri === 'string' && a.uri.startsWith('file://') &&
-            path.dirname(a.uri.slice('file://'.length)) === dir));
-      if (!listed) return sendJson(res, 404, { error: 'unknown artifact directory' });
-      const file = path.resolve(dir, rel);
-      if (!file.startsWith(dir + path.sep)) return sendJson(res, 403, { error: 'outside the artifact directory' });
-      let st;
-      try { st = fs.statSync(file); }
-      catch (e) { return sendJson(res, 404, { error: 'unreadable: ' + e.message }); }
-      if (!st.isFile()) return sendJson(res, 404, { error: 'not a file' });
-      if (st.size > ARTIFACT_MAX_BYTES) return sendJson(res, 413, { error: 'artifact too large (max ' + ARTIFACT_MAX_BYTES + ' bytes)' });
-      // No sandbox CSP: the board has no auth and binds to the tailnet, so anyone
-      // who reaches it can already ask a lieutenant to run anything. Hardening
-      // this page against that board defends nothing.
-      return sendBytes(req, res, fs.readFileSync(file), {
-        'Content-Type': ARTIFACT_MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
-        'Cache-Control': 'no-store',
-        'X-Content-Type-Options': 'nosniff',
-      });
+      const r = files.readDir(dir, rel);
+      if (r.error) return sendJson(res, r.code, { error: r.error });
+      return sendBytes(req, res, r.bytes, r.headers);
     }
-    // Artifact serve, for the UI's popup viewer. Servable is a uri listed
-    // verbatim in some live card's attributes.artifacts, or one of the
-    // workspace-owned files the same screen edits (playbookSource, charterFile,
-    // hookTarget) — never an arbitrary file read. Same allowlist the write below
-    // uses, plus the packaged playbooks, which are read-only.
-    // Default (no raw): TEXT content of the file. raw=1: the raw
-    // bytes with a real Content-Type, backing the inline <img> and downloads.
+    // Artifact serve, for the UI's popup viewer: whatever the file gate allows
+    // (a card's listed artifacts, or the workspace files the config screen
+    // edits) — never an arbitrary file read. Default: the TEXT content and its
+    // version. raw=1: the bytes with a real Content-Type, backing the inline
+    // <img> and downloads.
     if (route === 'GET /api/artifact') {
-      const uri = url.searchParams.get('uri') || '';
       const raw = url.searchParams.get('raw') === '1' || url.searchParams.get('raw') === 'true';
-      const charter = charterFile(uri);
-      const ht = hookTarget(uri);
-      if (ht && ht.error) return sendJson(res, ht.code, { error: ht.error });
-      const hook = (ht && ht.file) || '';
-      const listed = board.cards.some((c) => Array.isArray(c.attributes && c.attributes.artifacts) &&
-        c.attributes.artifacts.some((a) => a && a.uri === uri)) || !!playbookSource(uri) || !!charter || !!hook;
-      if (!listed) return sendJson(res, 404, { error: 'unknown artifact' });
-      // A promoted chat attachment (attachment://id) resolves to its stored file
-      // via the sidecar; file:// / bare paths read directly.
-      let file = uri.startsWith('file://') ? uri.slice('file://'.length) : uri;
-      let name = path.basename(file);
-      let attMime = '';
-      const am = /^attachment:\/\/(.+)$/.exec(uri);
-      if (am) {
-        const meta = readAttachmentMeta(am[1]);
-        if (!meta) return sendJson(res, 404, { error: 'unknown attachment' });
-        file = meta.path; name = meta.name; attMime = meta.mime || '';
-      }
-      if (raw) {
-        // Byte mode. Only a real local file is servable: an attachment path is
-        // already vetted by readAttachmentMeta; a plain artifact must be a
-        // file:// absolute path with no traversal escaping it (path.resolve is
-        // idempotent on a clean absolute path — a `..` segment or a relative
-        // path changes it, so it is rejected).
-        if (!am) {
-          if (!uri.startsWith('file://')) return sendJson(res, 400, { error: 'not a file artifact' });
-          if (path.resolve(file) !== file) return sendJson(res, 400, { error: 'unsafe artifact path' });
-        }
-        let st;
-        try { st = fs.statSync(file); }
-        catch (e) { return sendJson(res, 404, { error: 'unreadable: ' + e.message }); }
-        if (!st.isFile()) return sendJson(res, 404, { error: 'not a file' });
-        if (st.size > ARTIFACT_MAX_BYTES) return sendJson(res, 413, { error: 'artifact too large (max ' + ARTIFACT_MAX_BYTES + ' bytes)' });
-        const ext = path.extname(name).toLowerCase();
-        // A curated .html/.htm artifact (teach-me page, report) is a self-contained
-        // document meant to be *rendered*: serve it as text/html inline so a page
-        // opened here shows, not its source. Scoped to plain file artifacts, not
-        // attachments (an uploaded .html keeps its neutralized download behavior)
-        // and never a HOOK: a hook is a script whose basename the writer chooses,
-        // so `hooks/report.html` is a legal hook path and rendering it would make
-        // the gate that writes hooks a way to run script on the board's origin.
-        const isHtml = !am && !hook && (ext === '.html' || ext === '.htm');
-        const ctype = isHtml ? 'text/html; charset=utf-8'
-          : am ? (attMime || 'application/octet-stream')
-          : (ARTIFACT_MIME[ext] || 'application/octet-stream');
-        // Images, video, audio, pdf, and rendered html show inline in the browser;
-        // other binaries download. nosniff pins the Content-Type; the sandbox CSP
-        // neutralizes an uploaded SVG/HTML if it is navigated to as a document
-        // (inline <img>/<video> subresources unaffected). A curated .html artifact
-        // is exempt — it is the captain's own deliverable, and sandboxing it against
-        // a board anyone on the tailnet can drive defends nothing.
-        const inline = isHtml || /^(image|video|audio)\//.test(ctype) || ctype === 'application/pdf';
-        let data;
-        try { data = fs.readFileSync(file); }
-        catch (e) { return sendJson(res, 404, { error: 'unreadable: ' + e.message }); }
-        return sendBytes(req, res, data, {
-          'Content-Type': ctype,
-          'Cache-Control': 'private, max-age=31536000, immutable',
-          'X-Content-Type-Options': 'nosniff',
-          ...(isHtml ? {} : { 'Content-Security-Policy': 'sandbox' }),
-          'Content-Disposition': (inline ? 'inline' : 'attachment') + '; filename="' + name.replace(/["\\\r\n]/g, '_') + '"',
-        });
-      }
-      let data;
-      try { data = fs.readFileSync(file); }
-      catch (e) {
-        // A BOARD-OWNED file that is not written yet reads as the empty document
-        // at version '' — whatever kind it is. The board owns the path (it built
-        // it, not the client), so the file's absence is a state, not a 404: a
-        // lieutenant that has never written its memory, a hook nobody has typed
-        // yet. And '' is exactly what the PUT below reads as "I expect no file",
-        // so the first 💾 creates it. A card artifact is NOT board-owned — that
-        // path came from the card, and a missing one is genuinely unreadable.
-        if ((charter || hook) && e.code === 'ENOENT') return sendJson(res, 200, { name, content: '', version: '' });
-        return sendJson(res, 404, { error: 'unreadable: ' + e.message });
-      }
-      if (data.length > 2e6) return sendJson(res, 413, { error: 'file too large to preview' });
-      if (data.includes(0)) return sendJson(res, 415, { error: 'binary file' });
-      // The version travels with the content so an editor can hand it back on
-      // save: sha256 of the exact bytes on disk. Content-derived on purpose —
-      // mtime+size misses two writes in the same second at the same length.
-      return sendJson(res, 200, { name, content: data.toString('utf8'), version: sha256(data) });
+      const r = files.read(url.searchParams.get('uri') || '', { raw });
+      if (r.error) return sendJson(res, r.code, { error: r.error });
+      if (raw) return sendBytes(req, res, r.bytes, r.headers);
+      return sendJson(res, 200, r);
     }
 
-    // Artifact WRITE — what the file editor's save actually does. Deliberately
-    // narrow: this is an artifact editor, not remote arbitrary-file write on
-    // this machine. The board has no auth of its own (the network boundary is
-    // the auth boundary), so every guard below is load-bearing:
-    //   - the uri must ALREADY be listed on a live card, or be a WORKSPACE
-    //     playbook (playbookSource), or a registered lieutenant's charter
-    //     (charterFile), or a hook file (hookTarget) — the GET's allowlist minus
-    //     the packaged playbooks, which are read-only. Anything else is 403, and
-    //     there is no flag to turn it off;
-    //   - file:// only, absolute, no `..` (path.resolve is idempotent on a
-    //     clean absolute path), and no symlink anywhere along it (realpath must
-    //     come back unchanged), so a listed artifact can never be a door to
-    //     somewhere else;
-    //   - attachment:// is immutable: an upload is the record of what was sent.
-    // Lost-update guard: the client sends the version it read. If disk has
-    // moved since, nothing is written and the answer is 409 carrying what is
-    // there now — the captain's text stays on his screen either way. It applies
-    // to EVERY writer, agent included (`bc-axi artifact write`): the door is
-    // locked on both sides or it is not locked.
-    // A write that lands also announces itself on the board SSE (event
-    // `artifact`), so an editor already open on the file follows along.
+    // Artifact WRITE — what the file editor's save actually does. The file
+    // gate decides what is writable and guards the write (no symlink, no `..`,
+    // atomic swap); a version the writer read that no longer matches the disk
+    // is a 409 carrying what is there now, and nothing is written. A write that
+    // lands announces itself on the board SSE (event `artifact`), so an editor
+    // already open on the file follows along.
     if (route === 'PUT /api/artifact') {
       let raw;
       try { raw = await readBodyUpto(req, ARTIFACT_MAX_BYTES + 65536); }
@@ -4514,88 +4270,19 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(raw || '{}');
       const uri = String(body.uri || '');
       if (typeof body.content !== 'string') return sendJson(res, 400, { error: 'content required' });
-      const pbSource = playbookSource(uri);
-      const charter = charterFile(uri);
-      const ht = hookTarget(uri);
-      if (ht && ht.error) return sendJson(res, ht.code, { error: ht.error });
-      const hook = (ht && ht.file) || '';
-      const listed = board.cards.some((c) => Array.isArray(c.attributes && c.attributes.artifacts) &&
-        c.attributes.artifacts.some((a) => a && a.uri === uri)) || pbSource === 'workspace' || !!charter || !!hook;
-      if (!listed) {
-        // A packaged playbook is readable and never writable: it is a git
-        // checkout of this repo, so the edit is a copy into the workspace.
-        if (pbSource === 'packaged') {
-          return sendJson(res, 403, { error: 'a packaged playbook is never written — copy it to the workspace first' });
-        }
-        return sendJson(res, 403, { error: 'not an artifact of any card — refusing to write' });
+      const w = files.write(uri, body.content, body.version);
+      if (w.conflict) {
+        return sendJson(res, 409, {
+          error: 'the file changed on disk since you opened it — nothing was written',
+          version: w.conflict.version, content: w.conflict.content,
+        });
       }
-      if (!uri.startsWith('file://')) return sendJson(res, 403, { error: 'only file:// artifacts are writable' });
-      const file = uri.slice('file://'.length);
-      if (path.resolve(file) !== file) return sendJson(res, 403, { error: 'unsafe artifact path' });
-      // A listed artifact that is not on disk yet is CREATED — that is how a
-      // derived file gets written beside its source (a drawing's .svg), and it
-      // is the SAME lost-update rule with "nothing there" as the version read:
-      // an empty version means "I expect no file", so a file that turned up
-      // meanwhile is still a 409 below. The directory has to be real, for the
-      // same reason the file does.
-      let st = null, real;
-      try { st = fs.statSync(file); real = fs.realpathSync(file); }
-      catch (e) {
-        if (e.code !== 'ENOENT' || String(body.version || '') !== '') {
-          return sendJson(res, 404, { error: 'unreadable: ' + e.message });
-        }
-        const dir = path.dirname(file);
-        // A charter's folder is the board's to make: a lieutenant registered
-        // without one has no other way to get `lieutenants/<id>/`. So is a
-        // workspace's `hooks/` — a fixed name the board owns, and the card's
-        // "a new hook is a file you or a lieutenant writes" goes through this
-        // very route, so a workspace that has no hooks yet must not be the one
-        // place a lieutenant cannot write the first one. An EVENT directory is
-        // never made here: hookTarget refused before we got this far, because a
-        // directory invented from a typo is a hook that never runs.
-        // mkdir is a no-op when it is already there — including when it is a
-        // symlink, which the check right below still refuses.
-        if (charter || hook) { try { fs.mkdirSync(dir, { recursive: true }); } catch (e2) { /* the check below answers */ } }
-        try { if (fs.realpathSync(dir) !== dir) throw new Error('symlink'); }
-        catch (e2) { return sendJson(res, 403, { error: 'artifact path resolves elsewhere (symlink) — refusing to write' }); }
-      }
-      if (st) {
-        if (!st.isFile()) return sendJson(res, 403, { error: 'not a regular file' });
-        if (real !== file) return sendJson(res, 403, { error: 'artifact path resolves elsewhere (symlink) — refusing to write' });
-        let cur;
-        try { cur = fs.readFileSync(file); }
-        catch (e) { return sendJson(res, 404, { error: 'unreadable: ' + e.message }); }
-        if (cur.includes(0)) return sendJson(res, 415, { error: 'binary file' });
-        const version = sha256(cur);
-        if (String(body.version || '') !== version) {
-          return sendJson(res, 409, {
-            error: 'the file changed on disk since you opened it — nothing was written',
-            version, content: cur.toString('utf8'),
-          });
-        }
-      }
-      const next = Buffer.from(body.content, 'utf8');
-      if (next.length > ARTIFACT_MAX_BYTES) return sendJson(res, 413, { error: 'content too large (max ' + ARTIFACT_MAX_BYTES + ' bytes)' });
-      // Atomic swap: write a sibling temp file, then rename over the original.
-      // Truncating the artifact and writing into it would leave it half-written
-      // if the process died mid-write; a rename either happened or it didn't.
-      const tmp = path.join(path.dirname(file), '.' + path.basename(file) + '.bc-' + process.pid + '-' + Date.now() + '.tmp');
-      try {
-        // An existing file keeps its mode. A hook created here is born
-        // EXECUTABLE — a hook the runner would skip silently is not a hook, and
-        // there is no chmod on a phone.
-        fs.writeFileSync(tmp, next, st ? { mode: st.mode & 0o777 } : (hook ? { mode: 0o755 } : {}));
-        fs.renameSync(tmp, file);
-      } catch (e) {
-        try { fs.unlinkSync(tmp); } catch (e2) {}
-        return sendJson(res, 500, { error: 'write failed: ' + e.message });
-      }
-      const newVersion = sha256(next);
+      if (w.error) return sendJson(res, w.code, { error: w.error });
       // Whoever has this file open hears about it right away — that is what
       // makes four hands four hands instead of two taking turns around a
       // reload button. The writer's own client recognizes the echo.
-      broadcastArtifact(uri, newVersion, String(body.client || ''));
-      return sendJson(res, 200, { ok: true, version: newVersion, bytes: next.length });
+      broadcastArtifact(uri, w.version, String(body.client || ''));
+      return sendJson(res, 200, { ok: true, version: w.version, bytes: w.bytes });
     }
 
     // ----- chat attachments (uploads) -----
