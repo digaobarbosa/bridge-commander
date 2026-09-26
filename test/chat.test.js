@@ -16,7 +16,8 @@ test('lieutenant say to its main chat lands in lieutenant.chat and rings a level
     const board = (await s.api('GET', '/api/board')).body;
     const lt = board.lieutenants[0];
     assert.strictEqual(lt.chat.length, 1);
-    assert.strictEqual(lt.chat[0].author, 'Ada'); // author defaults to the lieutenant's name
+    // an unidentified caller signs as `agent` — the author is never inferred from the target
+    assert.strictEqual(lt.chat[0].author, 'agent');
     assert.strictEqual(lt.chat[0].text, 'hello there');
     // a main-chat lieutenant message doubles as a level-1 board event
     const ev = board.events.filter((e) => e.level === 1 && e.text === 'hello there');
@@ -39,7 +40,7 @@ test('lieutenant say to a card thread appends to card.thread, sets threadStart, 
     const board = (await s.api('GET', '/api/board')).body;
     const card = board.cards[0];
     assert.strictEqual(card.thread.length, 1);
-    assert.strictEqual(card.thread[0].author, 'Ada'); // the interlocutor is the owning lieutenant
+    assert.strictEqual(card.thread[0].author, 'agent'); // unidentified: not the owner's name either
     assert.strictEqual(card.threadStart, card.thread[0].ts);
     // card-thread messages do not hit the board stream (only the lieutenant-joined event is there)
     assert.deepStrictEqual(board.events.filter((e) => e.text !== 'lieutenant Ada joined the bridge'), []);
@@ -69,10 +70,10 @@ test('say author defaults to the session-resolved CALLER, not the target lieuten
     card = (await s.api('GET', '/api/cards/cross')).body;
     assert.strictEqual(card.thread[1].author, 'custom');
 
-    // an unresolved session falls back to the target's lieutenant (unidentified callers)
+    // an unresolved session is an unidentified caller: `agent`, never the target's lieutenant
     await s.api('POST', '/api/message', { target: 'card:cross', text: 'anonymous', session: 'bc-nobody' });
     card = (await s.api('GET', '/api/cards/cross')).body;
-    assert.strictEqual(card.thread[2].author, 'Ada');
+    assert.strictEqual(card.thread[2].author, 'agent');
 
     // Grace saying into another lieutenant's MAIN chat is stamped Grace too
     await s.api('POST', '/api/message', { target: 'lieutenant:' + LT, text_md: 'handoff note', session: 'bc-grace' });

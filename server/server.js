@@ -77,6 +77,7 @@ const { parseWhen, nextAfter, dueWindows, pickWindows, describeWhen, normalizeSc
 const { createSampler } = require(path.join(__dirname, 'sysload.js'));
 const { workerBrief, listPlaybooks, resolvePlaybook, playbooksDir, PACKAGED_PLAYBOOKS_DIR, parsePlaybook, attrVar, attrCardKey, PLACEHOLDERS, FRONTMATTER } = require(path.join(__dirname, 'playbooks.js'));
 const names = require(path.join(__dirname, 'names.js'));
+const { createConversation, parseTarget, CAPTAIN } = require(path.join(__dirname, 'conversation.js'));
 const { STATE_DIR_NAME, migrateStateDir, migrateHomeStateDir } = require(path.join(__dirname, 'statedir.js'));
 const gitrev = require(path.join(__dirname, 'gitrev.js'));
 const { charterPath, readCharter, writeCharter } = require(path.join(__dirname, 'charter.js'));
@@ -630,6 +631,35 @@ function ensureMinting(lts) {
   }
 }
 
+// ---------- conversation & identity (server/conversation.js) ----------
+// Who is talking — and, from there, what a say sets in motion — lives in one
+// module bound to this board, so every route asks the same question the same way.
+const conversation = createConversation({ board: () => board, now, queuePush, chatAppend, mkEvent });
+
+/**
+ * resolveHookAgent(body) — the agent a turn-end hook POST came from:
+ * { lt, worker } with at most one set. The hook's fields mapped onto identify().
+ */
+function resolveHookAgent(body) {
+  const tmux = typeof body.tmux_session === 'string' ? body.tmux_session : null;
+  const who = conversation.identify({
+    sessionId: body.session_id,
+    key: body.session,
+    session: tmux,
+    // only an OLD hook (no tmux_session field at all) may be adopted by cwd
+    cwd: tmux === null && body.cwd ? path.resolve(String(body.cwd)) : '',
+  });
+  return { lt: who.kind === 'lieutenant' ? who.lt : null, worker: who.kind === 'worker' ? who.worker : null };
+}
+
+/**
+ * callerOf(fields) — identify() for a CLI caller: bc-axi sends its tmux
+ * `session` and `window` (the window is absent from an older bc-axi).
+ */
+function callerOf(fields) {
+  return conversation.identify({ session: fields.session, window: fields.window });
+}
+
 // ---------- the line (the captain's voice channel) ----------
 // The captain talks to the board from his phone with the screen off, through a
 // voice shortcut that has no chat picker: it posts `target: "line"` and names
@@ -645,20 +675,7 @@ function ensureMinting(lts) {
 // FOUNDING lieutenant (first registered — the teleport) holds it by default, so
 // the shortcut works on day one with nothing seeded. Only a board with no
 // lieutenant at all has nobody on the line.
-function lineHolder() {
-  const held = board.line ? findLieutenant(board.line) : null; // a retired holder falls back
-  if (held) return { lieutenant: held, source: 'held' };
-  const first = board.lieutenants[0];
-  if (first) return { lieutenant: first, source: 'default' };
-  return { lieutenant: null, source: 'none' };
-}
-// The line follows the voice the captain last heard. Silent no-op when it is
-// already there, so an answering lieutenant never churns board state.
-function lineFollow(id) {
-  if (!id || board.line === id || !findLieutenant(id)) return false;
-  board.line = id;
-  return true;
-}
+function lineHolder() { return conversation.lineHolder(); }
 
 function createLieutenant(body) {
   const name = String(body.name || '').trim();
@@ -1394,54 +1411,11 @@ function resolveAttachments(list) {
   return out;
 }
 function findCard(id) { return board.cards.find((c) => c.id === id); }
-// Chat targets: lieutenant:<id> (main chat) | card:<id> (card thread).
-// What a target's thread READS as. A card thread is the stored array itself; a
-// lieutenant's is the in-memory tail of its log — a view, never something to
-// push() to. Everything that adds a message goes through appendMessage below.
-function threadFor(target) {
-  let m = /^lieutenant:(.+)$/.exec(target || '');
-  if (m) {
-    const lt = findLieutenant(m[1]);
-    if (lt) return (lt.chat = lt.chat || []);
-    return null;
-  }
-  m = /^card:(.+)$/.exec(target || '');
-  if (m) {
-    const card = findCard(m[1]);
-    if (card) return (card.thread = card.thread || []);
-  }
-  return null;
-}
-// The one door a chat message goes in by: a lieutenant main chat appends to its
-// own append-only log, a card thread pushes to the card. Returns the message,
-// or null when the target does not exist.
-function appendMessage(target, msg) {
-  let m = /^lieutenant:(.+)$/.exec(target || '');
-  if (m) {
-    const lt = findLieutenant(m[1]);
-    return lt ? chatAppend(lt.id, msg) : null;
-  }
-  m = /^card:(.+)$/.exec(target || '');
-  if (m) {
-    const card = findCard(m[1]);
-    if (!card) return null;
-    (card.thread = card.thread || []).push(msg);
-    return msg;
-  }
-  return null;
-}
-// The lieutenant a target's deliveries route to: the lieutenant itself, or the
-// card's owner (a card thread's interlocutor is always the owning lieutenant).
-function targetLieutenant(target) {
-  let m = /^lieutenant:(.+)$/.exec(target || '');
-  if (m) return findLieutenant(m[1]);
-  m = /^card:(.+)$/.exec(target || '');
-  if (m) {
-    const card = findCard(m[1]);
-    if (card) return findLieutenant(card.owner);
-  }
-  return null;
-}
+// Chat targets: lieutenant:<id> (main chat) | card:<id> (card thread) — parsed,
+// read, appended to and routed by server/conversation.js.
+function threadFor(target) { return conversation.threadFor(target); }
+function appendMessage(target, msg) { return conversation.appendMessage(target, msg); }
+function targetLieutenant(target) { return conversation.targetLieutenant(target); }
 // ---------- slash commands (the harness port's OPTIONAL commands/runCommand/status) ----------
 // The session a chat target's slash commands (and /api/commands) address: a
 // lieutenant target is the lieutenant's OWN session; a card target is the
@@ -1450,16 +1424,15 @@ function targetLieutenant(target) {
 // → { ref } | { ref: null, why } (valid target, no live session to address)
 //   | { error, code } (bad/unknown target)
 function commandTargetRef(target) {
-  let m = /^lieutenant:(.+)$/.exec(target || '');
-  if (m) {
-    const lt = findLieutenant(m[1]);
+  const t = parseTarget(target);
+  if (t && t.kind === 'lieutenant') {
+    const lt = findLieutenant(t.id);
     if (!lt) return { error: 'unknown target: ' + target, code: 404 };
     if (!isHarnessRef(lt.ref)) return { ref: null, why: 'lieutenant ' + lt.id + ' has no live session' };
     return { ref: lt.ref };
   }
-  m = /^card:(.+)$/.exec(target || '');
-  if (m) {
-    const card = findCard(m[1]);
+  if (t && t.kind === 'card') {
+    const card = findCard(t.id);
     if (!card) return { error: 'unknown target: ' + target, code: 404 };
     const w = findWorker(card.id);
     if (!w || !isHarnessRef(w.ref)) {
@@ -1486,7 +1459,8 @@ const BOARD_COMMANDS = [
   { name: '/reset', description: 'start this lieutenant over: same identity, no memory of the conversation' },
 ];
 function boardCommands(target) {  // MUTATION-TEST ME
-  return /^lieutenant:/.test(target || '') ? BOARD_COMMANDS : [];
+  const t = parseTarget(target);
+  return t && t.kind === 'lieutenant' ? BOARD_COMMANDS : [];
 }
 
 // /reset — kill the session and bring it back on the launch prompt: doctrine,
@@ -1601,13 +1575,7 @@ async function runChatCommand(target, text) {
   // /status reply additionally carries the structured `status` payload so the UI
   // renders a real progress bar instead of regex-parsing the formatted prose.
   const stamp = (author, t, cmd, extra) => {
-    const msg = Object.assign({ author, text: t, ts: now(), cmd }, extra || {});
-    appendMessage(target, msg);
-    const m = /^card:(.+)$/.exec(target);
-    if (m) {
-      const card = findCard(m[1]);
-      if (card) { card.updated = now(); if (!card.threadStart) card.threadStart = msg.ts; }
-    }
+    appendMessage(target, Object.assign({ author, text: t, ts: now(), cmd }, extra || {}));
   };
   const name = text.split(/\s+/)[0];
   const reply = (author, t, extra) => stamp(author, t, { name, reply: true }, extra);
@@ -1618,7 +1586,7 @@ async function runChatCommand(target, text) {
   // harness has no idea what a lieutenant is, and /reset is at its most useful
   // on one whose session has died — bringing it back is the whole point.
   if (boardCommands(target).some((c) => c.name === name)) {
-    const id = /^lieutenant:(.+)$/.exec(target)[1];
+    const id = parseTarget(target).id;
     const out = await withCycleGuard(id, () => resetLieutenant(id));
     if (out.error) reply('bridge', '⚠ ' + name + ' — ' + out.error);
     else reply('bridge', 'reset — ' + id + ' is a new session on the launch prompt (doctrine, charter, and what it owns). The conversation before this one is gone.');
@@ -4199,40 +4167,6 @@ function hookTarget(uri) {
 }
 
 // ---------- server ----------
-// Which agent a hook payload speaks for, READ-ONLY — turn-end and permission
-// asks share it so both attribute the same way (rules at POST /api/turn-end).
-// -> { lt, worker } with at most one set; both null = some other agent.
-function resolveHookAgent(body) {
-  const sid = body.session_id ? String(body.session_id) : '';
-  const sname = body.session ? String(body.session) : '';
-  const tmux = typeof body.tmux_session === 'string' ? body.tmux_session : null;
-  let lt = sid ? board.lieutenants.find((l) => isHarnessRef(l.ref) && l.ref.resumeId === sid) : null;
-  // A lieutenant's hook posts its state key, which for a window-granular
-  // ref is `session:lt` — matching on ref.session alone never saw it, and
-  // a codex lieutenant (born without a resumeId) had no other way in.
-  if (!lt && sname) lt = board.lieutenants.find((l) => isHarnessRef(l.ref) && refKey(l.ref) === sname);
-  if (!lt) {
-    let w = sid ? board.workers.find((x) => x.ref.resumeId === sid) : null;
-    // A window-granular worker's hook posts the `session:window` key —
-    // never the bare session name it shares with its lieutenant.
-    if (!w && sname) w = board.workers.find((x) => workerName(x.ref) === sname);
-    if (w) return { lt: null, worker: w };
-  }
-  // Worker hooks are excluded from tmux attribution: a worker's pane sits
-  // in the lieutenant session it cohabits, so its tmux_session IS that
-  // lieutenant's — without this guard a stale worker POST (its record
-  // already gone) would corrupt the lieutenant's resumeId. The WINDOW part
-  // of the key tells them apart: `:lt` is the lieutenant's own window,
-  // `:w-<card>` is a worker's (names.js — workerWindow / LIEUTENANT_WINDOW).
-  const keyWindow = sname.includes(':') ? sname.slice(sname.indexOf(':') + 1) : '';
-  const workerKey = !!keyWindow && keyWindow !== names.LIEUTENANT_WINDOW;
-  if (!lt && tmux && !workerKey) lt = board.lieutenants.find((l) => isHarnessRef(l.ref) && l.ref.session === tmux);
-  if (!lt && tmux === null && sid) {
-    const cands = board.lieutenants.filter((l) => isHarnessRef(l.ref) && !l.ref.resumeId);
-    if (cands.length === 1 && body.cwd && path.resolve(String(body.cwd)) === cands[0].ref.cwd) lt = cands[0];
-  }
-  return { lt: lt || null, worker: null };
-}
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
@@ -4716,12 +4650,14 @@ const server = http.createServer(async (req, res) => {
     // BEFORE lieutenant attribution so a worker's first POST can never be
     // mis-adopted); (4) tmux attribution — the hook runs inside the agent's
     // pane, so its tmux_session names the owning lieutenant's ref.session
-    // exactly (adopts/refreshes resumeId; works for any number of founders);
+    // exactly — never for a worker's `:w-<card>` key, whose pane shares that
+    // session (adopts/refreshes resumeId; works for any number of founders);
     // (5) legacy adoption — only for old hooks whose payload carries no
     // tmux_session field: exactly one ref-bearing lieutenant missing its
     // resumeId, and never a session_id whose cwd is not that lieutenant's
     // ref.cwd (a stray claude in the workspace must not become a lieutenant).
     // Anything else is some other agent in the workspace: acknowledged, ignored.
+    // The steps are conversation.identify's (resolveHookAgent).
     if (route === 'POST /api/turn-end') {
       const body = JSON.parse(await readBody(req) || '{}');
       const sid = body.session_id ? String(body.session_id) : '';
@@ -5241,9 +5177,9 @@ const server = http.createServer(async (req, res) => {
     // have nothing to page.
     if (route === 'GET /api/chat') {
       const target = String(url.searchParams.get('target') || '');
-      const m = /^lieutenant:(.+)$/.exec(target);
-      if (!m) return sendJson(res, 400, { error: 'target must be lieutenant:<id> (card threads ride the board payload)' });
-      const lt = findLieutenant(m[1]);
+      const t = parseTarget(target);
+      if (!t || t.kind !== 'lieutenant') return sendJson(res, 400, { error: 'target must be lieutenant:<id> (card threads ride the board payload)' });
+      const lt = findLieutenant(t.id);
       if (!lt) return sendJson(res, 404, { error: 'unknown target: ' + target });
       // Only an explicit 0 means the whole conversation; anything unreadable
       // falls back to the default page rather than shipping the entire log.
@@ -5253,112 +5189,39 @@ const server = http.createServer(async (req, res) => {
       const before = String(url.searchParams.get('before') || '');
       return sendJson(res, 200, { target, before: before || null, messages: chatPage(lt.id, before, limit) });
     }
+    // chat.say — both sides go through conversation.say(), which decides the
+    // thread append, the QueueItem (and so the wake) and the line move.
     if (route === 'POST /api/message') { // lieutenant -> captain (chat.say, lieutenant side)
       const body = JSON.parse(await readBody(req) || '{}');
-      const target = String(body.target || '');
-      if (!threadFor(target)) return sendJson(res, 404, { error: 'unknown target: ' + target });
-      const text = String(body.text_md || body.text || '');
-      const attachments = resolveAttachments(body.attachments);
-      if (!text.trim() && !attachments.length) return sendJson(res, 400, { error: 'text or attachments required' });
-      // Default author, most-identified first: explicit body.author; then the
-      // CALLER resolved from its tmux session (like drain/ack — so a lieutenant
-      // posting to another's chat or card is stamped as itself, not the target);
-      // then the target's lieutenant (unidentified callers — the interlocutor
-      // is the owning lieutenant, card threads included).
-      const lt = targetLieutenant(target);
-      const sess = body.session ? String(body.session) : '';
-      const caller = sess ? board.lieutenants.find((l) => l.ref && l.ref.session === sess) : null;
-      const msg = { author: String(body.author || (caller && caller.name) || (lt && lt.name) || 'agent').slice(0, 60), text, ts: now() };
-      if (attachments.length) msg.attachments = attachments;
-      appendMessage(target, msg);
-      const m = /^card:(.+)$/.exec(target);
-      if (m) {
-        const card = findCard(m[1]);
-        if (card) {
-          card.updated = now(); if (!card.threadStart) card.threadStart = msg.ts;
-          // A card-thread say from anyone but the owning lieutenant — its own
-          // worker (whose session resolves to no lieutenant), a peer, raw
-          // tooling — must WAKE the owner: the thread alone notifies nobody.
-          // Default-notify: only a session-identified owner is exempt (author
-          // names can't be trusted — an unidentified worker is stamped with
-          // the owner's name). Captain messages ride /api/feedback, never here.
-          const fromOwner = !!(caller && caller.id === card.owner);
-          if (!fromOwner && msg.author !== 'user') {
-            queuePush(card.owner, { kind: 'worker-said', card: card.id, target, author: msg.author,
-              text: text.slice(0, 2000), attachments });
-          }
-        }
-      } else {
-        // A free-form lieutenant message in its main chat is a level-1 notification.
-        const ev = mkEvent({ text: text.slice(0, 200), actor: msg.author, level: body.level, kind: body.kind }, { level: 1 });
-        board.events.push(ev);
-        // A PEER's message into another lieutenant's main chat must also be
-        // DELIVERED to that lieutenant: the chat append alone notifies nobody
-        // (same rule as the non-owner card-thread say above). Without this,
-        // lieutenant→lieutenant orders sit in the chat unread forever.
-        const fromPeer = !!(caller && lt && caller.id !== lt.id);
-        if (fromPeer) {
-          queuePush(lt.id, { kind: 'peer-message', target, author: msg.author,
-            text: text.slice(0, 4000), attachments });
-        }
-        // …and it is the last voice the captain heard, so the line follows it:
-        // an answer over the line keeps the line, and a lieutenant that speaks
-        // up on its own becomes who he reaches when he answers with the screen
-        // off. Card threads never move it — they are a board surface, read with
-        // eyes on a picker, not the channel with no picker. A peer's post is
-        // the PEER speaking, not the chat's owner — the line must not follow
-        // the silent recipient.
-        if (lt && !fromPeer) lineFollow(lt.id);
-      }
+      // The caller is resolved from its tmux session + window (like drain/ack),
+      // so a lieutenant speaking elsewhere is stamped as itself and a worker as
+      // `worker <card>` — never as the lieutenant whose session it shares.
+      const r = conversation.say(callerOf(body), String(body.target || ''),
+        String(body.text_md || body.text || ''), resolveAttachments(body.attachments),
+        { author: body.author, level: body.level, kind: body.kind });
+      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
       saveBoard(); broadcast(); // owed clears on ACK, not here — the reply alone leaves it derived from the queue
       return sendJson(res, 200, { ok: true });
     }
     if (route === 'POST /api/feedback') { // captain -> lieutenant (chat.say, captain side)
       const body = JSON.parse(await readBody(req) || '{}');
-      let target = String(body.target || '');
-      // `target: "line"` = whoever is on the line. The voice shortcut posts
-      // this and names nobody; the server resolves it to a real main chat, so
-      // everything below is an ordinary captain message — it just knows it
-      // came over the line.
-      const overLine = target === 'line';
-      if (overLine) {
-        const holder = lineHolder().lieutenant;
-        if (!holder) return sendJson(res, 404, { error: 'nobody is on the line — this board has no lieutenant' });
-        target = 'lieutenant:' + holder.id;
-      }
-      if (!threadFor(target)) return sendJson(res, 404, { error: 'unknown target: ' + target });
       const text = String(body.text || '');
       const attachments = resolveAttachments(body.attachments);
-      if (!text.trim() && !attachments.length) return sendJson(res, 400, { error: 'text or attachments required' });
       // A bare "/command" (no attachments riding along) is a slash command,
       // not a say: it routes to the target harness's runCommand and both the
       // command and its reply land in the thread — no QueueItem, no wake.
       if (text.trim().startsWith('/') && !attachments.length) {
-        const r = await runChatCommand(target, text.trim());
+        const t = conversation.captainTarget(body.target); // `line` = whoever holds it
+        if (t.error) return sendJson(res, t.code, { error: t.error });
+        const r = await runChatCommand(t.target, text.trim());
         if (r.error) return sendJson(res, r.code || 400, { error: r.error });
         saveBoard(); broadcast();
         return sendJson(res, 200, r);
       }
-      const lt = targetLieutenant(target);
-      if (!lt) return sendJson(res, 404, { error: 'no lieutenant behind target: ' + target });
-      // Write-ahead delivery: the QueueItem lands FIRST; the send-keys wake half
-      // of delivery arrives in a later phase. A dead session loses nothing. The
-      // attachments (with absolute paths) ride the queue item so drain surfaces
-      // the file paths to the agent.
-      // `via: 'line'` rides the ENVELOPE, never the captain's words: a lieutenant
-      // that reads channel information back to him got it glued into the text.
-      const item = queuePush(lt.id, Object.assign({ kind: 'message', target, text, attachments },
-        overLine ? { via: 'line' } : null));
-      const msg = { author: 'user', text, ts: now() };
-      if (attachments.length) msg.attachments = attachments;
-      appendMessage(target, msg);
-      const m = /^card:(.+)$/.exec(target);
-      if (m) {
-        const card = findCard(m[1]);
-        if (card) { card.updated = now(); if (!card.threadStart) card.threadStart = msg.ts; }
-      }
+      const r = conversation.say(CAPTAIN, String(body.target || ''), text, attachments);
+      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
       saveBoard(); broadcast(); // a captain message flips derived owed via broadcast
-      return sendJson(res, 200, { ok: true, seq: item.seq, target, via: overLine ? 'line' : undefined });
+      return sendJson(res, 200, { ok: true, seq: r.item.seq, target: r.target, via: r.via });
     }
 
     // ----- the line -----
@@ -5369,23 +5232,12 @@ const server = http.createServer(async (req, res) => {
     }
     if (route === 'POST /api/line') { // line.pass — a DELIVERY, not a quiet flag flip
       const body = JSON.parse(await readBody(req) || '{}');
-      const id = String(body.lieutenant || '').trim();
-      const lt = findLieutenant(id);
-      if (!lt) return sendJson(res, 404, { error: 'unknown lieutenant: ' + (id || '(none)') });
-      const note = String(body.note || '').trim().slice(0, 2000);
       // Who is handing it over: explicit actor, else the CALLER resolved from
-      // its tmux session (like say/drain/ack), else the captain.
-      const sess = body.session ? String(body.session) : '';
-      const caller = sess ? board.lieutenants.find((l) => l.ref && l.ref.session === sess) : null;
-      const from = String(body.actor || (caller && caller.name) || 'user').trim().slice(0, 60);
-      board.line = lt.id;
-      // The receiver finds out because it was TOLD — same durable queue as
-      // everything else, so it wakes and greets him in its own voice.
-      const item = queuePush(lt.id, { kind: 'line-passed', from, text: note });
-      board.events.push(mkEvent({ text: 'the line passed to ' + lt.name + (note ? ': ' + note : ''),
-        actor: from, kind: 'line' }, {}));
+      // its tmux session + window (like say/drain/ack), else the captain.
+      const r = conversation.pass(callerOf(body), body.lieutenant, body.note, { actor: body.actor });
+      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
       saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, lieutenant: lt.id, name: lt.name, seq: item.seq });
+      return sendJson(res, 200, { ok: true, lieutenant: r.lt.id, name: r.lt.name, seq: r.item.seq });
     }
 
     // ----- read state (persisted server-side, per user) -----
@@ -5475,10 +5327,11 @@ const server = http.createServer(async (req, res) => {
       // so it drains ONLY its own queue — the fix for cross-lieutenant drain.
       if (lt && !findLieutenant(lt)) return sendJson(res, 404, { error: 'unknown lieutenant: ' + lt });
       if (!lt && sess) {
-        const owner = board.lieutenants.find((l) => l.ref && l.ref.session === sess);
-        // A session that resolves to no lieutenant (a stale ref, a non-lieutenant
-        // tmux) gets nothing — draining every queue here is exactly what let a
-        // non-owner ack-wipe another lieutenant's items.
+        const who = callerOf({ session: sess, window: url.searchParams.get('window') });
+        const owner = who.kind === 'lieutenant' ? who.lt : null;
+        // A session that resolves to no lieutenant (a worker, a stale ref, a
+        // non-lieutenant tmux) gets nothing — draining every queue here is
+        // exactly what let a non-owner ack-wipe another lieutenant's items.
         if (!owner) return sendJson(res, 200, { items: [], head: delivery.head() });
         lt = owner.id;
       }
@@ -5502,9 +5355,12 @@ const server = http.createServer(async (req, res) => {
       let ackOwner = body.lieutenant || '';
       if (ackOwner && !findLieutenant(ackOwner)) return sendJson(res, 404, { error: 'unknown lieutenant: ' + ackOwner });
       if (!ackOwner && body.session) {
-        const owner = board.lieutenants.find((l) => l.ref && l.ref.session === body.session);
-        if (!owner) return sendJson(res, 403, { error: 'session ' + body.session + ' is not a lieutenant — ack refused' });
-        ackOwner = owner.id;
+        const who = callerOf(body);
+        // A worker shares its lieutenant's session but owns no queue: unscoped,
+        // its ack could commit (and so discard) the lieutenant's pending items.
+        if (who.kind === 'worker') return sendJson(res, 409, { error: 'a worker has no delivery queue — acks belong to its lieutenant' });
+        if (who.kind !== 'lieutenant') return sendJson(res, 403, { error: 'session ' + body.session + ' is not a lieutenant — ack refused' });
+        ackOwner = who.lt.id;
       }
       if (!ackOwner && board.lieutenants.length === 1) ackOwner = board.lieutenants[0].id;
       if (!ackOwner) {
