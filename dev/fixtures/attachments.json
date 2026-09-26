@@ -1,4 +1,4 @@
 {
-  "att-shot1": { "name": "board-screenshot.svg", "mime": "image/svg+xml", "file": "bodies/board-mock.svg" },
-  "att-log1": { "name": "worker.log", "mime": "text/plain", "file": "bodies/worker.log" }
+  "a77ac0de0001": { "name": "board-screenshot.svg", "mime": "image/svg+xml", "file": "bodies/board-mock.svg" },
+  "a77ac0de0002": { "name": "worker.log", "mime": "text/plain", "file": "bodies/worker.log" }
 }

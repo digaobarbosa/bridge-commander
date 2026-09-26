@@ -1,0 +1,3 @@
+#!/bin/bash
+# A lifecycle hook, so the hooks tab shows both kinds. Prints what it was handed.
+echo "archived ${BC_CARD:-?}"

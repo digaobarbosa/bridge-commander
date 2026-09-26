@@ -168,10 +168,9 @@ async function main() {
   let dev = null;
   let base = args.url;
   if (!base) {
-    const { createDevServer } = require(path.join(ROOT, 'dev', 'ui-server.js'));
-    dev = createDevServer({});
-    await new Promise((r) => dev.server.listen(0, '127.0.0.1', r));
-    base = 'http://127.0.0.1:' + dev.server.address().port;
+    const { startPlayground } = require(path.join(ROOT, 'dev', 'ui-server.js'));
+    dev = await startPlayground({});
+    base = dev.base;
   }
   const url = base.replace(/\/+$/, '') + '/ui/bridge3d.html?capture=1&xr=emulate';
 
