@@ -11,7 +11,7 @@ test('lieutenant card-thread reply notifies unread; the captain\'s own message n
   try {
     await s.api('POST', '/api/cards', withOwner({ title: 'Convo' })); // level-2 birth event only
     await s.api('POST', '/api/feedback', { target: 'card:convo', text: 'how is it going?' });
-    await s.api('POST', '/api/message', { target: 'card:convo', text: 'halfway there' });
+    await s.api('POST', '/api/message', { target: 'card:convo', text: 'halfway there', author: 'Ada' });
 
     const r = await s.api('GET', '/api/notifications');
     assert.strictEqual(r.body.unread, 1);

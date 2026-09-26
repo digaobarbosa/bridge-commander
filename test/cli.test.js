@@ -147,13 +147,13 @@ test('cli card create / board / say / drain / ack round-trip against a test serv
     r = await runCli(['drain', '--json', ...args]);
     assert.strictEqual(r.stdout.trim(), '');
 
-    // lieutenant reply via say (interlocutor default: the owning lieutenant)
+    // a say from outside tmux is unidentified: signed `agent`, never the owner's name
     const sayFile = path.join(s.dir, 'reply.md');
     fs.writeFileSync(sayFile, 'on it, captain');
     r = await runCli(['say', 'card:ADA-1', '--text-file', sayFile, ...args], { TMUX: '' });
     assert.strictEqual(r.code, 0, r.stderr);
     const card = (await s.api('GET', '/api/cards/ADA-1')).body;
-    assert.strictEqual(card.thread[1].author, 'Ada');
+    assert.strictEqual(card.thread[1].author, 'agent');
     assert.strictEqual(card.thread[1].text, 'on it, captain');
 
     // an UNIDENTIFIED card-thread say default-notifies the owner (worker-said);
