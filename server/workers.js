@@ -130,6 +130,7 @@ const END_OF_LIFE = {
   },
 };
 
+const TEARDOWN_OUTPUT_TAIL = 1200; // of the event text, whose own cap is 2000
 const PR_URL_RE = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/g;
 
 /**
@@ -245,9 +246,7 @@ function createWorkers(deps) {
    */
   async function kill(card, w, opts = {}) {
     try {
-      if (!w) return null;
-      if (opts.honorKeep && w.keepWorktree) return null;
-      if (!isCurrent(w)) return null;
+      if (!w || !isCurrent(w)) return null;
       const name = refKey(w.ref);
       let up = true;
       let err = null;
@@ -316,8 +315,7 @@ function createWorkers(deps) {
       const r = await deps.runTeardown(command, ctx, { timeoutMs });
       if (r.ok) transition(w, 'teardown-ran', { teardownRan: true });
       const detail = r.timedOut ? 'timed out' : r.error ? String(r.error) : 'exit ' + r.code;
-      const tail = cfg.teardownOutputTail || 1200;
-      const out = r.output.length > tail ? '…' + r.output.slice(-tail) : r.output;
+      const out = r.output.length > TEARDOWN_OUTPUT_TAIL ? '…' + r.output.slice(-TEARDOWN_OUTPUT_TAIL) : r.output;
       const text = 'teardown `' + command + '` ' + (r.ok ? 'ok' : 'FAILED')
         + ' (' + detail + ', ' + (r.ms / 1000).toFixed(1) + 's)' + (out ? ': ' + out : '');
       note(card, { text, actor: 'server' }, { kind: r.ok ? 'hook-ran' : 'hook-failed' });
@@ -347,13 +345,12 @@ function createWorkers(deps) {
    * Give the card's worktree back: teardown first, then releaseWorktree, which
    * REFUSES a checkout still holding work (that refusal is the feature). Never
    * throws.
-   * @param {object} opts {honorKeep, teardownMs, project (fallback clone)}
+   * @param {object} opts {teardownMs, project (fallback clone)}
    * @returns {Promise<{released: boolean, reason?: string, holder?: string}|null>}
    *   null when nothing could run (no ground, no clone, superseded, threw)
    */
   async function release(card, w, opts = {}) {
     try {
-      if (opts.honorKeep && w && w.keepWorktree) return null;
       if (supersededBy(card.id, w)) return null;
       const attrs = (card && card.attributes) || {};
       const fromRecord = !!(w && w.worktree && w.worktree.path);
