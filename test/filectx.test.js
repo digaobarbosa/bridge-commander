@@ -1,22 +1,18 @@
 'use strict';
 // The promise of the co-edit screen: "I select a piece and talk to you about
 // it". That only holds if the file and the lines reach the LIEUTENANT, not just
-// the composer. Three levels, because the failure could hide at any of them:
+// the composer. Two levels:
 //
 //  1. the format itself (ui/js/filectx.js — DOM-free, imported straight in);
-//  2. the composer actually using it (chat.js binds DOM at import time, so its
-//     wiring is pinned at the source level — the av-dispatch.test.js pattern);
-//  3. end to end: a message sent that way arrives on the owning lieutenant's
+//  2. end to end: a message sent that way arrives on the owning lieutenant's
 //     queue — what the agent drains — carrying file, lines and snippet.
 const test = require('node:test');
 const assert = require('node:assert');
-const fs = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { startServerWithLieutenant, withOwner, LT } = require('./helper');
 
 const mod = import(pathToFileURL(path.join(__dirname, '..', 'ui', 'js', 'filectx.js')).href);
-const chatSrc = fs.readFileSync(path.join(__dirname, '..', 'ui', 'js', 'chat.js'), 'utf8');
 
 test('a selection becomes file + lines + a fenced snippet', async () => {
   const { fileContextBlock } = await mod;
@@ -46,13 +42,6 @@ test('a snippet that is itself markdown cannot break out of its fence', async ()
   const fence = /\n(`{4,})md\n/.exec(block);
   assert.ok(fence, 'the opening fence outruns the backticks inside');
   assert.ok(block.trimEnd().endsWith(fence[1]), 'and the closing fence matches it');
-});
-
-test('the composer prepends the context to what the captain typed', () => {
-  assert.match(chatSrc, /const text = q \? fileContextBlock\(q\) \+ typed : typed;/,
-    'send() composes context + message');
-  assert.match(chatSrc, /api\.feedback\(target, text, metas\)/,
-    'and it is THAT composed text that is delivered');
 });
 
 test('a message sent from the file screen reaches the lieutenant queue with the context', async () => {

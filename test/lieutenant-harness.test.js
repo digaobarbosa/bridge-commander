@@ -14,19 +14,11 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { startServer, runCli, sleep } = require('./helper');
+const { startServer, runCli, sleep, until, seedBoard } = require('./helper');
 const { writeCharter } = require('../server/layout.js');
 
 const PRELOAD = path.join(__dirname, 'recording-harness.js');
 
-function seedBoard(dir, board) {
-  const sd = path.join(dir, '.bridge-commander');
-  fs.mkdirSync(sd, { recursive: true });
-  fs.writeFileSync(path.join(sd, 'board.json'), JSON.stringify(Object.assign({
-    title: 'seeded', seq: 0, lieutenants: [], cards: [], events: [], labels: [], reads: {}, kinds: {},
-    projects: [], workers: [],
-  }, board), null, 2));
-}
 // A fake session that is ALIVE across the process boundary: the marker file is
 // the window (see harness/fake.js).
 function fakeSession(fdir, key) {
@@ -41,15 +33,6 @@ function launches(logFile) {
   try {
     return fs.readFileSync(logFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   } catch (e) { return []; }
-}
-async function until(what, fn, ms = 5000) {
-  const deadline = Date.now() + ms;
-  for (;;) {
-    const v = await fn();
-    if (v) return v;
-    if (Date.now() > deadline) throw new Error('timeout waiting for: ' + what);
-    await sleep(50);
-  }
 }
 
 const LT_ADA = (extra) => Object.assign({

@@ -11,7 +11,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { startServer, sleep } = require('./helper');
+const { startServer, sleep, until, seedBoard } = require('./helper');
 const { writeCharter } = require('../server/layout.js');
 
 const TICK = '150';
@@ -23,23 +23,6 @@ function readSends(dir, session) {
   try {
     return fs.readFileSync(path.join(dir, session + '.sends.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   } catch (e) { return []; }
-}
-async function until(what, fn, ms = 5000) {
-  const deadline = Date.now() + ms;
-  for (;;) {
-    const v = await fn();
-    if (v) return v;
-    if (Date.now() > deadline) throw new Error('timeout waiting for: ' + what);
-    await sleep(50);
-  }
-}
-function seedBoard(dir, board) {
-  const sd = path.join(dir, '.bridge-commander');
-  fs.mkdirSync(sd, { recursive: true });
-  fs.writeFileSync(path.join(sd, 'board.json'), JSON.stringify(Object.assign({
-    title: 'seeded', seq: 0, lieutenants: [], cards: [], events: [], labels: [], reads: {}, kinds: {},
-    projects: [], workers: [],
-  }, board), null, 2));
 }
 
 test('dead lieutenant is respawned: ref updated, level-1 respawned event, drain nudge', async () => {

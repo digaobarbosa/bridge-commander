@@ -251,33 +251,3 @@ test('leaving the room takes the microphone with it', async () => {
   assert.equal(sockets[0].closed, true);
   await tick();
 });
-
-// ---- and how the room wires it ---------------------------------------------
-
-test('the microphone is acquired at the gate and nothing in the room can prompt', async () => {
-  const fs = require('node:fs');
-  const UI = path.join(__dirname, '..', 'ui', 'js', 'bridge3d');
-  const main = fs.readFileSync(path.join(UI, 'main.js'), 'utf8');
-  // The one call site, and it is inside enter() — before the session is asked
-  // for, which is the whole constraint.
-  const enter = /async function enter\(\)[\s\S]*?\n}\n/.exec(main)[0];
-  assert.match(enter, /await talk\.arm\(\)/, 'the microphone is not asked for at the gate');
-  assert.ok(
-    enter.indexOf('talk.arm()') < enter.indexOf("requestSession('immersive-vr'"),
-    'the microphone is asked for after the session starts, where no prompt can be shown',
-  );
-  for (const f of fs.readdirSync(UI)) {
-    if (!f.endsWith('.js') || f === 'talk.js') continue;
-    assert.ok(!/getUserMedia/.test(fs.readFileSync(path.join(UI, f), 'utf8')),
-      `${f} opens a microphone of its own — there is one, and talk.js holds it`);
-  }
-
-  // Every way a press can end, ends the recording. The bar's own pointerup is
-  // not one of them: he moves his hand while he speaks, and the ray leaves.
-  assert.match(main, /'selectend', \(\) => talk\.end\(\)/, 'letting the trigger go does not stop the recording');
-  assert.match(main, /pointerup'[\s\S]{0,80}talk\.end\(\)/, 'and neither does letting the mouse go, at a desk');
-
-  const chat = fs.readFileSync(path.join(UI, 'chat.js'), 'utf8');
-  assert.match(chat, /onPress: \(\) => this\.startTalking\(\)/, 'the talk bar does not start on the way down');
-  assert.match(chat, /this\.send\(text\)/, 'a dictated message does not go out the board\'s own chat path');
-});

@@ -185,7 +185,7 @@ if [ -n "$RESPOND" ]; then
   # here rather than asked of a human who is holding a phone.
   if [ "$RESPOND" = fix ] && [ -z "$FINDINGS" ]; then
     FINDINGS=$(parse_findings <<<"$("$NM" axi status 2>>"$LOG")" \
-      | awk -F'\t' '$2 == "auto-fix" || $2 == "ask-user" { print $1 }' | paste -sd,)
+      | awk -F'\t' '$2 == "auto-fix" || $2 == "ask-user" { print $1 }' | paste -sd, -)
     [ -n "$FINDINGS" ] || refuse \
       "A human answered \`fix\`, but the parked gate offers nothing actionable to fix."
   fi
@@ -241,7 +241,7 @@ while :; do
   rows=$(parse_findings <<<"$out")
   case "$rows" in PARSE_ERROR*) refuse "The clerk could not parse the gate's findings table: $rows" "$out" ;; esac
 
-  ask=$(awk -F'\t' '$2 == "ask-user" { print $1 }' <<<"$rows" | paste -sd,)
+  ask=$(awk -F'\t' '$2 == "ask-user" { print $1 }' <<<"$rows" | paste -sd, -)
   if [ -n "$ask" ]; then
     {
       echo "# no-mistakes parked on an ask-user finding"
@@ -259,7 +259,7 @@ while :; do
     finish escalated "ask-user finding(s) at gate $status: $ask — parked, nothing resolved"
   fi
 
-  fix=$(awk -F'\t' '$2 == "auto-fix" { print $1 }' <<<"$rows" | paste -sd,)
+  fix=$(awk -F'\t' '$2 == "auto-fix" { print $1 }' <<<"$rows" | paste -sd, -)
   if [ -n "$fix" ]; then
     fix_rounds=$((fix_rounds + 1))
     [ "$fix_rounds" -gt "$MAX_FIX_ROUNDS" ] && finish failed \

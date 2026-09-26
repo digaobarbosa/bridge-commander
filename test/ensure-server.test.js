@@ -84,7 +84,11 @@ test('ensureServer boot failure: surfaces a real error pointing at the logfile, 
   }
 });
 
-test('ensureServer stale pid: a live pid recycled to a non-bc process does not block a real boot', async () => {
+// The server tells a recycled pid from its own through /proc/<pid>/cmdline, and
+// only Linux has /proc. Elsewhere it trusts any live pid, so this cannot pass.
+test('ensureServer stale pid: a live pid recycled to a non-bc process does not block a real boot', {
+  skip: process.platform !== 'linux' && 'needs /proc to tell a recycled pid from the server',
+}, async () => {
   const dir = tmpWorkspace();
   const stateDir = path.join(dir, '.bridge-commander');
   fs.mkdirSync(stateDir, { recursive: true });

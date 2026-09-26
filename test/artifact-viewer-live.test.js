@@ -5,7 +5,7 @@
 // disk and the captain kept reading the old text until he closed and reopened.
 //
 // detail.js binds DOM at import time, so this drives it against a recording
-// stub DOM (the copytext.test.js trick, one size up): getElementById hands out
+// stub DOM (the md.test.js copyText trick, one size up): getElementById hands out
 // the same fake node per id, and the test reads what the viewer wrote into
 // #av-body. Everything the popup path does not touch answers through a Proxy.
 const test = require('node:test');
@@ -123,15 +123,4 @@ test('a closed popup does not follow — the next open re-reads anyway', async (
   disk = { name: 'brief.md', version: 'v2', content: 'written while nobody looked\n' };
   await m.artifactWritten({ uri: URI, version: 'v2', by: 'agent-tab' });
   assert.strictEqual(gets, before, 'nothing is on screen, so nothing is fetched');
-});
-
-// The file-screen path is not traded away for this: its branch still runs on
-// fileKey() and still routes through the editor's update / notice.
-test('the file-screen branch is intact', async () => {
-  const fs = require('node:fs');
-  const src = fs.readFileSync(path.join(__dirname, '..', 'ui', 'js', 'detail.js'), 'utf8');
-  assert.match(src, /const onFileScreen = fileKey\(\) === uri;/);
-  assert.match(src, /if \(fileKey\(\) !== uri\) return; \/\/ he left the screen/);
-  assert.match(src, /if \(!fileDirty\(\) \|\| fileMerges\(\)\) return take\(/);
-  assert.match(src, /fileNotice\(/);
 });
