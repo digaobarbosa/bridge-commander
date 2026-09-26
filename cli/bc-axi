@@ -21,7 +21,7 @@ const SELF_DIR = path.dirname(fs.realpathSync(process.argv[1]));
 // deliberately-crashing script to exercise the boot-failure path.
 const SERVER_JS = process.env.BC_SERVER_JS || path.join(SELF_DIR, '..', 'server', 'server.js');
 const { STATE_DIR_NAME, LEGACY_STATE_DIR_NAME, migrateStateDir, resolveStateDir, migrateHomeStateDir, isWorkspace, isId,
-  ONBOARDING_STEPS } =
+  slugBase, ONBOARDING_STEPS } =
   require(path.join(SELF_DIR, '..', 'server', 'layout.js'));
 const gitrev = require(path.join(SELF_DIR, '..', 'server', 'gitrev.js'));
 // The playbooks a workspace is seeded with, and the worker-duties skill that
@@ -356,9 +356,9 @@ async function cmdOpen() {
 // as the founding lieutenant (its tmux session is the ref), install the
 // workspace-level turn-end Stop hook, scaffold AGENTS.md + captain.md +
 // learnings/, print the board URL. Idempotent — safe to re-run.
-function slugId(s) {
-  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'lt';
-}
+// The id a name derives to, needed here before the server has answered (the
+// charter file is named after it). The rule is the server's (layout.slugBase).
+function idFromName(name) { return slugBase(name) || 'lt'; }
 
 // --charter-file seeds a lieutenant's memory file; it never replaces one. The
 // file's existence is the mark — the same rule the boot migration follows —
@@ -409,11 +409,30 @@ async function seedGhWatchSchedule(owner) {
   }
 }
 
+// Which agent CLI is running this init, read from what each one exports to
+// the commands it runs: claude sets CLAUDECODE (and CLAUDE_SESSION_ID when it
+// has one), codex sets CODEX_THREAD_ID — the thread id `codex resume` takes.
+// --harness wins. Claude also wins a tie: a tmux server started from one agent
+// hands that agent's variables to every session in it, and claude is what
+// every init before this one recorded.
+function callerHarness() {
+  const env = process.env;
+  if (opts.harness) {
+    const resumeId = opts.harness === 'codex' ? env.CODEX_THREAD_ID : env.CLAUDE_SESSION_ID;
+    return { harness: opts.harness, resumeId: resumeId || '' };
+  }
+  if (!env.CLAUDECODE && !env.CLAUDE_SESSION_ID && env.CODEX_THREAD_ID) {
+    return { harness: 'codex', resumeId: env.CODEX_THREAD_ID };
+  }
+  return { harness: 'claude', resumeId: env.CLAUDE_SESSION_ID || '' };
+}
+
 async function cmdInit() {
   if (opts.onboard) return cmdInitOnboard();
   if (!opts.name) {
-    die('usage: bc-axi init --name <founding-lieutenant-name> [--id id] [--charter-file f|-] [--port N] [--host H]\n' +
-      '  Run from inside the tmux session that will BE the founding lieutenant.');
+    die('usage: bc-axi init --name <founding-lieutenant-name> [--id id] [--charter-file f|-] [--harness claude|codex] [--port N] [--host H]\n' +
+      '  Run from inside the tmux session that will BE the founding lieutenant.\n' +
+      '  The harness is read from the environment (claude or codex); --harness overrides it.');
   }
   // 1. teleport precondition: the caller's tmux session becomes the lieutenant's address
   // No tmux command is ever printed for a human to type — not here, not in any
@@ -442,6 +461,7 @@ async function cmdInit() {
   console.error('│  workspace : ' + WORKSPACE + (fresh ? '   (NEW)' : '   (existing)'));
   console.error('│  resolved  : ' + how);
   console.error('│  tmux      : ' + tmuxSession);
+  console.error('│  harness   : ' + callerHarness().harness);
   console.error('└─ if that workspace is wrong, stop now and re-run with --workspace <dir>');
 
   // 2. state dir + server (detached, idempotent)
@@ -450,12 +470,13 @@ async function cmdInit() {
   const { started } = await ensureServer();
   console.log('server ' + (started ? 'started' : 'already running') + ' on port ' + PORT);
 
-  // 3. founding lieutenant: the CALLER's session is its ref. resumeId is learned
-  // from the first turn-end POST (adoption); CLAUDE_SESSION_ID seeds it when the
-  // harness exports it.
-  const id = opts.id || slugId(opts.name);
-  const ref = { harness: 'claude', session: tmuxSession, cwd: WORKSPACE };
-  if (process.env.CLAUDE_SESSION_ID) ref.resumeId = process.env.CLAUDE_SESSION_ID;
+  // 3. founding lieutenant: the CALLER's session is its ref, on the harness the
+  // caller runs on (callerHarness). resumeId is learned from the first turn-end
+  // POST (adoption); the harness's own id seeds it when the environment has one.
+  const id = opts.id || idFromName(opts.name);
+  const who = callerHarness();
+  const ref = { harness: who.harness, session: tmuxSession, cwd: WORKSPACE };
+  if (who.resumeId) ref.resumeId = who.resumeId;
   const body = { name: opts.name, id, ref, actor: 'user' };
   if (opts.color) body.color = opts.color;
   // Before the register, so a session launched off this record already finds it.
@@ -556,6 +577,8 @@ function scaffoldWorkspace() {
 const BRIDGET = { name: 'Bridget', id: 'bridget', prefix: 'BRI', avatar: 5 };
 const ONBOARDING_DIR = path.join(SELF_DIR, '..', 'onboarding');
 
+// The one writer of config.json on this side. A key patched to undefined is
+// dropped (JSON.stringify leaves it out), which is how a setting is cleared.
 function writeConfigKeys(patch) {
   let cfg = {};
   try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (e) {}
@@ -658,7 +681,7 @@ async function cmdInitOnboard() {
   //    lieutenant with no idea why she exists.
   const id = opts.id || BRIDGET.id;
   const name = opts.name || BRIDGET.name;
-  const avatar = opts.avatar !== null ? parseAvatarOpt(opts.avatar) : BRIDGET.avatar;
+  const avatar = opts.avatar !== null ? avatarArg(opts.avatar) : BRIDGET.avatar;
   const charterFile = path.join(ONBOARDING_DIR, 'bridget.md');
   if (fs.existsSync(charterPath(WORKSPACE, id))) {
     console.log('charter left alone — ' + charterPath(WORKSPACE, id) + ' already exists');
@@ -783,12 +806,11 @@ async function cmdStop() {
 }
 
 // ---------- lieutenants ----------
-function parseAvatarOpt(raw) {
-  const n = parseInt(raw, 10);
-  if (!Number.isInteger(n) || String(n) !== String(raw).trim() || n < 0 || n > 63) {
-    die('--avatar must be an integer 0-63');
-  }
-  return n;
+// --avatar is a string on argv and a number on the wire. Only the conversion
+// lives here: the range is the server's, and so is the refusal.
+function avatarArg(raw) {
+  if (raw === 'none') return null;
+  return /^\s*\d+\s*$/.test(raw) ? Number(raw) : raw;
 }
 
 async function cmdLtCreate() {
@@ -798,12 +820,12 @@ async function cmdLtCreate() {
   if (opts.id) body.id = opts.id;
   if (opts.prefix) body.prefix = opts.prefix;
   if (opts.color) body.color = opts.color;
-  if (opts.avatar !== null) body.avatar = parseAvatarOpt(opts.avatar);
+  if (opts.avatar !== null) body.avatar = avatarArg(opts.avatar);
   // A charter pins the id here rather than leaving it to the server: the memory
   // file is named after it, and it has to be on disk BEFORE --spawn reads it
   // into the launch prompt.
   if (opts.charterFile) {
-    body.id = body.id || slugId(opts.name);
+    body.id = body.id || idFromName(opts.name);
     seedCharter(body.id, opts.charterFile);
   }
   if (opts.actor) body.actor = opts.actor;
@@ -829,7 +851,7 @@ async function cmdLtPatch() {
   const id = positional[0];
   if (!id) die(LT_PATCH_USAGE);
   const body = {};
-  if (opts.avatar !== null) body.avatar = opts.avatar === 'none' ? null : parseAvatarOpt(opts.avatar);
+  if (opts.avatar !== null) body.avatar = avatarArg(opts.avatar);
   if (opts.color) body.color = opts.color;
   if (opts.prefix) body.prefix = opts.prefix;
   if (opts.model !== null) body.model = opts.model === 'none' ? null : opts.model;
@@ -875,7 +897,7 @@ async function cmdLtList() {
     // The harness is a property of the SESSION, so a lieutenant with none shows
     // '-' rather than a default it is not actually running on.
     const run = (l.ref ? l.ref.harness : '-') + (l.model ? ':' + l.model : '');
-    console.log(l.id + '\t' + l.name + '\t' + l.color + '\t' + l.prefix + '-' + ((l.cardSeq || 0) + 1)
+    console.log(l.id + '\t' + l.name + '\t' + l.color + '\t' + (l.next || '-')
       + '\t' + run + (charter ? '\t' + charter : ''));
   }
 }
@@ -988,14 +1010,13 @@ async function cmdCreate() {
   }
   if (opts.id) {
     // The owner mints the id — refuse locally, before any create, and name the
-    // id it would have minted (the same prefix+cardSeq compute cmdLtList does).
-    // The lookup is a courtesy: the refusal is local policy and stands whether
-    // or not a server is there to answer.
+    // id the server says it would mint. The lookup is a courtesy: the refusal
+    // is local policy and stands whether or not a server is there to answer.
     let minted = null;
     try {
       const lr = await request('GET', '/api/lieutenants');
       const lt = (lr.lieutenants || []).find((l) => l.id === opts.owner);
-      if (lt) minted = lt.prefix + '-' + ((Number.isInteger(lt.cardSeq) ? lt.cardSeq : 0) + 1);
+      minted = lt ? lt.next : null;
     } catch (e) { minted = null; }
     die('card create refused: the owner mints the id, --id is not accepted.' +
       (minted ? ' ' + opts.owner + ' would mint ' + minted + ' next.' : ''));
@@ -1010,15 +1031,11 @@ async function cmdCreate() {
   if (opts.bodyFile) body.body = readInput(opts.bodyFile);
   // A duplicate id is refused, never resolved: print the server's sentence as
   // its own line so the human reads what to do instead of an HTTP envelope.
-  // The server offers two remedies because an API caller has both; here the id
-  // is always the mint, so drop the door this command no longer has and leave
-  // the one a CLI caller can walk through.
   let r;
   try { r = await request('POST', '/api/cards', body); }
   catch (e) {
     if (!(e.status === 409 && e.body && e.body.error)) die(e.message);
-    die('card create refused: ' +
-      e.body.error.replace(/\s*Create it with an explicit free id, or give /, ' Give '));
+    die('card create refused: ' + e.body.error);
   }
   console.log('created ' + r.card.id + ' in ' + r.card.column);
 }
@@ -1629,109 +1646,23 @@ async function cmdDrain() {
   // until then every drain re-offers the same items (dedupe by seq). An
   // identified drain does advance the separate drained cursor — the captain's
   // board flips the message from queued/unseen to seen/responding.
-  // Default output is agent-ergonomic (card context + next-action hint per
-  // item); --json prints the raw QueueItems, one JSON line each.
+  // Each item arrives with its head and next-action hint (server/feedtext.js),
+  // so the default output only prints; --json prints the items, one JSON line each.
   const me = opts.lieutenant ? {} : currentTmuxCaller();
   const q = opts.lieutenant ? '?lieutenant=' + encodeURIComponent(opts.lieutenant)
     : (me.session ? '?' + new URLSearchParams(me) : '');
   const r = await request('GET', '/api/feed' + q);
   if (opts.json) { for (const it of r.items) console.log(JSON.stringify(it)); return; }
   if (!r.items.length) { console.log('queue empty — nothing pending.'); return; }
-  let cards = [];
-  try { cards = (await request('GET', '/api/board')).cards || []; } catch (e) { /* context is best-effort */ }
-  const cardBit = (id) => {
-    const c = cards.find((x) => x.id === id);
-    return 'card ' + id + (c ? ' "' + c.title + '" [' + c.column + ']' : ' (not on the board — archived?)');
-  };
   const indent = (t) => '    ' + String(t).replace(/\n/g, '\n    ');
   console.log(r.items.length + ' pending item(s):\n');
   let max = 0;
   for (const it of r.items) {
     if (it.seq > max) max = it.seq;
-    let head = it.kind + (it.card ? ' — ' + cardBit(it.card) : '');
-    let hint = '';
-    const cm = /^card:(.+)$/.exec(it.target || '');
-    if (it.kind === 'message' && cm) {
-      head = 'captain message on ' + cardBit(cm[1]);
-      hint = 'reply on the thread: bc-axi say ' + it.target + ' --text-file <f|->';
-    } else if (it.kind === 'message' && it.via === 'line') {
-      // The channel is in the ENVELOPE — his text above is untouched, so a
-      // reply read back to him never contains our plumbing.
-      head = 'captain message (over the line)';
-      hint = 'he is listening with the SCREEN OFF — this will be heard, not read: answer in a couple of '
-        + 'spoken sentences, no links or diffs unless he asked. Reply: bc-axi say '
-        + (it.target || 'lieutenant:' + it.lieutenant) + ' --text-file <f|->';
-    } else if (it.kind === 'message') {
-      head = 'captain message (your main chat)';
-      hint = 'reply: bc-axi say ' + (it.target || 'lieutenant:' + it.lieutenant) + ' --text-file <f|->';
-    } else if (it.kind === 'peer-message') {
-      head = 'message from ' + (it.author || 'a fellow lieutenant') + ' (your main chat)';
-      hint = 'a colleague wrote in your chat — act on it; reply in THEIR chat: bc-axi say lieutenant:<their-id> --text-file <f|->';
-    } else if (it.kind === 'line-passed') {
-      head = 'YOU ARE ON THE LINE — passed by ' + (it.from || 'user');
-      hint = 'greet him in ONE spoken line before anything else (bc-axi say lieutenant:' + it.lieutenant
-        + ' --text-file -) — the screen is off and the voice changing is how he knows the handoff took; '
-        + 'then do what the note asks';
-    } else if (it.kind === 'start-order') {
-      head = 'START ORDER — ' + cardBit(it.card);
-      hint = 'the captain ordered this card started: read it (bc-axi card show ' + it.card + '), brief the worker, then: bc-axi card start ' + it.card + ' [--brief-file <f>]';
-    } else if (it.kind === 'rework-order') {
-      head = 'REWORK ORDER — ' + cardBit(it.card);
-      hint = 'the captain sent this back: the handoff that put it in review ended that worker, so rework is a FRESH one with an updated brief (bc-axi card start ' + it.card + ' --brief-file <f>) — only a keep_worktree playbook still has a live session to steer; when reworked, rewrite the body and hand off: bc-axi card move ' + it.card + ' review';
-    } else if (it.kind === 'worker-signal') {
-      head = 'worker milestone — ' + cardBit(it.card);
-      hint = 'note it; act only if it changes your plan';
-    } else if (it.kind === 'worker-said') {
-      head = 'worker said — ' + cardBit(it.card);
-      hint = 'read the thread (bc-axi thread card:' + it.card + ') and act; steer the worker: bc-axi worker send ' + it.card + ' --text-file <f|->';
-    } else if (it.kind === 'worker-done') {
-      head = 'WORKER DONE — ' + cardBit(it.card);
-      hint = 'verify the work in its worktree (read the diff/branch, not just the outcome text) and ask the worker whatever you still want to ask (bc-axi worker send ' + it.card + ' --text-file <f|->) — the handoff KILLS that session and releases the worktree, so do both first; rewrite the card body to current state (bc-axi card patch ' + it.card + ' --body-file <f|->), then hand off: bc-axi card move ' + it.card + ' review';
-    } else if (it.kind === 'worker-stopped') {
-      const c = cards.find((x) => x.id === it.card);
-      const sess = (c && c.attributes && c.attributes.session) || '<session>';
-      head = 'WORKER STOPPED — ' + cardBit(it.card);
-      hint = 'worker stopped without reporting — peek its session (tmux attach -t ' + sess + ') or steer it, then act';
-    } else if (it.kind === 'worker-stalled') {
-      const c = cards.find((x) => x.id === it.card);
-      const sess = (c && c.attributes && c.attributes.session) || '<session>';
-      head = 'WORKER STALLED — ' + cardBit(it.card);
-      hint = 'worker alive but silent — it may be hung: peek its session (tmux attach -t ' + sess + '), steer it (bc-axi worker send ' + it.card + ' --text-file <f|->), or pause and resume later (bc-axi worker pause ' + it.card + ' [--park]); then narrate what you found on the card timeline (bc-axi event ' + it.card + ' --level 2 --text-file -) — a legit long wait is fine, a SILENT one is not';
-    } else if (it.kind === 'worker-died') {
-      head = 'WORKER DIED — ' + cardBit(it.card);
-      hint = 'the worker session died without done: resume it (bc-axi card start ' + it.card + ' --resume) or park the card back to backlog (bc-axi card park ' + it.card + ')';
-    } else if (it.kind === 'pr-merged') {
-      head = 'PR MERGED — ' + cardBit(it.card);
-      hint = 'the server archived the card and released the worktree; nothing to do beyond noting it';
-    } else if (it.kind === 'pr-closed') {
-      head = 'PR CLOSED (unmerged) — ' + cardBit(it.card);
-      hint = 'decide: rework and reopen, or archive the card (killed)';
-    } else if (it.kind === 'card-created') {
-      head = 'new card for you — ' + cardBit(it.card);
-      hint = 'read it: bc-axi card show ' + it.card;
-    } else if (it.kind === 'schedule-failed') {
-      head = 'SCHEDULE ' + (it.schedule || '?') + ' — a firing failed';
-      hint = 'the board\'s clock ran a hook for you and it did not come back clean: read the output above, '
-        + 'then look at the schedule (bc-axi schedule show ' + (it.schedule || '<name>') + ') and the hook it fires. '
-        + 'Fix the hook, or pause the schedule (bc-axi schedule pause ' + (it.schedule || '<name>') + ') so it stops '
-        + 'waking you while you do';
-    } else if (it.kind === 'schedule') {
-      head = 'SCHEDULE ' + (it.schedule || '?') + ' — healthy again';
-      hint = 'whatever stopped this schedule is gone and the clock is firing it again; '
-        + 'nothing to do beyond noting it (bc-axi schedule show ' + (it.schedule || '<name>') + ')';
-    } else if (it.kind === 'card-event') {
-      head = 'CARD EVENT' + (it.eventKind ? ' [' + it.eventKind + ']' : '') + ' — ' + cardBit(it.card);
-      hint = 'an outside process (a workflow, a cron, a CI hook) put this on the timeline and woke you: read the text and act';
-    } else if (it.kind === 'card-moved') {
-      head = 'captain moved ' + cardBit(it.card) + ': ' + it.from + ' -> ' + it.to;
-    }
-    // Who woke you, when the caller said. Rides on the envelope, so the text
-    // above stays exactly what they wrote.
-    if (it.source) head += '  (from ' + it.source + ')';
-    console.log('#' + it.seq + '  ' + head);
+    console.log('#' + it.seq + '  ' + (it.head || it.kind));
     if (it.text) console.log(indent(it.text));
     for (const line of attachmentLines(it.attachments)) console.log(indent(line));
-    if (hint) console.log('    -> ' + hint);
+    if (it.hint) console.log('    -> ' + it.hint);
     console.log('');
   }
   console.log('handle EVERY item above, then commit: bc-axi ack ' + max + '   (only ack after handling; unacked items re-offer)');
@@ -1793,12 +1724,7 @@ async function cmdConfig() {
   if (sub === 'voices') {
     if (positional.length < 2) die('usage: bc-axi config voices "<name,name,...>"  ("" clears the filter)');
     const names = positional.slice(1).join(' ').split(',').map((s) => s.trim()).filter(Boolean);
-    let cfg = {};
-    try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (e) {}
-    if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) cfg = {};
-    if (names.length) cfg.voices = names; else delete cfg.voices;
-    fs.mkdirSync(STATE_DIR, { recursive: true });
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2) + '\n');
+    writeConfigKeys({ voices: names.length ? names : undefined });
     console.log(names.length ? 'voices=' + names.join(',') : 'voices cleared');
     return;
   }
@@ -1835,10 +1761,11 @@ if (!commands[cmd]) {
     'Workspace: nearest .bridge-commander/ from cwd upward, or --workspace DIR. Port: workspace config.json (default 4780), or --port N.\n' +
     'Bind host: config.json "host" (default 127.0.0.1 loopback), or --host H on init/open. Never 0.0.0.0 — there is no app auth.\n' +
     '\nserver & workspace:\n' +
-    '  init --name N [--id id] [--charter-file f|-] [--port N] [--host H]\n' +
+    '  init --name N [--id id] [--charter-file f|-] [--harness claude|codex] [--port N] [--host H]\n' +
     '                                         workspace.init (the teleport): run INSIDE tmux; bootstraps\n' +
     '                                         .bridge-commander/, boots the server, registers the caller\'s tmux\n' +
-    '                                         session as the founding lieutenant, installs the turn-end hook,\n' +
+    '                                         session as the founding lieutenant (on the harness its\n' +
+    '                                         environment names; --harness overrides), installs the turn-end hook,\n' +
     '                                         scaffolds AGENTS.md + captain.md + learnings/, seeds the\n' +
     '                                         playbooks and symlinks the worker-duties skill. Idempotent\n' +
     '  init --onboard [--here] [--allow-root] [--port N] [--host H]\n' +
@@ -2059,5 +1986,6 @@ if (!commands[cmd]) {
   // here. A down server, an unknown commit, or a match all print nothing extra.
   driftNote().then((n) => die(usage + (n ? '\n\n⚠ ' + n : '')), () => die(usage));
 } else {
-  commands[cmd]().catch((e) => die(e.message));
+  // A refusal prints the server's own sentence, not the raw JSON envelope.
+  commands[cmd]().catch((e) => die(e.body && e.body.error ? e.body.error + ' (HTTP ' + e.status + ')' : e.message));
 }

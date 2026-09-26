@@ -206,3 +206,41 @@ test('session-scoped drain and ack isolate each lieutenant to its own queue', as
     await s.stop();
   }
 });
+
+// The words a drain prints are the server's (feedtext.js): each served item
+// carries its head and next-action hint, rendered against the card as it
+// stands at drain time — never written into the queue itself.
+test('drained items carry head and hint, rendered against the live card', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    const id = (await s.api('POST', '/api/cards', { title: 'Wire it', owner: LT })).body.card.id;
+    await s.api('POST', '/api/feedback', { target: 'card:' + id, text: 'how is it going?' });
+    await s.api('POST', '/api/feedback', { target: 'lieutenant:' + LT, text: 'hello' });
+
+    let items = (await s.api('GET', '/api/feed?lieutenant=' + LT)).body.items;
+    assert.strictEqual(items[0].head, 'captain message on card ' + id + ' "Wire it" [backlog]');
+    assert.strictEqual(items[0].hint, 'reply on the thread: bc-axi say card:' + id + ' --text-file <f|->');
+    assert.strictEqual(items[1].head, 'captain message (your main chat)');
+    assert.match(items[1].hint, /bc-axi say lieutenant:ada/);
+
+    // the unidentified peek gets the same words
+    items = (await s.api('GET', '/api/feed')).body.items;
+    assert.strictEqual(items[0].head, 'captain message on card ' + id + ' "Wire it" [backlog]');
+
+    // rendered at drain time: a renamed card reads renamed, and the queue on
+    // disk holds only what was delivered
+    await s.api('PATCH', '/api/cards/' + id, { title: 'Wire it twice' });
+    items = (await s.api('GET', '/api/feed?lieutenant=' + LT)).body.items;
+    assert.match(items[0].head, /"Wire it twice"/);
+    const onDisk = fs.readFileSync(path.join(queueDir(s), LT + '.jsonl'), 'utf8')
+      .split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    assert.ok(onDisk.every((it) => !('head' in it) && !('hint' in it)), 'nothing presentational is stored');
+
+    // a card that left the board says so
+    await s.api('POST', '/api/cards/' + id + '/archive', { actor: 'user' });
+    items = (await s.api('GET', '/api/feed?lieutenant=' + LT)).body.items;
+    assert.strictEqual(items[0].head, 'captain message on card ' + id + ' (not on the board — archived?)');
+  } finally {
+    await s.stop();
+  }
+});

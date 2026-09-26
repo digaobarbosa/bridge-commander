@@ -90,6 +90,7 @@ const { createConversation, parseTarget, CAPTAIN } = require(path.join(__dirname
 const { permissionMode, summarize, createPermissions } = require(path.join(__dirname, 'permissions.js'));
 const { readJsonl, sealJsonl } = require(path.join(__dirname, 'jsonl.js'));
 const { createDelivery } = require(path.join(__dirname, 'delivery.js'));
+const feedtext = require(path.join(__dirname, 'feedtext.js'));
 const { execFile, execFileSync } = require('child_process');
 
 // ---------- args ----------
@@ -525,6 +526,7 @@ function validColor(c) { return typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.tes
 // 8x8, row-major). Absent = colored-dot fallback everywhere (every existing
 // lieutenant has no avatar).
 function validAvatar(a) { return Number.isInteger(a) && a >= 0 && a <= 63; }
+const BAD_AVATAR = 'avatar must be an integer 0-63';
 // lieutenant voice: an opaque TTS-engine voice id, whatever the engine calls its
 // own. Absent = the board's voice speaks for this lieutenant (the default).
 function validVoice(v) { return typeof v === 'string' && v.trim() ? v.trim().slice(0, 200) : null; }
@@ -598,6 +600,9 @@ function uniquePrefixIn(lts, base, exceptId) {
     if (!taken(cand)) return cand;
   }
 }
+// The id this lieutenant mints next — what createCard will pick, said ahead of
+// it so no client has to repeat the arithmetic.
+function nextCardId(l) { return l.prefix + '-' + ((Number.isInteger(l.cardSeq) ? l.cardSeq : 0) + 1); }
 const BAD_PREFIX = 'bad prefix (1-8 letters/digits starting with a letter — it heads every card id this lieutenant mints)';
 const BAD_MODEL = 'bad model (one token, no spaces or control characters, max 100 chars — '
   + 'it is handed straight to the harness CLI as --model; null clears it back to the harness default)';
@@ -671,7 +676,7 @@ function createLieutenant(body) {
   if (!isId(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])' };
   if (findLieutenant(id)) return { error: 'lieutenant exists: ' + id, code: 409 };
   if (body.avatar !== undefined && body.avatar !== null && !validAvatar(body.avatar)) {
-    return { error: 'avatar must be an integer 0-63' };
+    return { error: BAD_AVATAR };
   }
   let prefix;
   if (body.prefix === undefined || body.prefix === null || body.prefix === '') {
@@ -816,6 +821,11 @@ async function spawnLieutenant(body) {
   try { impl = getHarness(harnessName); } catch (e) { return { error: String(e.message || e) }; }
   if (body.model !== undefined && body.model !== null && body.model !== '' && !validModel(body.model)) {
     return { error: BAD_MODEL };
+  }
+  // Checked before the spawn, not after it in createLieutenant: a refusal
+  // there would leave a live session behind with no lieutenant to own it.
+  if (body.avatar !== undefined && body.avatar !== null && !validAvatar(body.avatar)) {
+    return { error: BAD_AVATAR };
   }
   // A revived lieutenant keeps the model it was pinned to unless this call
   // names another; a new one is born on whatever it was given.
@@ -1653,17 +1663,12 @@ function columnTitle(id) {
   const c = board.columns.find((k) => k.id === id);
   return c ? c.title : id;
 }
-// ASCII slug: emoji, ZWJ sequences, and any other non-ASCII are stripped, so
-// derived ids (and the session names built from them) never reach tmux.
-function slugBase(s) {
-  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
-}
-// Lieutenant id from a display name. A name with no ASCII at all (pure emoji)
-// falls back to 'lt', made unique so a second such lieutenant can still be
-// born; a real slug collision stays a 409 in createLieutenant (same-name
-// duplicates are a caller mistake, not a naming gap).
+// Lieutenant id from a display name (layout.slugBase). A name with no ASCII at
+// all (pure emoji) falls back to 'lt', made unique so a second such lieutenant
+// can still be born; a real slug collision stays a 409 in createLieutenant
+// (same-name duplicates are a caller mistake, not a naming gap).
 function lieutenantIdFrom(name) {
-  const base = slugBase(name);
+  const base = names.slugBase(name);
   if (base) return base;
   if (!findLieutenant('lt')) return 'lt';
   for (let i = 2; ; i++) if (!findLieutenant('lt-' + i)) return 'lt-' + i;
@@ -1745,11 +1750,12 @@ function createCard(body, actorDefault) {
   // no silently picking the next free number. It can happen when a prefix outlives
   // the lieutenant that used it (retire, recreate, counter back at 1) — rare, and
   // the captain settles it with the lieutenant. What must never happen is a
-  // collision created SILENTLY.
+  // collision created SILENTLY. The fix named is the prefix: every caller has it
+  // (the CLI takes no --id), and it is the one that unwedges the mint for good.
   if (findCard(id)) {
     return { error: minted
       ? 'card exists: ' + id + ' — ' + lt.name + ' would mint that id next (counter at ' + (minted - 1)
-        + '). Create it with an explicit free id, or give ' + lt.name + ' an unused prefix in its settings.'
+        + '). Give ' + lt.name + ' an unused prefix in its settings.'
       : 'card exists: ' + id, code: 409 };
   }
   const column = body.column ? String(body.column) : 'backlog';
@@ -2865,19 +2871,21 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ----- lieutenants -----
+    // Every listing carries `next`, the card id this lieutenant would mint.
     // `live=1` adds what the config screen's lieutenants tab shows and the board
-    // payload cannot: the next card id this lieutenant would mint, how many live
-    // cards it owns, where its charter file is, and — the one fact a board tile
-    // never tells you — whether its session is actually up. The probe shells out
-    // to the harness once per lieutenant, so it is gated the way /api/projects
-    // gates its git reads: the tab asks, nobody else pays.
+    // payload cannot: how many live cards it owns, where its charter file is,
+    // and — the one fact a board tile never tells you — whether its session is
+    // actually up. The probe shells out to the harness once per lieutenant, so
+    // it is gated the way /api/projects gates its git reads: the tab asks,
+    // nobody else pays.
     if (route === 'GET /api/lieutenants') {
       if (!/^(1|true)$/.test(url.searchParams.get('live') || '')) {
-        return sendJson(res, 200, { lieutenants: board.lieutenants.map(withStatusAge) });
+        return sendJson(res, 200, { lieutenants: board.lieutenants.map((l) =>
+          Object.assign({}, withStatusAge(l), { next: nextCardId(l) })) });
       }
       const lieutenants = await Promise.all(board.lieutenants.map(async (l) => Object.assign({}, withStatusAge(l), {
         cards: board.cards.filter((c) => c.owner === l.id).length,
-        next: l.prefix + '-' + ((l.cardSeq || 0) + 1),
+        next: nextCardId(l),
         memory: charterPath(WORKSPACE, l.id),
         session: await sessionState(l),
       })));
@@ -3584,7 +3592,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ----- feed.drain: pending QueueItems past the committed ack cursor -----
+    // Each item goes out with its `head` and `hint` (feedtext.js), rendered
+    // against the card as it stands now; the stored item is never touched.
     if (route === 'GET /api/feed') {
+      const served = (items) => items.map((it) => Object.assign({}, it, feedtext.describe(it, findCard)));
       let lt = url.searchParams.get('lieutenant') || '';
       const sess = url.searchParams.get('session') || '';
       // Session-scoped drain: a lieutenant identifies itself by its tmux session
@@ -3601,11 +3612,11 @@ const server = http.createServer(async (req, res) => {
       }
       // No identity at all (raw tooling): a read-only peek at every queue. It is
       // not a lieutenant starting its turn, so no wake flag or cursor moves.
-      if (!lt) return sendJson(res, 200, { items: delivery.pending(), head: delivery.head() });
+      if (!lt) return sendJson(res, 200, { items: served(delivery.pending()), head: delivery.head() });
       // Draining is SEEING: the drained cursor moves, the UI flips queued→seen.
       const r = delivery.drain(lt);
       if (r.seen) broadcast();
-      return sendJson(res, 200, { items: r.items, head: delivery.head() });
+      return sendJson(res, 200, { items: served(r.items), head: delivery.head() });
     }
 
     // ----- feed.ack: commit the cursor AFTER the items were handled -----
