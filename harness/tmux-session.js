@@ -1,14 +1,11 @@
 'use strict';
-// tmux-session — session/window/pane plumbing SHARED by the tmux-TUI harness
-// adapters (claude-tmux.js, codex-tmux.js). Everything here is harness-agnostic:
-// pane lifecycle, naming/validation, state-dir resolution, the launch-and-settle
-// skeleton (the adapter supplies its trust-prompt and UI-ready signatures), the
-// turn-end file tail, and the optional pane-viewing verbs. An adapter differs
-// only in its launch line, screen signatures, resume semantics, and turn-end
-// relay wiring.
+// tmux-session — session/window/pane plumbing under tmux-adapter.js. Every
+// piece here is harness-agnostic: pane lifecycle, naming/validation, state-dir
+// resolution, the launch-and-settle loop (the profile supplies its screen
+// signatures), the turn-end file tail, and the pane-viewing verbs.
 //
-// Extracted verbatim from claude-tmux.js (the reference implementation) — the
-// comments below carry that provenance where behavior was learned the hard way.
+// Learned on claude-tmux.js first — the comments below carry that provenance
+// where behavior was learned the hard way.
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -110,6 +107,19 @@ function stateKey(session, window) {
 // `send-keys -t =name` fails with "can't find pane"); the trailing colon
 // (`=name:`) resolves for both. Window-granular: `=session:=window`, exact on
 // both halves, so tmux never pattern-matches or reads the window as an index.
+/**
+ * readSessionId(stateDir, key) -> string | null — the resume id the turn-end
+ * relay recorded for this agent (refreshed every turn, so it beats the ref's).
+ */
+function readSessionId(stateDir, key) {
+  if (!stateDir) return null;
+  try {
+    return fs.readFileSync(path.join(stateDir, `${key}.session-id`), 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 function paneTarget(session, window) {
   return window ? `=${session}:=${window}` : `=${session}:`;
 }
@@ -527,6 +537,7 @@ module.exports = {
   shellQuote,
   newSessionName,
   stateKey,
+  readSessionId,
   paneTarget,
   paneCommand,
   hasSession,

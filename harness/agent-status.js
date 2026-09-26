@@ -329,6 +329,30 @@ const SLASH_COMMANDS = [
   { name: '/help', description: 'list the available commands' },
 ];
 
+/**
+ * runSlashCommand(ref, command, opts, h) -> reply text — the slash-command
+ * dispatch every harness shares. h: { key, commands, status, send, handlers,
+ * passthrough, noStatusHint }. /help renders commands(ref), /status formats
+ * status(), a handler emulates a command, a pass-through name types the
+ * LITERAL line into the session; anything else throws before doing anything.
+ */
+async function runSlashCommand(ref, command, opts, h) {
+  const line = String(command || '').trim();
+  const name = line.split(/\s+/)[0];
+  if (name === '/help') return helpText(h.commands(ref));
+  if (name === '/status') {
+    const st = await h.status(ref, opts);
+    if (!st) throw new Error('no status for ' + h.key + ' — ' + (h.noStatusHint || 'nothing readable yet'));
+    return formatStatus(st);
+  }
+  if (Object.prototype.hasOwnProperty.call(h.handlers || {}, name)) return h.handlers[name](ref, line, opts);
+  if ((h.passthrough || []).includes(name)) {
+    await h.send(ref, line); // verified submit; the harness's own command runs in-session
+    return '"' + line + '" submitted to ' + h.key + ' — the session runs it in-place';
+  }
+  throw new Error('unknown command ' + name + ' (see /help)');
+}
+
 // Replies render as markdown in the chat thread, where a single newline
 // collapses — blank-line separators keep each line its own paragraph.
 function helpText(cmds) {
@@ -384,4 +408,5 @@ module.exports = {
   SLASH_COMMANDS,
   helpText,
   formatStatus,
+  runSlashCommand,
 };
