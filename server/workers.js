@@ -489,7 +489,7 @@ function createWorkers(deps) {
    * card.start — ONE atomic op: worktree + spawn + bind + card → Working.
    * body.resume reincarnates the recorded worker instead. A second start of
    * the SAME card while one is in flight is refused; other cards interleave.
-   * @returns {Promise<{worker: object, resumed?: true}|{error: string, code?: number}>}
+   * @returns {Promise<{worker: object, resumed?: true}|{error: string, code: number}>}
    */
   async function start(card, body) {
     if (starting.has(card.id)) return { error: 'card start already in progress: ' + card.id, code: 409 };
@@ -502,7 +502,7 @@ function createWorkers(deps) {
   }
 
   async function doStart(card, body) {
-    if (card.type === 'plan') return { error: 'plan cards never start (no worker is spawned for a plan)' };
+    if (card.type === 'plan') return { error: 'plan cards never start (no worker is spawned for a plan)', code: 400 };
     // The second way a card could start is gone, not merely unsupported.
     if (body.command !== undefined) {
       return { error: '--command was removed: a card starts one way, from its playbook. '
@@ -516,9 +516,9 @@ function createWorkers(deps) {
       return { error: 'card already has a worker (' + refKey(existing.ref) + ') — resume it (card start --resume) or archive first', code: 409 };
     }
     const repoAttr = card.attributes && card.attributes.repo;
-    if (!repoAttr) return { error: 'card has no repo attribute — set it first: card patch ' + card.id + ' --attr repo=<project>' };
+    if (!repoAttr) return { error: 'card has no repo attribute — set it first: card patch ' + card.id + ' --attr repo=<project>', code: 400 };
     const project = deps.findProject(String(repoAttr));
-    if (!project) return { error: 'unregistered project: ' + repoAttr + ' (register it: bc-axi project add <url|path>)' };
+    if (!project) return { error: 'unregistered project: ' + repoAttr + ' (register it: bc-axi project add <url|path>)', code: 400 };
     const plan = deps.planStart(card, body, project);
     if (plan.error) return plan;
 
@@ -630,12 +630,12 @@ function createWorkers(deps) {
     if (body.brief) {
       return { error: 'resume does not deliver briefs — the reincarnated worker keeps its own context '
         + 'and the brief would be silently dropped. To hand a live worker new instructions: '
-        + 'bc-axi worker send ' + card.id + ' --text-file <f|->' };
+        + 'bc-axi worker send ' + card.id + ' --text-file <f|->', code: 400 };
     }
     if (!existing) {
       return { error: 'nothing to resume: card ' + card.id + ' has no recorded worker — a handoff '
         + 'ends the worker it hands off, so rework after one is a fresh start (card start ' + card.id
-        + '), and a card that never started has nothing to reincarnate either' };
+        + '), and a card that never started has nothing to reincarnate either', code: 400 };
     }
     // --expect-exit: the first run still holds the path; a resume would be a second run.
     if (existing.expectExit) {
@@ -673,7 +673,7 @@ function createWorkers(deps) {
   /** worker.signal — a milestone: resets the stall clock, level-2 event + owner item. */
   function signal(card, body) {
     const text = String((body && body.text) || '').trim();
-    if (!text) return { error: 'text required' };
+    if (!text) return { error: 'text required', code: 400 };
     transition(find(card.id), 'signal', { lastSignalAt: iso(), lastSignalText: text.slice(0, 300) });
     const ev = note(card, { text: text.slice(0, 2000), actor: (body && body.actor) || 'worker' }, { kind: 'signal' });
     deps.queuePush(card.owner, { kind: 'worker-signal', card: card.id, text: text.slice(0, 2000) });
@@ -686,7 +686,7 @@ function createWorkers(deps) {
    */
   function done(card, body) {
     const outcome = String((body && body.outcome) || '').trim();
-    if (!outcome) return { error: 'outcome required' };
+    if (!outcome) return { error: 'outcome required', code: 400 };
     transition(find(card.id), 'done', { done: true, outcome: outcome.slice(0, 2000) });
     const urls = outcome.match(PR_URL_RE) || [];
     if (urls.length) {
@@ -714,7 +714,7 @@ function createWorkers(deps) {
    */
   async function send(card, body) {
     const text = String((body && body.text) || '').trim();
-    if (!text) return { error: 'text required' };
+    if (!text) return { error: 'text required', code: 400 };
     const w = find(card.id);
     if (!w) {
       return { error: 'no worker bound to card ' + card.id + ' — start one first (card start ' + card.id + ')', code: 404 };

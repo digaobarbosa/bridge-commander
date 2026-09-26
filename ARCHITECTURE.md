@@ -31,6 +31,12 @@ them drift.
   items still unacked. Only ack removes; a dead session loses nothing; a server restart is a
   non-event. `server/delivery.js` owns all of it — queues, cursors, wakes, the owed projection —
   reading the queue files once at boot; the server is their only writer.
+- **One door for board changes**: `server/store.js` holds the board in memory and is the only
+  writer of `board.json` (temp file + rename). A change goes through `store.mutate(fn)`: the
+  domain function validates before it touches the board, a refusal (`{error, code}`) writes
+  nothing, anything else is saved once. The SSE board push is coalesced, so every change in one
+  tick costs one rebuild of the served board. The router maps every domain result the same way:
+  `{error, code}` answers `code`, anything else a 200.
 - **The harness port** is the only seam to agent sessions — seven verbs (`spawn`, `send`,
   `alive`, `resumable`, `resume`, `kill`, `onTurnEnd`); see [harness/README.md](harness/README.md).
   Builtins: `claude` and `codex` over tmux, plus an in-memory `fake` for tests.

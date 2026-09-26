@@ -90,6 +90,7 @@ const { createConversation, parseTarget, CAPTAIN } = require(path.join(__dirname
 const { permissionMode, summarize, createPermissions } = require(path.join(__dirname, 'permissions.js'));
 const { readJsonl, sealJsonl } = require(path.join(__dirname, 'jsonl.js'));
 const { createDelivery } = require(path.join(__dirname, 'delivery.js'));
+const { createStore } = require(path.join(__dirname, 'store.js'));
 const { execFile, execFileSync } = require('child_process');
 
 // ---------- args ----------
@@ -381,30 +382,30 @@ function normalizeBoard(doc) {
   b.seq = max;
   return b;
 }
-function loadBoard() {
-  try { return normalizeBoard(JSON.parse(fs.readFileSync(BOARD_FILE, 'utf8'))); }
-  catch (e) { return defaultBoard(); }
-}
-let board = loadBoard();
 // What lands on disk: the board MINUS every lieutenant's chat. The main chat is
 // an append-only log of its own (chat/<id>.jsonl, below) — keeping a second copy
 // here is the drift bug, and it is what made every write rewrite megabytes of
 // conversation nobody scrolls to.
-function storedBoard() {
-  return Object.assign({}, board, {
-    lieutenants: board.lieutenants.map((l) => {
+function storedBoard(b) {
+  return Object.assign({}, b, {
+    lieutenants: b.lieutenants.map((l) => {
       const copy = Object.assign({}, l);
       delete copy.chat;
       return copy;
     }),
   });
 }
-function saveBoard() {
-  board.updated = now();
-  const tmp = BOARD_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(storedBoard(), null, 2));
-  fs.renameSync(tmp, BOARD_FILE);
-}
+// The board lives in the store (server/store.js): it is the only writer of
+// board.json, mints every event, and coalesces the SSE push. `board` is the
+// live object for the rest of this file; a change goes through store.mutate
+// (a domain result) or store.commit (a change already made).
+const store = createStore({
+  file: BOARD_FILE, normalize: normalizeBoard, fresh: defaultBoard, serialize: storedBoard,
+  kinds: () => effectiveKinds(), now,
+  publish: () => sseSend('board', publicBoard('user')),
+  log: (m) => console.error(now() + ' ' + m),
+});
+const board = store.load();
 
 // One-time migration, at boot: the charter used to be a board field. Move what
 // is still there into the lieutenant's memory file and drop the key. The write
@@ -428,7 +429,7 @@ function saveBoard() {
     delete lt.charter;
     moved = true;
   }
-  if (moved) saveBoard();
+  if (moved) store.save();
 })();
 
 // ---------- events / kinds ----------
@@ -499,23 +500,8 @@ function sanitizeKinds(doc) {
   return out;
 }
 function effectiveKinds() { return Object.assign({}, BUILTIN_KINDS, board.kinds); }
-// Level resolution: explicit level wins; else the kind's level from the
-// effective map (registered over built-ins); else the caller's default; else 2.
-function mkEvent(body, defaults) {
-  const kindRaw = body.kind == null ? '' : String(body.kind).trim();
-  const kind = kindRaw ? kindRaw.slice(0, 60) : (defaults.kind || null);
-  const known = kind ? effectiveKinds()[kind] : null;
-  const level = body.level === 2 ? 2 : body.level === 1 ? 1
-    : known ? known.level
-    : (defaults.level === 1 || defaults.level === 2 ? defaults.level : 2);
-  const ev = {
-    seq: ++board.seq, ts: now(), level,
-    text: String(body.text || '').slice(0, 2000),
-    actor: String(body.actor || defaults.actor || 'agent').slice(0, 60),
-  };
-  if (kind) ev.kind = kind;
-  return ev;
-}
+// Events are minted by the store (it owns board.seq); level resolution is there.
+const mkEvent = store.event;
 
 // ---------- label registry (user-owned; persisted in board json) ----------
 const LABEL_PALETTE = ['#4cc2ff', '#2fbf71', '#e2b93b', '#c678dd', '#e2795b', '#56b6c2', '#98c379', '#e06c75'];
@@ -665,19 +651,19 @@ function lineHolder() { return conversation.lineHolder(); }
 
 function createLieutenant(body) {
   const name = String(body.name || '').trim();
-  if (!name) return { error: 'name required' };
+  if (!name) return { error: 'name required', code: 400 };
   const id = body.id ? String(body.id) : lieutenantIdFrom(name);
-  if (!isId(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])' };
+  if (!isId(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])', code: 400 };
   if (findLieutenant(id)) return { error: 'lieutenant exists: ' + id, code: 409 };
   if (body.avatar !== undefined && body.avatar !== null && !validAvatar(body.avatar)) {
-    return { error: 'avatar must be an integer 0-63' };
+    return { error: 'avatar must be an integer 0-63', code: 400 };
   }
   let prefix;
   if (body.prefix === undefined || body.prefix === null || body.prefix === '') {
     prefix = uniquePrefixIn(board.lieutenants, prefixFrom(name), id);
   } else {
     prefix = validPrefix(body.prefix);
-    if (!prefix) return { error: BAD_PREFIX };
+    if (!prefix) return { error: BAD_PREFIX, code: 400 };
     const clash = prefixOwner(prefix, id);
     if (clash) return { error: prefixTakenMsg(prefix, clash), code: 409 };
   }
@@ -691,8 +677,7 @@ function createLieutenant(body) {
   if (validModel(body.model)) lt.model = validModel(body.model);
   if (isHarnessRef(body.ref)) lt.ref = body.ref; // the live-session address, persisted with the board
   board.lieutenants.push(lt);
-  const ev = mkEvent({ text: 'lieutenant ' + lt.name + ' joined the bridge', actor: body.actor || 'user', level: 2 }, {});
-  board.events.push(ev);
+  store.boardEvent({ text: 'lieutenant ' + lt.name + ' joined the bridge', actor: body.actor || 'user', level: 2 });
   return { lieutenant: lt };
 }
 
@@ -797,9 +782,9 @@ async function respawnFresh(lt, harness) {
 
 async function spawnLieutenant(body) {
   const name = String(body.name || '').trim();
-  if (!name) return { error: 'name required' };
+  if (!name) return { error: 'name required', code: 400 };
   const id = body.id ? String(body.id) : lieutenantIdFrom(name);
-  if (!isId(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])' };
+  if (!isId(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])', code: 400 };
   // revive:true is what makes `bc-axi init --onboard` re-runnable: the founding
   // lieutenant already exists, and the question is only whether her session is
   // still up. A live one is left strictly alone (spawning over a live session
@@ -812,9 +797,9 @@ async function spawnLieutenant(body) {
   }
   const harnessName = String(body.harness || readConfig().harness || 'claude');
   let impl;
-  try { impl = getHarness(harnessName); } catch (e) { return { error: String(e.message || e) }; }
+  try { impl = getHarness(harnessName); } catch (e) { return { error: String(e.message || e), code: 400 }; }
   if (body.model !== undefined && body.model !== null && body.model !== '' && !validModel(body.model)) {
-    return { error: BAD_MODEL };
+    return { error: BAD_MODEL, code: 400 };
   }
   // A revived lieutenant keeps the model it was pinned to unless this call
   // names another; a new one is born on whatever it was given.
@@ -867,10 +852,69 @@ async function retireLieutenant(id, body) {
   // rather than deleting it, and a same-slug successor inherits it knowingly.
   try { fs.unlinkSync(chatFile(id)); } catch (e) { /* none */ }
   const memory = fs.existsSync(charterPath(WORKSPACE, id)) ? charterPath(WORKSPACE, id) : null;
-  const ev = mkEvent({ text: 'lieutenant ' + lt.name + ' retired',
-    actor: (body && body.actor) || 'user', level: 1 }, {});
-  board.events.push(ev);
+  const ev = store.boardEvent({ text: 'lieutenant ' + lt.name + ' retired',
+    actor: (body && body.actor) || 'user', level: 1 });
   return { ok: true, event: ev, memory };
+}
+
+/**
+ * lieutenant.patch minus the harness switch: validates every field before any
+ * applies, so a refusal leaves no half-applied lieutenant behind. Names the
+ * harness to switch to (validated, not applied) for the caller to run last.
+ * @returns {{ok: true, harness: string}|{error: string, code: number}}
+ */
+function patchLieutenant(lt, body) {
+  // Prefix is the only field a peer can veto (two lieutenants may not share
+  // one). Past cards keep the id they were minted with — a prefix change is
+  // about what comes next.
+  let prefix;
+  if (body.prefix !== undefined) {
+    prefix = validPrefix(body.prefix);
+    if (!prefix) return { error: BAD_PREFIX, code: 400 };
+    const clash = prefixOwner(prefix, lt.id);
+    if (clash) return { error: prefixTakenMsg(prefix, clash), code: 409 };
+  }
+  if (body.ref !== undefined && body.ref !== null && !isHarnessRef(body.ref)) {
+    return { error: 'bad ref (want {harness, session, cwd, resumeId?} or null)', code: 400 };
+  }
+  if (body.avatar !== undefined && body.avatar !== null && !validAvatar(body.avatar)) {
+    return { error: 'avatar must be an integer 0-63 or null', code: 400 };
+  }
+  // null / "" clears the model back to the harness's own default.
+  const clearModel = body.model === null || body.model === '';
+  const model = body.model !== undefined && !clearModel ? validModel(body.model) : null;
+  if (body.model !== undefined && !clearModel && !model) return { error: BAD_MODEL, code: 400 };
+  const harness = body.harness !== undefined && body.harness !== null ? String(body.harness) : '';
+  if (harness) {
+    try { getHarness(harness); } catch (e) { return { error: String((e && e.message) || e), code: 400 }; }
+  }
+
+  if (prefix) lt.prefix = prefix;
+  if (body.ref !== undefined) {
+    // A re-run of `bc-axi init` re-sends the founder's session-granular ref
+    // (the caller's tmux session is all it can see). Keep the window this
+    // lieutenant was already pinned to — losing it would put the ref back
+    // to killing its whole session, worker windows included, on revive.
+    lt.ref = body.ref && !body.ref.window && lt.ref && lt.ref.window
+      && lt.ref.session === body.ref.session
+      ? { ...body.ref, window: lt.ref.window }
+      : body.ref;
+  }
+  if (body.name !== undefined && String(body.name).trim()) lt.name = String(body.name).trim().slice(0, 60);
+  if (body.color !== undefined && validColor(body.color)) lt.color = body.color;
+  if (body.avatar === null) delete lt.avatar;
+  else if (body.avatar !== undefined) lt.avatar = body.avatar;
+  // "" / null clears the pick — the lieutenant is back to the board's voice.
+  if (body.voice !== undefined) {
+    const v = validVoice(body.voice);
+    if (v) lt.voice = v; else delete lt.voice;
+  }
+  // The model is stored, not applied: it rides `--model` on the next spawn
+  // or resume this lieutenant gets. Set BEFORE the harness switch, so a
+  // captain who moves harness and model in one call lands on both.
+  if (clearModel) delete lt.model;
+  else if (model) lt.model = model;
+  return { ok: true, harness };
 }
 
 // ---------- delivery (server/delivery.js: queues, cursors, wakes, owed) ----------
@@ -907,7 +951,7 @@ function scheduleWake(lt) { delivery.nudge(lt); }
 // One jsonl per lieutenant, written exactly the way archive.jsonl and the
 // delivery queues are: one message per line, appended, never rewritten. A
 // message is durable the moment the line lands — a crash before the next
-// saveBoard() loses nothing, because the board stores no chat at all.
+// board save loses nothing, because the board stores no chat at all.
 // The server keeps the newest CHAT_TAIL per lieutenant in memory (lt.chat, read
 // from the file at boot) and that is what GET /api/board ships; everything
 // older is paged in over GET /api/chat. No index, no compaction: reading the
@@ -963,7 +1007,7 @@ function chatTail(ltId, n) { return chatPage(ltId, '', n); }
     lt.chat = chatTail(lt.id, CHAT_TAIL);
   }
   if (migrated) console.log('[bridge-commander] moved ' + migrated + ' lieutenant chat message(s) out of board.json');
-  if (carried) saveBoard(); // drops the key even when the file was already there
+  if (carried) store.save(); // drops the key even when the file was already there
 }
 
 // ---------- card status (the ONE work signal; derived on read) ----------
@@ -1049,19 +1093,19 @@ function publicBoard(user) {
 
 // status.set — the ONLY writer of card.status.worker.
 function setStatus(card, body) {
-  if (!body || !('worker' in body)) return { error: 'worker required: {id, state} (or null / state "absent" to clear)' };
+  if (!body || !('worker' in body)) return { error: 'worker required: {id, state} (or null / state "absent" to clear)', code: 400 };
   const w = body.worker;
   if (w === null || (w && typeof w === 'object' && w.state === 'absent')) {
     card.status = { worker: null };
   } else {
-    if (!w || typeof w !== 'object') return { error: 'worker must be {id, state} or null' };
-    if (!WORKER_STATES.includes(w.state)) return { error: 'bad worker.state (use ' + WORKER_STATES.join('|') + ')' };
+    if (!w || typeof w !== 'object') return { error: 'worker must be {id, state} or null', code: 400 };
+    if (!WORKER_STATES.includes(w.state)) return { error: 'bad worker.state (use ' + WORKER_STATES.join('|') + ')', code: 400 };
     const id = String(w.id || '').trim();
-    if (!id) return { error: 'worker.id required for state ' + w.state };
+    if (!id) return { error: 'worker.id required for state ' + w.state, code: 400 };
     let ttl = WORKER_TTL_SECS;
     if (body.ttl !== undefined) {
       ttl = Number(body.ttl);
-      if (!Number.isFinite(ttl) || ttl <= 0) return { error: 'bad ttl (seconds > 0)' };
+      if (!Number.isFinite(ttl) || ttl <= 0) return { error: 'bad ttl (seconds > 0)', code: 400 };
     }
     card.status = { worker: { id: id.slice(0, 120), state: w.state, expires: new Date(Date.now() + ttl * 1000).toISOString() } };
   }
@@ -1082,7 +1126,8 @@ function sseSend(event, data) {
   const payload = sseFrame(event, data);
   for (const res of sseClients) res.write(payload);
 }
-function broadcast() { sseSend('board', publicBoard('user')); }
+// Coalesced by the store: N calls in one tick push the board once.
+function broadcast() { store.broadcast(); }
 
 // ---------- permission approvals (see server/permissions.js) ----------
 // Claude Code gives the hook 3600s; answering null a little earlier lets the
@@ -1099,8 +1144,8 @@ function permissionChanged(item, outcome) {
   const w = permissionWorker(item);
   if (w) workers.transition(w, 'permission', { lastPermissionAt: now() });
   if (outcome === 'allow' || outcome === 'deny') return; // the decide route saves and broadcasts with its event
-  if (w) saveBoard();
-  broadcast();
+  if (w) store.commit();
+  else broadcast();
 }
 function permissionFields(body, lt, w) {
   const tool = String(body.tool_name || 'unknown').slice(0, 200);
@@ -1314,6 +1359,15 @@ function sendJson(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
   res.end(body);
 }
+/**
+ * respond(res, r, payload?) — the one mapping from a domain result to HTTP:
+ * `{error, code}` answers `code` (400 when a caller forgot one) with the error;
+ * anything else is a 200 carrying payload(r), or r itself.
+ */
+function respond(res, r, payload) {
+  if (r && r.error) return sendJson(res, r.code || 400, { error: r.error });
+  return sendJson(res, 200, payload ? payload(r) : r);
+}
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
@@ -1462,22 +1516,21 @@ function boardCommands(target) {  // MUTATION-TEST ME
 // read it. The agent cannot.
 async function resetLieutenant(id) {
   const lt = findLieutenant(id);
-  if (!lt) return { error: 'unknown lieutenant: ' + id };
-  if (!isHarnessRef(lt.ref)) return { error: 'lieutenant ' + id + ' has no session to reset' };
-  try { getHarness(lt.ref.harness); } catch (e) { return { error: String((e && e.message) || e) }; }
+  if (!lt) return { error: 'unknown lieutenant: ' + id, code: 404 };
+  if (!isHarnessRef(lt.ref)) return { error: 'lieutenant ' + id + ' has no session to reset', code: 409 };
+  try { getHarness(lt.ref.harness); } catch (e) { return { error: String((e && e.message) || e), code: 400 }; }
   try {
     lt.ref = await respawnFresh(lt);
   } catch (e) {
-    return { error: 'reset failed: ' + String((e && e.message) || e) };
+    return { error: 'reset failed: ' + String((e && e.message) || e), code: 502 };
   }
   respawnAttempts.delete(id);
   delivery.resetNudge(id); // the new session owes a drain — the queue is truth, its memory was a cache
-  board.events.push(mkEvent({
+  // Saved by the caller: /reset only runs inside the chat route's store.mutate.
+  store.boardEvent({
     text: 'lieutenant ' + lt.name + ' was reset by the captain — new session on the launch prompt',
     actor: 'user',
-  }, { kind: 'reset', level: 1 }));
-  saveBoard();
-  broadcast();
+  }, { kind: 'reset', level: 1 });
   if (pendingItems(id).length) scheduleWake(id);
   return { ok: true, session: lt.ref.session };
 }
@@ -1525,7 +1578,7 @@ async function withCycleGuard(id, fn) {
 // a lieutenant that is down is to respawn it — racing this spawn for the pane
 // and telling the captain his lieutenant crashed while he is the one moving it.
 async function switchLieutenantHarness(lt, harness, actor) {
-  try { getHarness(harness); } catch (e) { return { error: String((e && e.message) || e) }; }
+  try { getHarness(harness); } catch (e) { return { error: String((e && e.message) || e), code: 400 }; }
   if (!isHarnessRef(lt.ref)) {
     return { error: 'lieutenant ' + lt.id + ' has no session — a harness is a property of the '
       + 'session it runs in, so there is nothing here to move (spawn one first)', code: 409 };
@@ -1542,13 +1595,12 @@ async function switchLieutenantHarness(lt, harness, actor) {
   lt.ref = { harness: ref.harness, session: ref.session, cwd: ref.cwd, window: ref.window || names.LIEUTENANT_WINDOW };
   respawnAttempts.delete(lt.id);
   delivery.resetNudge(lt.id); // the new session owes a drain; its predecessor's memory went with it
-  const ev = mkEvent({
+  const ev = store.boardEvent({
     text: 'lieutenant ' + lt.name + ' moved to ' + harness
       + (validModel(lt.model) ? ':' + validModel(lt.model) : '')
       + ' — respawned as ' + lt.ref.session,
     actor: actor || 'user',
   }, { kind: 'harness-switch', level: 1 });
-  board.events.push(ev);
   if (pendingItems(lt.id).length) scheduleWake(lt.id);
   return { ok: true, switched: true, lieutenant: lt, event: ev };
 }
@@ -1720,26 +1772,26 @@ function checkPlaybook(raw) {
   if (!id) return { playbook: '' };
   if (!resolvePlaybook(STATE_DIR, id)) {
     return { error: 'unknown playbook: ' + id + ' — playbooks in ' + path.join(STATE_DIR, 'playbooks')
-      + ': ' + playbooksHint() };
+      + ': ' + playbooksHint(), code: 400 };
   }
   return { playbook: id };
 }
 function createCard(body, actorDefault) {
   const title = String(body.title || '').trim();
-  if (!title) return { error: 'title required' };
+  if (!title) return { error: 'title required', code: 400 };
   const owner = String(body.owner || '').trim();
-  if (!owner) return { error: 'owner required (every card belongs to exactly one lieutenant)' };
+  if (!owner) return { error: 'owner required (every card belongs to exactly one lieutenant)', code: 400 };
   const lt = findLieutenant(owner);
-  if (!lt) return { error: 'unknown lieutenant: ' + owner };
+  if (!lt) return { error: 'unknown lieutenant: ' + owner, code: 400 };
   const type = body.type ? String(body.type) : 'implementation';
-  if (!CARD_TYPES.includes(type)) return { error: 'bad type (use ' + CARD_TYPES.join('|') + ')' };
+  if (!CARD_TYPES.includes(type)) return { error: 'bad type (use ' + CARD_TYPES.join('|') + ')', code: 400 };
   const pb = checkPlaybook(body.playbook);
-  if (pb.error) return { error: pb.error };
+  if (pb.error) return pb;
   // No id given: the owner mints the next one from its own counter. The counter
   // advances only when the card is actually born (below).
   const minted = body.id ? 0 : (Number.isInteger(lt.cardSeq) ? lt.cardSeq : 0) + 1;
   const id = body.id ? String(body.id) : lt.prefix + '-' + minted;
-  if (!/^[\w][\w.:-]*$/.test(id)) return { error: 'bad card id (use [A-Za-z0-9_.:-])' };
+  if (!/^[\w][\w.:-]*$/.test(id)) return { error: 'bad card id (use [A-Za-z0-9_.:-])', code: 400 };
   // A duplicate is an error, not a case to engineer around: no suffix, no retry,
   // no silently picking the next free number. It can happen when a prefix outlives
   // the lieutenant that used it (retire, recreate, counter back at 1) — rare, and
@@ -1752,13 +1804,13 @@ function createCard(body, actorDefault) {
       : 'card exists: ' + id, code: 409 };
   }
   const column = body.column ? String(body.column) : 'backlog';
-  if (!board.columns.some((c) => c.id === column)) return { error: 'unknown column: ' + column };
+  if (!board.columns.some((c) => c.id === column)) return { error: 'unknown column: ' + column, code: 400 };
   // Working is a fact, not a label: a card is in Working iff a live worker
   // exists for it, and only card.start creates one. Cards are never BORN there.
-  if (column === 'working') return { error: 'cards cannot be created in Working — a card enters Working only through card.start (which spawns its worker)' };
+  if (column === 'working') return { error: 'cards cannot be created in Working — a card enters Working only through card.start (which spawns its worker)', code: 400 };
   // Nor anywhere else: cards are born in Backlog ONLY (review is the handoff,
   // peer is the captain's shelf — both are earned, never a birthplace).
-  if (column !== 'backlog') return { error: 'cards are born in Backlog only — create it there and move it after' };
+  if (column !== 'backlog') return { error: 'cards are born in Backlog only — create it there and move it after', code: 400 };
   const actor = String(body.actor || actorDefault || 'agent').slice(0, 60);
   const card = {
     id, title: title.slice(0, 200), type, owner, column, playbook: pb.playbook,
@@ -1768,11 +1820,12 @@ function createCard(body, actorDefault) {
     created: now(), updated: now(), threadStart: null, pendingOrder: null,
     events: [], thread: [],
   };
-  card.events.push(mkEvent({ text: 'created in ' + columnTitle(column), actor }, { kind: 'created' }));
+  // Write-ahead first: a queue append that throws must leave no card behind.
+  if (actor === 'user') queuePush(owner, { kind: 'card-created', card: id, text: card.title, column });
+  store.cardEvent(card, { text: 'created in ' + columnTitle(column), actor }, { kind: 'created' });
   if (minted) lt.cardSeq = minted; // never reissued, never rolled back
   board.cards.push(card);
   registerCardLabels();
-  if (actor === 'user') queuePush(owner, { kind: 'card-created', card: id, text: card.title, column });
   return { card };
 }
 
@@ -1791,7 +1844,7 @@ function createCard(body, actorDefault) {
 // captain rearranging) resolves the order marker.
 function moveCard(card, body, actorDefault) {
   const column = String(body.column || '');
-  if (!board.columns.some((c) => c.id === column)) return { error: 'unknown column: ' + column };
+  if (!board.columns.some((c) => c.id === column)) return { error: 'unknown column: ' + column, code: 400 };
   const actor = String(body.actor || actorDefault || 'agent').slice(0, 60);
   if (column === card.column) return { ok: true, unchanged: true };
   const from = card.column;
@@ -1804,57 +1857,52 @@ function moveCard(card, body, actorDefault) {
         { kind: order, card: card.id, from, to: column },
         String(body.text || '').trim() ? { text: String(body.text).slice(0, 2000) } : {}));
       card.pendingOrder = { kind: order, seq: item.seq, ts: item.ts };
-      const ev = mkEvent({ actor, kind: 'ordered',
-        text: (order === 'start-order' ? 'start ordered' : 'rework ordered') + ' (' + columnTitle(from) + ' → ' + columnTitle(column) + ')' }, {});
-      card.events.push(ev);
-      card.updated = now();
+      const ev = store.cardEvent(card, { actor, kind: 'ordered',
+        text: (order === 'start-order' ? 'start ordered' : 'rework ordered') + ' (' + columnTitle(from) + ' → ' + columnTitle(column) + ')' });
       return { ok: true, ordered: order, event: ev, seq: item.seq };
     }
   } else if (column === 'working') {
     return { error: 'only card.start moves a card into Working (it spawns the worker) — run: card start ' + card.id, code: 409 };
   } else if (column !== 'review') {
-    return { error: 'lieutenants move cards only to review (the handoff)' };
+    return { error: 'lieutenants move cards only to review (the handoff)', code: 400 };
   }
 
   card.column = column;
   card.pendingOrder = null;
-  card.updated = now();
   if (from === 'working') workers.leave(card.id); // leaving Working ends the stop/stale-state
   // A move is a deliberate act: it always lands on the timeline. Default kind:
   // a lieutenant move is a handoff (level 1 from the kinds map — rings the
   // captain); a captain move is `moved` (level 2). `kind` in the body overrides;
   // levels come from the effective kinds map unless an explicit level is given.
-  const ev = mkEvent(
+  const ev = store.cardEvent(card,
     { level: body.level, kind: body.kind, actor, text: columnTitle(from) + ' → ' + columnTitle(column) },
     { kind: actor === 'user' ? 'moved' : 'handoff' });
-  card.events.push(ev);
   if (actor === 'user') queuePush(card.owner, { kind: 'card-moved', card: card.id, from, to: column });
   return { ok: true, event: ev };
 }
 
 function patchCard(card, body) {
   // Validate every field before applying any: a refused patch must leave nothing
-  // in memory for the next unrelated saveBoard to persist.
+  // in memory for the next unrelated save to persist.
   // Owner reassignment is allowed ONLY while no worker is bound to the card
   // (live or recorded): a worker's session/worktree belong to the owning
   // lieutenant's supervision, so mid-work handovers stay forbidden.
   const newOwner = body.owner !== undefined ? String(body.owner).replace(/^lieutenant:/, '') : card.owner;
   if (newOwner !== card.owner) {
     if (findWorker(card.id)) {
-      return { error: 'owner change refused: card has a worker bound (session/worktree) — finish or archive first' };
+      return { error: 'owner change refused: card has a worker bound (session/worktree) — finish or archive first', code: 409 };
     }
     if (!board.lieutenants.some((l) => l.id === newOwner)) {
-      return { error: 'unknown lieutenant: ' + newOwner };
+      return { error: 'unknown lieutenant: ' + newOwner, code: 400 };
     }
   }
   const pb = body.playbook !== undefined ? checkPlaybook(body.playbook) : null;
-  if (pb && pb.error) return { error: pb.error };
+  if (pb && pb.error) return pb;
 
   if (newOwner !== card.owner) {
     const prev = card.owner;
     card.owner = newOwner;
-    card.events.push(mkEvent(
-      { actor: body.actor, text: 'owner: ' + prev + ' → ' + newOwner }, { kind: 'moved' }));
+    store.cardEvent(card, { actor: body.actor, text: 'owner: ' + prev + ' → ' + newOwner }, { kind: 'moved' });
   }
   if (pb) card.playbook = pb.playbook;
   if (body.title !== undefined) card.title = String(body.title).slice(0, 200);
@@ -1886,7 +1934,7 @@ function normalizeArtifactUri(raw) {
 }
 function cardArtifactAdd(card, body) {
   const uri = normalizeArtifactUri(body && body.uri);
-  if (!uri) return { error: 'uri required (attachment://id | file://path | path)' };
+  if (!uri) return { error: 'uri required (attachment://id | file://path | path)', code: 400 };
   if (!Array.isArray(card.attributes.artifacts)) card.attributes.artifacts = [];
   const label = String((body && body.label) || '').slice(0, 200);
   const existing = card.attributes.artifacts.find((a) => a && a.uri === uri);
@@ -1901,13 +1949,12 @@ function cardArtifactAdd(card, body) {
   if (am) { const meta = readAttachmentMeta(am[1]); if (meta) defLabel = meta.name; }
   const art = label ? { uri, label } : { uri, label: defLabel };
   card.attributes.artifacts.push(art);
-  card.events.push(mkEvent({ text: 'artifact added: ' + (art.label || uri), actor: (body && body.actor) || 'agent', level: 2 }, {}));
-  card.updated = now();
+  store.cardEvent(card, { text: 'artifact added: ' + (art.label || uri), actor: (body && body.actor) || 'agent', level: 2 });
   return { ok: true, artifact: art };
 }
 function cardArtifactRemove(card, body) {
   const uri = normalizeArtifactUri(body && body.uri);
-  if (!uri) return { error: 'uri required' };
+  if (!uri) return { error: 'uri required', code: 400 };
   const arts = Array.isArray(card.attributes.artifacts) ? card.attributes.artifacts : [];
   const next = arts.filter((a) => !(a && a.uri === uri));
   const removed = next.length !== arts.length;
@@ -1931,8 +1978,11 @@ function archiveCard(card, body, actorDefault) {
   // the optional `note`, preserved on the archive record.
   const reason = (body && body.reason) || 'killed';
   if (reason !== 'merged' && reason !== 'killed') {
-    return { error: "reason must be 'merged' or 'killed' (free text goes in note)" };
+    return { error: "reason must be 'merged' or 'killed' (free text goes in note)", code: 400 };
   }
+  // The worker's address goes onto the card BEFORE the snapshot freezes: the
+  // record may be dropped later, detached, with no card left to stamp.
+  stampWorkerAddress(card, findWorker(card.id));
   const note = body && body.note ? String(body.note).slice(0, 500) : null;
   const rec = { ts: now(), actor, reason, card };
   if (note) rec.note = note;
@@ -1949,11 +1999,10 @@ function archiveCard(card, body, actorDefault) {
   // reference. Typed by reason: merged = landed (level 1 — worth a bell),
   // killed = killed (level 2 — the captain's own act, no bell). Levels come from
   // the effective kinds map.
-  const ev = mkEvent(
+  const ev = store.boardEvent(
     { level: body && body.level, kind: body && body.kind, actor, text: reason + ': ' + (note || card.title) },
     { kind: reason === 'merged' ? 'landed' : 'killed' });
   ev.card = card.id; ev.cardTitle = card.title; ev.archived = true;
-  board.events.push(ev);
   return { ok: true, event: ev };
 }
 
@@ -1985,13 +2034,11 @@ function restoreCard(id, body) {
   const wasWorking = card.column === 'working';
   if (wasWorking) card.column = 'backlog';
   for (const e of card.events) if (e.seq > board.seq) board.seq = e.seq; // defensive: no seq reuse
-  const ev = mkEvent({
+  const ev = store.cardEvent(card, {
     level: body && body.level, kind: body && body.kind, actor: body && body.actor,
     text: (String((body && body.text) || '').trim() || 'resurrected')
       + (wasWorking ? ' — restored to backlog (was working)' : ''),
   }, { kind: 'resurrected' });
-  card.events.push(ev);
-  card.updated = now();
   board.cards.push(card);
   registerCardLabels();
   return { ok: true, card, event: ev };
@@ -2006,9 +2053,9 @@ function findProject(name) { return board.projects.find((p) => p.name === name);
 const addingProjects = new Set(); // names with a clone in flight (async clone opens racing duplicate adds)
 async function addProject(body) {
   const source = String((body && body.source) || '').trim();
-  if (!source) return { error: 'source required (git URL or local path)' };
+  if (!source) return { error: 'source required (git URL or local path)', code: 400 };
   const name = String((body && body.name) || path.basename(source.replace(/\/+$/, '')).replace(/\.git$/, '')).trim();
-  if (!isId(name)) return { error: 'bad project name: ' + name + ' (use [A-Za-z0-9_.-], or pass --name)' };
+  if (!isId(name)) return { error: 'bad project name: ' + name + ' (use [A-Za-z0-9_.-], or pass --name)', code: 400 };
   if (findProject(name)) return { error: 'project exists: ' + name, code: 409 };
   if (addingProjects.has(name)) return { error: 'project add already in progress: ' + name, code: 409 };
   const dest = path.join(WORKSPACE, 'projects', name);
@@ -2028,8 +2075,7 @@ async function addProject(body) {
   }
   const project = { name, path: dest, source: src, added: now() };
   board.projects.push(project);
-  board.events.push(mkEvent({ text: 'project ' + name + ' registered',
-    actor: (body && body.actor) || 'agent', level: 2 }, {}));
+  store.boardEvent({ text: 'project ' + name + ' registered', actor: (body && body.actor) || 'agent', level: 2 });
   return { project };
 }
 
@@ -2228,7 +2274,7 @@ async function fireHooks(event, card, w, opts) {
         { kind: r.ok ? 'hook-ran' : 'hook-failed' }), opts);
       if (!r.ok) queuePush(card.owner, { kind: 'hook-failed', card: card.id, text: text.slice(0, 2000) });
     }
-    saveBoard(); broadcast();
+    store.commit();
   } catch (e) {
     console.error(now() + ' ' + event + ' hooks for ' + card.id + ' failed: ' + String((e && e.message) || e));
   }
@@ -2242,8 +2288,7 @@ async function fireHooks(event, card, w, opts) {
 function landCardEvent(card, ev, opts) {
   const live = (opts && opts.boardLevel) ? null : findCard(card.id);
   if (live) {
-    live.events.push(ev);
-    live.updated = now();
+    store.pushCardEvent(live, ev);
   } else {
     ev.card = card.id;
     ev.cardTitle = card.title;
@@ -2278,7 +2323,7 @@ const workers = createWorkers({
   },
   runTeardown, hookContext, fireHooks,
   mkEvent, landEvent: landCardEvent, queuePush,
-  save: () => { saveBoard(); broadcast(); },
+  save: store.commit,
   planStart, ownerSession, workerWindow: names.workerWindow,
   refreshStatus: refreshAgentStatus,
   permissionMode: () => configPermissionMode(),
@@ -2306,18 +2351,18 @@ const BOARD_OWNED_ATTRS = new Set(['prs', 'artifacts']);
  * Resolve what a start runs from the card's playbook: harness, branch, launch
  * flags, keep_worktree/teardown, and the brief renderer. Refuses BEFORE
  * anything is provisioned (a missing `requires` attribute, an unknown harness).
- * @returns {{impl, branch, extraArgs, keepWorktree, teardown, brief: (wtPath) => string}|{error, code?}}
+ * @returns {{impl, branch, extraArgs, keepWorktree, teardown, brief: (wtPath) => string}|{error, code}}
  */
 function planStart(card, body, project) {
   const playbookId = String(card.playbook || '').trim();
   if (!playbookId) {
     return { error: 'card ' + card.id + ' has no playbook — pick one before starting it: '
-      + 'bc-axi card patch ' + card.id + ' --playbook <id>. Available: ' + playbooksHint() };
+      + 'bc-axi card patch ' + card.id + ' --playbook <id>. Available: ' + playbooksHint(), code: 400 };
   }
   const playbookFile = resolvePlaybook(STATE_DIR, playbookId);
   if (!playbookFile) {
     return { error: 'card ' + card.id + ' points at playbook "' + playbookId + '", which no file '
-      + 'matches. Available: ' + playbooksHint() };
+      + 'matches. Available: ' + playbooksHint(), code: 400 };
   }
   let raw;
   try { raw = fs.readFileSync(playbookFile, 'utf8'); }
@@ -2325,7 +2370,7 @@ function planStart(card, body, project) {
   let template = '';
   let meta = {};
   try { ({ meta, body: template } = parsePlaybook(raw)); }
-  catch (e) { return { error: 'playbook ' + playbookFile + ': ' + String((e && e.message) || e) }; }
+  catch (e) { return { error: 'playbook ' + playbookFile + ': ' + String((e && e.message) || e), code: 400 }; }
   // `requires`: does the card CARRY the attribute (an empty list carries
   // nothing), matched through attrVar() like the placeholders, so PR_URL is
   // answered by pr_url.
@@ -2355,7 +2400,7 @@ function planStart(card, body, project) {
         + ' recorded by the board itself and never set by hand — the card has to earn '
         + (ours.length > 1 ? 'them' : 'it') + ' before this playbook can run.';
     }
-    return { error: err };
+    return { error: err, code: 400 };
   }
   // Harness and model: explicit flag, then the playbook's frontmatter, then config.
   const harnessFromPlaybook = !body.harness && !!meta.harness;
@@ -2365,7 +2410,7 @@ function planStart(card, body, project) {
   try { impl = getHarness(harnessName); }
   catch (e) {
     return { error: String((e && e.message) || e)
-      + (harnessFromPlaybook ? ' (from playbook ' + playbookFile + ')' : '') };
+      + (harnessFromPlaybook ? ' (from playbook ' + playbookFile + ')' : ''), code: 400 };
   }
   const extraArgs = [];
   const modelHint = body.model || meta.model;
@@ -2461,10 +2506,10 @@ async function superviseTick() {
         }
         lt.ref = ref;
         respawnAttempts.delete(lt.id);
-        board.events.push(mkEvent({
+        store.boardEvent({
           text: 'lieutenant ' + lt.name + ' session died — respawned as ' + ref.harness + ':' + ref.session,
           actor: 'server',
-        }, { kind: 'respawned' }));
+        }, { kind: 'respawned' });
         changed = true;
         delivery.resetNudge(lt.id); // the reincarnated session owes a drain: queue is truth, its memory is a cache
         if (pendingItems(lt.id).length) scheduleWake(lt.id);
@@ -2477,17 +2522,17 @@ async function superviseTick() {
       } catch (e) {
         console.error(now() + ' respawn failed for ' + lt.id + ' (attempt ' + n + '/3): ' + String((e && e.message) || e));
         if (n === 3) {
-          board.events.push(mkEvent({
+          store.boardEvent({
             text: 'lieutenant ' + lt.name + ' is down and 3 respawn attempts failed — needs the captain (session ' + lt.ref.session + ')',
             actor: 'server',
-          }, { kind: 'needs-captain' }));
+          }, { kind: 'needs-captain' });
           respawnAttempts.set(lt.id, 4);
           changed = true;
         }
       }
     }
     if (await workers.tick()) changed = true; // died / stalled workers
-    if (changed) { saveBoard(); broadcast(); }
+    if (changed) store.commit();
   } finally {
     supervising = false;
   }
@@ -2530,14 +2575,14 @@ async function prWatchTick() {
         else if (st.state === 'CLOSED') {
           pr.state = 'closed';
           changed = true;
-          card.events.push(mkEvent({ text: 'PR closed without merge: ' + pr.url, actor: 'server', level: 2 }, {}));
+          store.cardEvent(card, { text: 'PR closed without merge: ' + pr.url, actor: 'server', level: 2 });
           queuePush(card.owner, { kind: 'pr-closed', card: card.id, text: pr.url });
         }
       }
       if (!changed) continue;
       // one signal per PR that landed — a stack can flip several between polls
       for (const pr of merged) {
-        card.events.push(mkEvent({ text: 'PR merged: ' + pr.url, actor: 'server' }, { kind: 'pr-merged' }));
+        store.cardEvent(card, { text: 'PR merged: ' + pr.url, actor: 'server' }, { kind: 'pr-merged' });
         queuePush(card.owner, { kind: 'pr-merged', card: card.id, text: pr.url });
       }
       // a stack card only finishes when nothing is left open: a partial merge
@@ -2549,11 +2594,11 @@ async function prWatchTick() {
         const out = await workers.end(card, 'merge');
         let note = merged.map((p) => p.url).join(' ');
         if (out.release && !out.release.released) note += ' (worktree NOT released: ' + out.release.reason + ')';
-        // A record the kill could not verify is kept: the snapshot still names its run.
-        stampWorkerAddress(card, findWorker(card.id));
+        // archiveCard stamps the worker's address: a record the kill could not
+        // verify is kept, and the snapshot still names its run.
         archiveCard(card, { reason: 'merged', note, actor: 'server' }); // landed — the level-1 bell
       }
-      saveBoard(); broadcast();
+      store.commit();
     }
   } finally {
     prWatching = false;
@@ -2574,13 +2619,13 @@ const clock = createClock({
   // The kind travels onto the queue item as well as the timeline entry: the
   // drain dispatches on the item's kind alone.
   notify: (s, { text, kind, level, wake }) => {
-    board.events.push(mkEvent({ text, actor: 'server', level }, { kind }));
+    store.boardEvent({ text, actor: 'server', level }, { kind });
     if (wake && findLieutenant(s.owner)) {
       queuePush(s.owner, { kind, schedule: s.name, text, source: 'schedule ' + s.name });
     }
   },
   keys: { seen: seenEventKey, claim: claimEventKey, forget: forgetEventKeys },
-  save: () => { saveBoard(); broadcast(); },
+  save: store.commit,
   runNamedHook,
   now,
   hookTimeoutMs: HOOK_TIMEOUT_MS,
@@ -2588,7 +2633,7 @@ const clock = createClock({
 const { publicSchedules, findSchedule, scheduleTrigger, describeWhenSafe } = clock;
 if (Number.isInteger(SCHEDULE_MS) && SCHEDULE_MS > 0) setInterval(clock.tick, SCHEDULE_MS).unref();
 
-// validateSchedule(body) -> {error} | {schedule}
+// validateSchedule(body) -> {error, code} | {schedule}
 // The refusals are the point of `add`: a bad expression names the offending
 // text, a hook that is not there is refused before it can become a dead window
 // every five minutes, and an unregistered owner is refused because a firing's
@@ -2596,27 +2641,27 @@ if (Number.isInteger(SCHEDULE_MS) && SCHEDULE_MS > 0) setInterval(clock.tick, SC
 function validateSchedule(body) {
   const name = String(body.name || '').trim();
   if (!SCHEDULE_NAME_RE.test(name)) {
-    return { error: 'bad schedule name "' + name + '" (letters, digits, _ . - ; starts with a letter, digit or _)' };
+    return { error: 'bad schedule name "' + name + '" (letters, digits, _ . - ; starts with a letter, digit or _)', code: 400 };
   }
   if (findSchedule(name)) return { error: 'schedule "' + name + '" already exists', code: 409 };
   const hook = String(body.hook || '').trim();
-  if (!HOOK_NAME_RE.test(hook)) return { error: 'a schedule fires a NAMED hook — give one with --hook' };
+  if (!HOOK_NAME_RE.test(hook)) return { error: 'a schedule fires a NAMED hook — give one with --hook', code: 400 };
   if (!namedHookFile(WORKSPACE, hook)) {
     return { error: 'no hook "' + hook + '" — a named hook is an executable file in ' + hooksDir(WORKSPACE)
-      + ' (bc-axi hook list). A schedule naming a hook that does not exist is a window that fires nothing' };
+      + ' (bc-axi hook list). A schedule naming a hook that does not exist is a window that fires nothing', code: 400 };
   }
   let when;
-  try { when = parseWhen(body.when); } catch (e) { return { error: e.message }; }
+  try { when = parseWhen(body.when); } catch (e) { return { error: e.message, code: 400 }; }
   const owner = String(body.owner || '').trim();
   if (!findLieutenant(owner)) {
-    return { error: 'unknown lieutenant "' + owner + '" — a schedule needs an owner for its failures to land on' };
+    return { error: 'unknown lieutenant "' + owner + '" — a schedule needs an owner for its failures to land on', code: 400 };
   }
   const overlap = body.overlap === undefined || body.overlap === null || body.overlap === ''
     ? 'skip' : String(body.overlap);
-  if (!OVERLAP.includes(overlap)) return { error: 'overlap must be one of: ' + OVERLAP.join(', ') };
+  if (!OVERLAP.includes(overlap)) return { error: 'overlap must be one of: ' + OVERLAP.join(', '), code: 400 };
   const catchup = body.catchup === undefined || body.catchup === null || body.catchup === ''
     ? 'latest' : String(body.catchup);
-  if (!CATCHUP.includes(catchup)) return { error: 'catch-up must be one of: ' + CATCHUP.join(', ') };
+  if (!CATCHUP.includes(catchup)) return { error: 'catch-up must be one of: ' + CATCHUP.join(', '), code: 400 };
   return { schedule: { name, hook, when: when.text, owner, overlap, catchup,
     paused: false, created: now(), lastWindow: '', problem: '' } };
 }
@@ -2730,7 +2775,7 @@ const server = http.createServer(async (req, res) => {
       const next = Object.assign({}, cur, body, { step, updated: now() });
       delete next.actor;
       board.onboarding = next;
-      saveBoard(); broadcast();
+      store.commit();
       return sendJson(res, 200, { ok: true, onboarding: board.onboarding });
     }
     if (route === 'GET /api/archive') {
@@ -2876,88 +2921,27 @@ const server = http.createServer(async (req, res) => {
       // spawn:true births a real session (harness.spawn in the workspace root)
       // and registers the lieutenant with the returned ref; without it this is
       // registration only (the founding lieutenant brings its own ref).
-      const r = body.spawn ? await spawnLieutenant(body) : createLieutenant(body);
-      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      saveBoard(); broadcast();
+      const r = await store.mutate(() => (body.spawn ? spawnLieutenant(body) : createLieutenant(body)));
       // `spawned` is how a re-run of `init --onboard` tells "I revived her" from
       // "she was already up" — the second is not worth a line of anyone's output.
-      return sendJson(res, 200, { ok: true, lieutenant: r.lieutenant, spawned: r.spawned });
+      return respond(res, r, () => ({ ok: true, lieutenant: r.lieutenant, spawned: r.spawned }));
     }
     const ltRoute = /^\/api\/lieutenants\/([^/]+)$/.exec(p);
     if (ltRoute && req.method === 'DELETE') { // lieutenant.retire — explicit only
       const body = JSON.parse(await readBody(req) || '{}');
-      const r = await retireLieutenant(decodeURIComponent(ltRoute[1]), body);
-      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, event: r.event, memory: r.memory });
+      const r = await store.mutate(() => retireLieutenant(decodeURIComponent(ltRoute[1]), body));
+      return respond(res, r, () => ({ ok: true, event: r.event, memory: r.memory }));
     }
     if (ltRoute && req.method === 'PATCH') { // name/color/avatar/voice/prefix/model/harness/ref (init idempotency)
       const lt = findLieutenant(decodeURIComponent(ltRoute[1]));
       if (!lt) return sendJson(res, 404, { error: 'unknown lieutenant: ' + decodeURIComponent(ltRoute[1]) });
       const body = JSON.parse(await readBody(req) || '{}');
-      // Every field is checked before any applies, so a refused patch leaves no
-      // half-applied lieutenant for the next unrelated saveBoard to persist.
-      // Prefix is the only field a peer can veto (two lieutenants may not share
-      // one). Past cards keep the id they were minted with — a prefix change is
-      // about what comes next.
-      let prefix;
-      if (body.prefix !== undefined) {
-        prefix = validPrefix(body.prefix);
-        if (!prefix) return sendJson(res, 400, { error: BAD_PREFIX });
-        const clash = prefixOwner(prefix, lt.id);
-        if (clash) return sendJson(res, 409, { error: prefixTakenMsg(prefix, clash) });
-      }
-      if (body.ref !== undefined && body.ref !== null && !isHarnessRef(body.ref)) {
-        return sendJson(res, 400, { error: 'bad ref (want {harness, session, cwd, resumeId?} or null)' });
-      }
-      if (body.avatar !== undefined && body.avatar !== null && !validAvatar(body.avatar)) {
-        return sendJson(res, 400, { error: 'avatar must be an integer 0-63 or null' });
-      }
-      // null / "" clears the model back to the harness's own default.
-      const clearModel = body.model === null || body.model === '';
-      const model = body.model !== undefined && !clearModel ? validModel(body.model) : null;
-      if (body.model !== undefined && !clearModel && !model) return sendJson(res, 400, { error: BAD_MODEL });
-      const harness = body.harness !== undefined && body.harness !== null ? String(body.harness) : '';
-      if (harness) {
-        try { getHarness(harness); } catch (e) { return sendJson(res, 400, { error: String((e && e.message) || e) }); }
-      }
-
-      if (prefix) lt.prefix = prefix;
-      if (body.ref !== undefined) {
-        // A re-run of `bc-axi init` re-sends the founder's session-granular ref
-        // (the caller's tmux session is all it can see). Keep the window this
-        // lieutenant was already pinned to — losing it would put the ref back
-        // to killing its whole session, worker windows included, on revive.
-        lt.ref = body.ref && !body.ref.window && lt.ref && lt.ref.window
-          && lt.ref.session === body.ref.session
-          ? { ...body.ref, window: lt.ref.window }
-          : body.ref;
-      }
-      if (body.name !== undefined && String(body.name).trim()) lt.name = String(body.name).trim().slice(0, 60);
-      if (body.color !== undefined && validColor(body.color)) lt.color = body.color;
-      if (body.avatar === null) delete lt.avatar;
-      else if (body.avatar !== undefined) lt.avatar = body.avatar;
-      // "" / null clears the pick — the lieutenant is back to the board's voice.
-      if (body.voice !== undefined) {
-        const v = validVoice(body.voice);
-        if (v) lt.voice = v; else delete lt.voice;
-      }
-      // The model is stored, not applied: it rides `--model` on the next spawn
-      // or resume this lieutenant gets. Set BEFORE the harness switch below, so
-      // a captain who moves harness and model in one call lands on both.
-      if (clearModel) delete lt.model;
-      else if (model) lt.model = model;
-      // Last, because it is the only field that costs the lieutenant its
-      // session: everything above is already on the record the respawn prompt
-      // is built from.
-      if (harness) {
-        const sw = await switchLieutenantHarness(lt, harness, body.actor);
-        if (sw.error) { saveBoard(); broadcast(); return sendJson(res, sw.code || 400, { error: sw.error }); }
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, lieutenant: lt, switched: sw.switched, event: sw.event });
-      }
-      saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, lieutenant: lt });
+      const r = store.mutate(() => patchLieutenant(lt, body));
+      if (r.error || !r.harness) return respond(res, r, () => ({ ok: true, lieutenant: lt }));
+      // Last, and its own change: the switch costs the lieutenant its session,
+      // and the fields above are already on the record the respawn prompt reads.
+      const sw = await store.mutate(() => switchLieutenantHarness(lt, r.harness, body.actor));
+      return respond(res, sw, () => ({ ok: true, lieutenant: lt, switched: sw.switched, event: sw.event }));
     }
 
     // ----- turn boundaries (the BC_TURNEND_URL target; posted by the Stop-hook relay) -----
@@ -2984,7 +2968,7 @@ const server = http.createServer(async (req, res) => {
       const { lt, worker: w } = resolveHookAgent(body);
       if (w) {
         const r = await workers.turnEnd(w, { sid, text: body.text });
-        saveBoard();
+        store.save();
         if (r.stopped || r.statusChanged) broadcast();
         return sendJson(res, 200, { ok: true, lieutenant: null, worker: w.card });
       }
@@ -2994,7 +2978,7 @@ const server = http.createServer(async (req, res) => {
       lt.turns = (lt.turns || 0) + 1;
       // turn-end is the status refresh point (context bar / /status data)
       const statusChanged = await refreshAgentStatus(lt);
-      saveBoard();
+      store.save();
       if (statusChanged) broadcast();
       // Drain-at-turn-start backstop: the lieutenant just ended a turn with
       // items still unacked. Re-nudge unless a wake is already outstanding
@@ -3032,29 +3016,25 @@ const server = http.createServer(async (req, res) => {
       if (card) {
         const text = 'captain ' + (body.decision === 'allow' ? 'approved ' : 'denied ') + item.tool_name + ': '
           + item.summary + (message ? ' — ' + message : '');
-        card.events.push(mkEvent({ text, actor: 'captain' }, { kind: 'permission', level: 2 }));
-        card.updated = now();
+        store.cardEvent(card, { text, actor: 'captain' }, { kind: 'permission', level: 2 });
       }
-      saveBoard(); broadcast();
+      store.commit();
       return sendJson(res, 200, { ok: true });
     }
 
     // ----- cards -----
     if (route === 'POST /api/cards') {
       const body = JSON.parse(await readBody(req) || '{}');
-      const r = createCard(body);
-      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, card: publicCard(r.card, 'user') });
+      const r = store.mutate(() => createCard(body));
+      return respond(res, r, () => ({ ok: true, card: publicCard(r.card, 'user') }));
     }
     // restore targets a card that is NOT on the board, so it routes before the
     // find-card paths (which would 404 the normal restore case).
     const restoreRoute = /^\/api\/cards\/([^/]+)\/restore$/.exec(p);
     if (restoreRoute && req.method === 'POST') {
-      const r = restoreCard(decodeURIComponent(restoreRoute[1]), JSON.parse(await readBody(req) || '{}'));
-      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, card: publicCard(r.card, 'user'), event: r.event });
+      const body = JSON.parse(await readBody(req) || '{}');
+      const r = store.mutate(() => restoreCard(decodeURIComponent(restoreRoute[1]), body));
+      return respond(res, r, () => ({ ok: true, card: publicCard(r.card, 'user'), event: r.event }));
     }
     const cardRoute = /^\/api\/cards\/([^/]+)(\/(move|events|archive|status|start|park|artifacts|worker\/signal|worker\/done|worker\/send|worker\/pause))?$/.exec(p);
     if (cardRoute) {
@@ -3062,40 +3042,35 @@ const server = http.createServer(async (req, res) => {
       if (!card) return sendJson(res, 404, { error: 'unknown card: ' + decodeURIComponent(cardRoute[1]) });
       const sub = cardRoute[3];
       if (sub === 'start' && req.method === 'POST') { // card.start — the ONE atomic op into Working
-        const r = await workers.start(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, card: publicCard(card, 'user'), worker: r.worker, resumed: !!r.resumed });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = await store.mutate(() => workers.start(card, body));
+        return respond(res, r, () => ({ ok: true, card: publicCard(card, 'user'), worker: r.worker, resumed: !!r.resumed }));
       }
       if (sub === 'worker/signal' && req.method === 'POST') {
-        const r = workers.signal(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, event: r.event });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => workers.signal(card, body));
+        return respond(res, r, () => ({ ok: true, event: r.event }));
       }
       if (sub === 'worker/send' && req.method === 'POST') {
-        const r = await workers.send(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, event: r.event, session: r.session });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = await store.mutate(() => workers.send(card, body));
+        return respond(res, r, () => ({ ok: true, event: r.event, session: r.session }));
       }
       if (sub === 'worker/pause' && req.method === 'POST') {
-        const r = await workers.pause(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, event: r.event, session: r.session,
-          parked: r.parked, parkError: r.parkError, card: publicCard(card, 'user') });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = await store.mutate(() => workers.pause(card, body));
+        return respond(res, r, () => ({ ok: true, event: r.event, session: r.session,
+          parked: r.parked, parkError: r.parkError, card: publicCard(card, 'user') }));
       }
       if (sub === 'park' && req.method === 'POST') {
-        const r = await workers.park(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, event: r.event, card: publicCard(card, 'user') });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = await store.mutate(() => workers.park(card, body));
+        return respond(res, r, () => ({ ok: true, event: r.event, card: publicCard(card, 'user') }));
       }
       if (sub === 'worker/done' && req.method === 'POST') {
-        const r = workers.done(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, 400, { error: r.error });
-        saveBoard(); broadcast();
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => workers.done(card, body));
+        if (r.error) return respond(res, r);
         // The worktree STAYS: done hands the card to its lieutenant, whose first
         // job is to read the diff in it. It goes at the handoff (the move out of
         // Working), not here.
@@ -3108,30 +3083,27 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, pc);
       }
       if (!sub && req.method === 'PATCH') {
-        const r = patchCard(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, card: publicCard(card, 'user') });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => patchCard(card, body));
+        return respond(res, r, () => ({ ok: true, card: publicCard(card, 'user') }));
       }
       if (sub === 'status' && req.method === 'POST') { // status.set(card, worker{id, state}, ttl?)
-        const r = setStatus(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, status: cardStatus(card, 'user') });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => setStatus(card, body));
+        return respond(res, r, () => ({ ok: true, status: cardStatus(card, 'user') }));
       }
       if (sub === 'move' && req.method === 'POST') {
         const wasWorking = card.column === 'working';
-        const r = moveCard(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => moveCard(card, body));
         // The handoff IS the end of the worker (workers.end: kill, then release,
         // with its exceptions). NOT awaited: the release queues behind the clone
         // lock and a teardown, and lands on the timeline when it lands.
-        if (wasWorking && card.column !== 'working') {
+        if (!r.error && wasWorking && card.column !== 'working') {
           workers.end(card, 'handoff').catch((e) => console.error(now() + ' handoff teardown for ' + card.id
             + ' failed: ' + String((e && e.message) || e)));
         }
-        saveBoard(); broadcast();
-        return sendJson(res, 200, r);
+        return respond(res, r);
       }
       if (sub === 'events' && req.method === 'POST') {
         const body = JSON.parse(await readBody(req) || '{}');
@@ -3146,7 +3118,7 @@ const server = http.createServer(async (req, res) => {
         // Write-ahead, then the live board — the order queuePush itself keeps.
         // The append is the step that can throw, and a throw before the push
         // must leave NOTHING behind in the board object for somebody else's
-        // saveBoard to write out later: the caller was told nothing happened,
+        // save to write out later: the caller was told nothing happened,
         // so a phantom entry surfacing on the next unrelated save is the one
         // duplicate --key was never meant to buy. mkEvent has already spent a
         // board.seq by then, which costs nothing — seq is monotonic, not dense.
@@ -3166,22 +3138,17 @@ const server = http.createServer(async (req, res) => {
             { kind: 'card-event', card: card.id, eventKind: ev.kind || null, text: ev.text },
             source ? { source } : {}));
         }
-        card.events.push(ev);
-        card.updated = now();
-        saveBoard();
+        store.pushCardEvent(card, ev);
+        store.commit();
         // Only now: the entry is on the card and the queue item is written, so
         // this key really has been said.
         if (key) claimEventKey(card.id, key);
-        broadcast();
         return sendJson(res, 200, { ok: true, event: ev });
       }
       if (sub === 'archive' && req.method === 'POST') {
-        // The address goes onto the card BEFORE archiveCard freezes the
-        // snapshot: the drop below is detached and finds no card left to stamp.
-        stampWorkerAddress(card, findWorker(card.id));
-        const r = archiveCard(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, 400, { error: r.error });
-        saveBoard(); broadcast();
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => archiveCard(card, body));
+        if (r.error) return respond(res, r);
         // Kill, card-archived hooks, release (keep_worktree buys nothing: the
         // card is gone) — detached, like the handoff.
         workers.end(card, 'archive').catch((e) => console.error(now() + ' archive teardown for ' + card.id
@@ -3191,16 +3158,14 @@ const server = http.createServer(async (req, res) => {
       // promote-to-artifact — the deliberate tool. POST adds, DELETE removes an
       // entry on card.attributes.artifacts. A chat upload alone never lands here.
       if (sub === 'artifacts' && req.method === 'POST') {
-        const r = cardArtifactAdd(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, artifact: r.artifact, card: publicCard(card, 'user') });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => cardArtifactAdd(card, body));
+        return respond(res, r, () => ({ ok: true, artifact: r.artifact, card: publicCard(card, 'user') }));
       }
       if (sub === 'artifacts' && req.method === 'DELETE') {
-        const r = cardArtifactRemove(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, removed: r.removed, card: publicCard(card, 'user') });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => cardArtifactRemove(card, body));
+        return respond(res, r, () => ({ ok: true, removed: r.removed, card: publicCard(card, 'user') }));
       }
       return sendJson(res, 405, { error: 'method not allowed' });
     }
@@ -3224,10 +3189,9 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { projects });
     }
     if (route === 'POST /api/projects') {
-      const r = await addProject(JSON.parse(await readBody(req) || '{}'));
-      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, project: r.project });
+      const body = JSON.parse(await readBody(req) || '{}');
+      const r = await store.mutate(() => addProject(body));
+      return respond(res, r, () => ({ ok: true, project: r.project }));
     }
 
     // ----- playbooks (the card's `playbook` picks one by id) -----
@@ -3311,16 +3275,18 @@ const server = http.createServer(async (req, res) => {
     }
     if (route === 'POST /api/schedules') {
       const body = JSON.parse(await readBody(req) || '{}');
-      const v = validateSchedule(body);
-      if (v.error) return sendJson(res, v.code || 400, { error: v.error });
-      board.schedules.push(v.schedule);
-      board.events.push(mkEvent({
-        text: 'schedule ' + v.schedule.name + ' added — hook ' + v.schedule.hook + ', '
-          + describeWhenSafe(v.schedule.when) + ', owner ' + v.schedule.owner,
-        actor: String(body.actor || 'agent'), level: 2,
-      }, { kind: 'schedule' }));
-      saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, schedule: publicSchedules().find((s) => s.name === v.schedule.name) });
+      const v = store.mutate(() => {
+        const out = validateSchedule(body);
+        if (out.error) return out;
+        board.schedules.push(out.schedule);
+        store.boardEvent({
+          text: 'schedule ' + out.schedule.name + ' added — hook ' + out.schedule.hook + ', '
+            + describeWhenSafe(out.schedule.when) + ', owner ' + out.schedule.owner,
+          actor: String(body.actor || 'agent'), level: 2,
+        }, { kind: 'schedule' });
+        return out;
+      });
+      return respond(res, v, () => ({ ok: true, schedule: publicSchedules().find((s) => s.name === v.schedule.name) }));
     }
     const schedRoute = /^\/api\/schedules\/([^/]+)$/.exec(p);
     if (schedRoute) {
@@ -3342,14 +3308,13 @@ const server = http.createServer(async (req, res) => {
         // is paused, not queued, and must not wake up owing sixty windows.
         if (s.paused && !body.paused) s.lastWindow = now();
         s.paused = body.paused;
-        saveBoard(); broadcast();
+        store.commit();
         return sendJson(res, 200, { ok: true, schedule: publicSchedules().find((x) => x.name === name) });
       }
       if (req.method === 'DELETE') {
         board.schedules = board.schedules.filter((x) => x.name !== name);
-        board.events.push(mkEvent({ text: 'schedule ' + name + ' removed', actor: 'agent', level: 2 },
-          { kind: 'schedule' }));
-        saveBoard(); broadcast();
+        store.boardEvent({ text: 'schedule ' + name + ' removed', actor: 'agent', level: 2 }, { kind: 'schedule' });
+        store.commit();
         return sendJson(res, 200, { ok: true });
       }
     }
@@ -3358,9 +3323,8 @@ const server = http.createServer(async (req, res) => {
     if (route === 'POST /api/events') {
       const body = JSON.parse(await readBody(req) || '{}');
       if (!String(body.text || '').trim()) return sendJson(res, 400, { error: 'text required' });
-      const ev = mkEvent(body, { level: 1 });
-      board.events.push(ev);
-      saveBoard(); broadcast();
+      const ev = store.boardEvent(body, { level: 1 });
+      store.commit();
       return sendJson(res, 200, { ok: true, event: ev });
     }
 
@@ -3383,7 +3347,7 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { ok: true, kinds: Object.keys(board.kinds).length, unchanged: true });
       }
       board.kinds = next;
-      saveBoard(); broadcast();
+      store.commit();
       return sendJson(res, 200, { ok: true, kinds: Object.keys(board.kinds).length });
     }
 
@@ -3392,7 +3356,7 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || '{}');
       if (body.title !== undefined) board.title = String(body.title).slice(0, 120);
       if (body.subtitle !== undefined) board.subtitle = String(body.subtitle).slice(0, 300);
-      saveBoard(); broadcast();
+      store.commit();
       return sendJson(res, 200, { ok: true });
     }
 
@@ -3445,12 +3409,11 @@ const server = http.createServer(async (req, res) => {
       // The caller is resolved from its tmux session + window (like drain/ack),
       // so a lieutenant speaking elsewhere is stamped as itself and a worker as
       // `worker <card>` — never as the lieutenant whose session it shares.
-      const r = conversation.say(callerOf(body), String(body.target || ''),
+      // owed clears on ACK, not here — the reply alone leaves it derived from the queue
+      const r = store.mutate(() => conversation.say(callerOf(body), String(body.target || ''),
         String(body.text_md || body.text || ''), resolveAttachments(body.attachments),
-        { author: body.author, level: body.level, kind: body.kind });
-      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      saveBoard(); broadcast(); // owed clears on ACK, not here — the reply alone leaves it derived from the queue
-      return sendJson(res, 200, { ok: true });
+        { author: body.author, level: body.level, kind: body.kind }));
+      return respond(res, r, () => ({ ok: true }));
     }
     if (route === 'POST /api/feedback') { // captain -> lieutenant (chat.say, captain side)
       const body = JSON.parse(await readBody(req) || '{}');
@@ -3461,16 +3424,12 @@ const server = http.createServer(async (req, res) => {
       // command and its reply land in the thread — no QueueItem, no wake.
       if (text.trim().startsWith('/') && !attachments.length) {
         const t = conversation.captainTarget(body.target); // `line` = whoever holds it
-        if (t.error) return sendJson(res, t.code, { error: t.error });
-        const r = await runChatCommand(t.target, text.trim());
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, r);
+        if (t.error) return respond(res, t);
+        return respond(res, await store.mutate(() => runChatCommand(t.target, text.trim())));
       }
-      const r = conversation.say(CAPTAIN, String(body.target || ''), text, attachments);
-      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      saveBoard(); broadcast(); // a captain message flips derived owed via broadcast
-      return sendJson(res, 200, { ok: true, seq: r.item.seq, target: r.target, via: r.via });
+      // a captain message flips derived owed via the broadcast
+      const r = store.mutate(() => conversation.say(CAPTAIN, String(body.target || ''), text, attachments));
+      return respond(res, r, () => ({ ok: true, seq: r.item.seq, target: r.target, via: r.via }));
     }
 
     // ----- the line -----
@@ -3483,10 +3442,8 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || '{}');
       // Who is handing it over: explicit actor, else the CALLER resolved from
       // its tmux session + window (like say/drain/ack), else the captain.
-      const r = conversation.pass(callerOf(body), body.lieutenant, body.note, { actor: body.actor });
-      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, lieutenant: r.lt.id, name: r.lt.name, seq: r.item.seq });
+      const r = store.mutate(() => conversation.pass(callerOf(body), body.lieutenant, body.note, { actor: body.actor }));
+      return respond(res, r, () => ({ ok: true, lieutenant: r.lt.id, name: r.lt.name, seq: r.item.seq }));
     }
 
     // ----- read state (persisted server-side, per user) -----
@@ -3509,7 +3466,7 @@ const server = http.createServer(async (req, res) => {
       else if (Array.isArray(body.seqs)) {
         for (const s of body.seqs) if (Number.isInteger(s) && s > r.notifSeq && !r.notifSeqs.includes(s)) r.notifSeqs.push(s);
       }
-      saveBoard(); broadcast();
+      store.commit();
       return sendJson(res, 200, { ok: true });
     }
     if (route === 'POST /api/read') { // thread read marker: {user?, target, ts?}
@@ -3523,7 +3480,7 @@ const server = http.createServer(async (req, res) => {
       // unified stream fires one POST per viewed thread per device — full
       // board pushes here burst every SSE client. Other devices of the same
       // user converge on the next real broadcast.
-      saveBoard();
+      store.save();
       return sendJson(res, 200, { ok: true });
     }
 
@@ -3564,7 +3521,7 @@ const server = http.createServer(async (req, res) => {
       } else {
         return sendJson(res, 400, { error: 'expected create|rename|recolor|delete' });
       }
-      saveBoard(); broadcast();
+      store.commit();
       return sendJson(res, 200, { ok: true, labels: board.labels });
     }
 
@@ -3685,7 +3642,7 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, 404, { error: 'not found' });
   } catch (e) {
     // A malformed body (JSON) or URL escape is the caller's fault; anything else,
-    // e.g. saveBoard failing on disk, is ours and must not read as a bad request.
+    // e.g. the board save failing on disk, is ours and must not read as a bad request.
     const code = e instanceof SyntaxError || e instanceof URIError ? 400 : 500;
     sendJson(res, code, { error: String(e.message || e) });
   }
