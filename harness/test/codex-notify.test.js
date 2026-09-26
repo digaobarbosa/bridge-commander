@@ -48,6 +48,7 @@ test('codex-notify normalizes agent-turn-complete into the claude-relay event sh
     assert.strictEqual(ev.cwd, '/abs/worktree');
     assert.ok(typeof ev.ts === 'string' && !Number.isNaN(Date.parse(ev.ts)), 'ts is a timestamp');
     assert.ok('tmux_session' in ev, 'tmux_session present (may be empty outside tmux)');
+    assert.strictEqual(ev.text, 'PONG', 'the last assistant message rides along for the stall alert');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -114,6 +115,7 @@ test('codex-notify POSTs the event to the url argv (and still writes files)', as
     assert.strictEqual(got[0].body.session, 'bc-x4');
     assert.strictEqual(got[0].body.session_id, '019f49a7-81f4-7ad3-822d-3acf8cf81ed6');
     assert.strictEqual(got[0].body.event, 'turn-end');
+    assert.strictEqual(got[0].body.text, 'PONG', 'the server reads body.text for the stall alert');
     assert.ok(fs.existsSync(path.join(dir, 'bc-x4.turnend.jsonl')), 'marker file written too');
   } finally {
     server.close();
@@ -127,6 +129,20 @@ test('codex-notify survives an unreachable callback url (files written, exit 0)'
     await runRelay([dir, 'bc-x5', 'http://127.0.0.1:1/nope', payload()]);
     assert.ok(fs.existsSync(path.join(dir, 'bc-x5.turnend.jsonl')));
     assert.ok(fs.existsSync(path.join(dir, 'bc-x5.session-id')));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('codex-notify trims and caps the text, and omits it when codex said nothing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-codex-notify-'));
+  try {
+    await runRelay([dir, 'bc-x6', payload({ 'last-assistant-message': '  ' + 'y'.repeat(400) + '\n' })]);
+    await runRelay([dir, 'bc-x6', payload({ 'last-assistant-message': '   ' })]);
+    await runRelay([dir, 'bc-x6', payload({ 'last-assistant-message': null })]);
+    const evs = fs.readFileSync(path.join(dir, 'bc-x6.turnend.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    assert.strictEqual(evs[0].text, 'y'.repeat(300));
+    assert.ok(!('text' in evs[1]) && !('text' in evs[2]), 'no text key when there is nothing to quote');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

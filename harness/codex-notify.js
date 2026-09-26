@@ -12,7 +12,7 @@
 // It normalizes that payload into the EXACT event shape the claude Stop-hook
 // relay emits, so the server's /api/turn-end and the harness onTurnEnd() tail
 // consume codex turn boundaries unchanged:
-//   { ts, session: <key>, event: 'turn-end', session_id: <thread-id>, cwd, tmux_session }
+//   { ts, session: <key>, event: 'turn-end', session_id: <thread-id>, cwd, tmux_session, text? }
 //
 // It does three things, all best-effort and always exiting 0 fast so it can
 // never wedge the agent:
@@ -66,6 +66,10 @@ async function main() {
     cwd: payload.cwd || null,
     tmux_session: tmuxSession(),
   };
+  // What the agent last said, same rule as the claude relay: the server's
+  // worker-stall alert quotes it, and without it a codex worker stalls silently.
+  const said = payload['last-assistant-message'];
+  if (typeof said === 'string' && said.trim()) event.text = said.trim().slice(0, 300);
 
   try {
     fs.mkdirSync(stateDir, { recursive: true });
