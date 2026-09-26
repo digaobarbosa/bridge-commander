@@ -24,11 +24,6 @@
 
 import { USER, readMarker, unreadCount } from '../state.js';
 
-// Precedence matters and it is not alphabetical: a lieutenant who is both
-// running a worker AND sitting on something unread is one he needs to look at,
-// so wants-you wins. The louder state is never masked by the busier one.
-export const STATES = ['wants-you', 'working', 'idle'];
-
 // Whether the captain has seen the last thing this lieutenant said. The read
 // markers and the unread rule are the flat board's own (state.js), so the room
 // agrees with the board about what is unread rather than inventing a second
@@ -41,7 +36,10 @@ export function unansweredReply(lt, reads) {
   return unreadCount([last], readMarker(reads, 'lieutenant:' + (lt.id || ''))) > 0;
 }
 
-// One lieutenant's state, from the whole payload.
+// One lieutenant's state, from the whole payload. Precedence matters and it is
+// not alphabetical: a lieutenant who is both running a worker AND sitting on
+// something unread is one he needs to look at, so wants-you wins. The louder
+// state is never masked by the busier one.
 export function livenessOf(lt, doc) {
   if (!lt) return 'idle';
   const cards = (doc && doc.cards) || [];

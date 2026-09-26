@@ -11,6 +11,7 @@
 // the poll for a moment after input so the echo does not sit behind the 1s
 // baseline.
 import { card, lieutenant } from './state.js';
+import { api } from './api.js';
 import { ansiToHtml } from './ansi.js';
 import { keyForEvent } from './panekeys.js';
 
@@ -52,19 +53,11 @@ const SEND_TIMEOUT_MS = 5000;
 const JUMPS_QUEUE = new Set(['C-c', 'C-d', 'C-z', 'C-\\']);
 
 let sending = Promise.resolve();
+// api.js turns a 4xx/5xx into a rejection: without the flash a rejected
+// keystroke is preventDefaulted away from the browser and vanishes unseen.
 function post(url, payload) {
-  return fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
-  }).then((r) => {
-    // A 4xx/5xx is a RESOLVED fetch, so .catch() never sees it: without this a
-    // rejected keystroke is preventDefaulted away from the browser and then
-    // vanishes with no trace anywhere.
-    if (!r.ok) return r.json().catch(() => ({})).then((b) => { throw new Error(b.error || 'HTTP ' + r.status); });
-    return null;
-  }).catch((e) => { flash(String((e && e.message) || e)); });
+  return api.paneInput(url, payload, SEND_TIMEOUT_MS)
+    .then(() => null, (e) => { flash(String((e && e.message) || e)); });
 }
 function sendInput(payload) {
   if (!inputUrl) return;

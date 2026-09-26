@@ -13,12 +13,12 @@ let total = 0;        // server-side record count
 let loaded = false;
 let loading = false;
 
-export function ensureArchive() { if (!loaded && !loading) fetch(PAGE, true); }
-export function loadMore() { if (!loading) fetch(PAGE, false); }
+export function ensureArchive() { if (!loaded && !loading) loadPage(PAGE, true); }
+export function loadMore() { if (!loading) loadPage(PAGE, false); }
 // resync everything already on screen (after a restore): one fetch of the
 // same window size, so the row count doesn't jump back to one page
-function refetch() { fetch(Math.max(PAGE, recs.length), true); }
-function fetch(limit, reset) {
+function refetch() { loadPage(Math.max(PAGE, recs.length), true); }
+function loadPage(limit, reset) {
   loading = true;
   api.archive(limit, reset ? 0 : recs.length)
     .then((r) => {

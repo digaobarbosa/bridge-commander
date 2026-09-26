@@ -41,6 +41,7 @@ import { Target } from './hover.js';
 import * as talk from './talk.js';
 import { USER } from '../state.js';
 import { hhmm } from '../util.js';
+import { api } from '../api.js';
 
 const D = W.PANEL.distM;
 
@@ -326,12 +327,7 @@ export class ChatPanel extends Panel {
     // half a second later reads as a dropped keystroke.
     this.field.setValue('');
     try {
-      const r = await fetch('/api/feedback', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ target: this.target, text }),
-      });
-      if (!r.ok) throw new Error(await r.text());
+      await api.feedback(this.target, text);
       // Shown immediately, before the next pushed board brings it back — a
       // message that takes a beat to appear feels broken even
       // when it is not.
