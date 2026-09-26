@@ -7,7 +7,7 @@ import { trackEvents, trackPermissions, renderNotifSettings } from './notifysett
 import { renderPermTray } from './permtray.js';
 import { docPermissions } from './perms.js';
 import { onOpenCard as toastOnOpenCard, onOpenLieutenant as toastOnOpenLieutenant } from './toast.js';
-import { renderBoard, newCardOpen, closeNewCard, newLieutenantOpen, closeNewLieutenant, closeMoveMenu } from './board.js';
+import { renderBoard, newCardOpen, closeNewCard, newLieutenantOpen, closeNewLieutenant } from './board.js';
 import { renderTable } from './table.js';
 import { renderBulkBar } from './bulk.js';
 import { selectionOn, exitSelection } from './selection.js';
@@ -16,16 +16,18 @@ import { renderFilterUI, filterPanelOpen, closeFilterPanel } from './filterpop.j
 import { renderChat, onOpenCard as chatOnOpenCard, openCardConversation, openLieutenantChat, onQuoteSource } from './chat.js';
 import { onModeSwitch, forgetFile, fileOpen, fileName, fileQuote } from './filepane.js';
 import { renderLtSwitcher, ltSwitcherOpen, closeLtSwitcher, ltSettingsOpen, closeLtSettings } from './ltswitcher.js';
-import { renderDetail, openDetail, closeDetail, detailOpen, auxDetailKey, closeArtifact, artifactOpen, onArtifactClose, closeOwnerMenu, ownerMenuOpen, closePlaybookMenu, playbookMenuOpen, artifactWritten } from './detail.js';
+import { renderDetail, openDetail, closeDetail, detailOpen, auxDetailKey, closeArtifact, artifactOpen, onArtifactClose, artifactWritten } from './detail.js';
+import { openPopover, closePopover, closeTopPopover } from './popover.js';
+import { MODE_BTN, SCREENS, boardModeFor, switcherModeFor } from './modes.js';
 import { closePane, paneOpen } from './pane.js';
 import { openMonitor, closeMonitor, monitorOpen } from './monitor.js';
 import { closeLog, logOpen } from './logview.js';
 import { renderNotifications, onOpenCard as notifOnOpenCard } from './notify.js';
 import { renderLabelManager, renderPicker, pickerIsOpen, closeLabelPicker } from './labels.js';
-import { renderPlaybooks } from './pbmanager.js';
-import { renderProjects } from './projmanager.js';
-import { renderLieutenants } from './ltmanager.js';
-import { renderAutomation } from './automation.js';
+import { renderPlaybooks, initPlaybooks } from './pbmanager.js';
+import { renderProjects, initProjects } from './projmanager.js';
+import { renderLieutenants, initLieutenants } from './ltmanager.js';
+import { renderAutomation, initAutomation } from './automation.js';
 import './resize.js'; // draggable side-panel widths
 import './keepalivesettings.js'; // the pocket switch: hold the audio session open
 
@@ -103,6 +105,17 @@ document.getElementById('config-open').onclick = () => {
   setBoardMode('settings');
 };
 
+// ---------- the list panels ----------
+// They look nothing up at import — each is handed its elements here, once — so
+// a module can be loaded without the page it paints into.
+{
+  const $ = (id) => document.getElementById(id);
+  initPlaybooks({ list: $('pb-list'), dir: $('pb-dir'), ref: $('pb-ref') });
+  initProjects({ list: $('pj-list') });
+  initLieutenants({ list: $('lt-list') });
+  initAutomation();
+}
+
 // ---------- config screen tabs ----------
 // One tab per section, one section visible. The tab is a class toggle over
 // [data-sec] plus one variable — nothing is persisted, so entering from the
@@ -129,15 +142,7 @@ for (const b of document.querySelectorAll('#ss-tabs button')) {
   b.onclick = () => setWsTab(b.dataset.tab);
 }
 // ---- board region mode: kanban ⇄ table ⇄ archived ⇄ automation ⇄ file ⇄ settings ----
-// Board and table are two views over the LIVE cards; 🧊 is the archived
-// snapshots' own read-only mode; ⚡ is the clock and the scripts it fires, which
-// is watched rather than configured and so is a mode rather than a config tab.
-// Those four are the switcher, and the choice sticks per browser.
-// 'file' and 'settings' are the screens: not in the switcher (you enter them by
-// opening a file, or from the gear), and never remembered — MODE_BTN is the
-// whole rule, so a reload comes back to the last switcher mode.
-const MODE_BTN = { board: 'vs-board', table: 'vs-table', archive: 'vs-arch', auto: 'vs-auto' };
-const SCREENS = ['file', 'settings'];
+// Which modes exist and which are remembered is modes.js; this is the wiring.
 // Entering ⚡ is a fresh look at the clock, not last visit's answer — the same
 // contract setWsTab gives a config section. The render loop below hands this to
 // renderAutomation once and clears it, so the board events that follow repaint
@@ -148,7 +153,7 @@ function setBoardMode(mode) {
   // The ⚡ screen's panel belongs to that screen: leaving the mode takes it with
   // us rather than leaving a schedule floating over the kanban.
   if (mode !== S.boardMode && auxDetailKey()) closeDetail();
-  if (!MODE_BTN[mode] && !SCREENS.includes(mode)) mode = 'board';
+  mode = boardModeFor(mode);
   if (mode !== 'file') forgetFile(); // anything else leaves the file screen
   S.boardMode = mode;
   if (MODE_BTN[mode]) try { localStorage.setItem('bc-board-mode', mode); } catch (e) {}
@@ -169,7 +174,7 @@ function setBoardMode(mode) {
 function lastSwitcherMode() {
   let m = null;
   try { m = localStorage.getItem('bc-board-mode'); } catch (e) {}
-  return MODE_BTN[m] ? m : 'board';
+  return switcherModeFor(m);
 }
 function leaveScreen() { setBoardMode(lastSwitcherMode()); }
 // On a phone the board tab IS the main area, so tapping it while that area
@@ -187,31 +192,18 @@ onQuoteSource(fileQuote);     // …and is where every message's file context co
 // opens a small dropdown of the four modes. Desktop shows all four buttons,
 // where clicking the active one was always a no-op — so the dropdown branch
 // can never fire there.
-const modeMenuEl = document.getElementById('mode-menu');
 const MODE_LABEL = { board: '▦ kanban', table: '☰ table', archive: '🧊 archived', auto: '⚡ automation' };
-function modeMenuIsOpen() { return !modeMenuEl.hidden; }
-function closeModeMenu() { modeMenuEl.hidden = true; }
 function openModeMenu(anchor) {
-  modeMenuEl.textContent = '';
-  for (const m of Object.keys(MODE_BTN)) {
-    const b = document.createElement('button');
-    b.textContent = (m === S.boardMode ? '● ' : '') + MODE_LABEL[m];
-    if (m === S.boardMode) b.className = 'cur';
-    b.onclick = () => { closeModeMenu(); setBoardMode(m); };
-    modeMenuEl.appendChild(b);
-  }
-  modeMenuEl.hidden = false;
-  const ar = anchor.getBoundingClientRect(), r = modeMenuEl.getBoundingClientRect();
-  modeMenuEl.style.left = Math.max(8, Math.min(ar.right - r.width, window.innerWidth - r.width - 8)) + 'px';
-  modeMenuEl.style.top = Math.min(ar.bottom + 6, window.innerHeight - r.height - 8) + 'px';
+  openPopover(anchor, Object.keys(MODE_BTN).map((m) => ({
+    label: (m === S.boardMode ? '● ' : '') + MODE_LABEL[m],
+    current: m === S.boardMode,
+    onClick: () => setBoardMode(m),
+  })), { id: 'mode-menu', align: 'right' });
 }
-document.addEventListener('click', (e) => { if (modeMenuIsOpen() && !modeMenuEl.contains(e.target)) closeModeMenu(); });
 for (const [m, id] of Object.entries(MODE_BTN)) {
   document.getElementById(id).onclick = (e) => {
     if (m === S.boardMode && matchMedia('(max-width: 760px)').matches) {
-      e.stopPropagation(); // keep the document click-away handler out of this tap
-      if (modeMenuIsOpen()) closeModeMenu();
-      else openModeMenu(e.currentTarget);
+      if (!closePopover('mode-menu')) openModeMenu(e.currentTarget);
     } else setBoardMode(m);
   };
 }
@@ -257,6 +249,7 @@ document.addEventListener('keydown', (e) => {
   // instead (✕, or click outside).
   if (e.key === 'Escape') {
     if (artifactOpen()) closeArtifact();
+    else if (closeTopPopover()) return; // just the menu — what it opened over stays
     else if (logOpen()) closeLog();
     else if (paneOpen()) closePane();
     else if (monitorOpen()) closeMonitor();
@@ -264,18 +257,14 @@ document.addEventListener('keydown', (e) => {
     else if (newLieutenantOpen()) closeNewLieutenant();
     else if (ltSettingsOpen()) closeLtSettings();
     else if (pickerIsOpen()) closeLabelPicker();
-    else if (modeMenuIsOpen()) closeModeMenu();
     else if (filterPanelOpen()) closeFilterPanel();
     else if (ltSwitcherOpen()) closeLtSwitcher();
-    else if (ownerMenuOpen()) closeOwnerMenu(); // just the menu — keep the detail open
-    else if (playbookMenuOpen()) closePlaybookMenu();
     else if (S.notifOpen) { S.notifOpen = false; render(); }
     else if (selectionOn()) { exitSelection(); render(); } // leave selection mode
     else if (!spEl.hidden) { spEl.hidden = true; gearBtn.classList.remove('on'); }
     else if (detailOpen()) closeDetail();
     else if (searchModeOn()) topbarEl.classList.remove('searching'); // collapse first, filters survive
     else if (filtersActive()) { clearFilters(); syncFilterInputs(); }
-    closeMoveMenu();
   }
 });
 

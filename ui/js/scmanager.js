@@ -28,21 +28,22 @@
 // off hookruns.jsonl, filtered to this schedule's trigger server-side, so the
 // screen and the CLI read one truth.
 import { api } from './api.js';
-import { hhmm } from './util.js';
+import { hhmm, runOutcome } from './util.js';
 import { openAuxDetail, auxDetailKey, repaintAuxDetail, closeDetail } from './detail.js';
 import { openLog } from './logview.js';
+import { listSection, paintCards, rankSort, tally } from './listpanel.js';
+import { scheduleView, scheduleBad, scheduleRank, scheduleCountText, outcomeClass, until } from './panelviews.js';
 
-const listEl = document.getElementById('sc-list');
-const countEl = document.getElementById('sc-count');
-const noteEl = document.getElementById('sc-note');
-const addEl = document.getElementById('sc-add');
-const formEl = document.getElementById('sc-form');
-const nameEl = document.getElementById('sc-name');
-const hookEl = document.getElementById('sc-hook');
-const whenEl = document.getElementById('sc-when');
-const ownerEl = document.getElementById('sc-owner');
-const overlapEl = document.getElementById('sc-overlap');
-const catchupEl = document.getElementById('sc-catchup');
+let listEl, countEl, noteEl, addEl, formEl, nameEl, hookEl, whenEl, ownerEl, overlapEl, catchupEl;
+/** Hand the column its elements — the list, count, note and the add form's fields — and wire the form. */
+export function initSchedules(els) {
+  ({ list: listEl, count: countEl, note: noteEl, add: addEl, form: formEl, name: nameEl, hook: hookEl,
+    when: whenEl, owner: ownerEl, overlap: overlapEl, catchup: catchupEl } = els);
+  // Opening the form is the moment its pickers have to be right — a hook dropped
+  // in a minute ago belongs on the list he is about to choose from.
+  addEl.ontoggle = () => { if (addEl.open) loadPickers(); };
+  formEl.onsubmit = submit;
+}
 
 // The one place the note is written, so a refusal always reads like one: every
 // failure here leads with a ⚠, and that is what colours it. A refusal in the
@@ -53,17 +54,14 @@ function say(text) {
 }
 
 let items = null; // the last GET /api/schedules answer
-let loading = false;
-let stale = false; // a render arrived while a read was in flight
 // The schedule showing in the detail panel, and its firings as last read. One
 // at a time, because the panel holds one subject at a time.
 let openName = '';
 const runs = new Map(); // name -> its firings, as last read
 const busy = new Set(); // names with a press still in flight — state, not a mutated button
 
-// The hook name jumps to that hook's row on the hooks tab. main.js owns the tab
-// switching, so it hands the action down here rather than this module reaching
-// up for it — the same shape filepane uses for onModeSwitch.
+// The hook name jumps to that hook's card. automation.js hands the action down
+// rather than this module reaching for it — the shape filepane's onModeSwitch uses.
 let openHookFn = null;
 export function onOpenHook(fn) { openHookFn = fn; }
 
@@ -76,280 +74,60 @@ export function focusSchedule(name) {
   renderSchedules();
 }
 
-// What the masthead counts. `bad` is the number this screen exists for: a
-// schedule that fires nothing, or whose last firing did not come back clean. A
-// skip is neither — it is the overlap policy doing its job.
-export function scheduleCounts() {
-  const list = items || [];
-  return { total: list.length, bad: list.filter(isBad).length };
-}
-function isBad(s) { return !!s.problem || !!(s.last && !s.last.skipped && !s.last.ok); }
+/** What the masthead counts: {total, bad}. */
+export function scheduleCounts() { return tally(items, scheduleBad); }
 
-// The other half of the one-story rule: a hook card says which schedules fire
-// it, and reads that off the answer this module already holds.
+/** The names of the schedules that fire `hook`, off the answer this module already holds. */
 export function schedulesForHook(hook) {
   return (items || []).filter((s) => s.hook === hook).map((s) => s.name);
 }
 
-// Same contract as its neighbours: `reload` is what the tab passes on the way
-// in. Every render ASKS, though, not just the entering one — a schedule fires,
-// is paused from the CLI, or has its hook deleted out from under it, and the
-// board event that brought us here is the only nudge this tab gets. Which is
-// also why there is no polling: nothing runs while another tab is up.
-export async function renderSchedules(reload) {
-  if (reload) { say(''); focus = ''; } // entering is a fresh look, not last visit's answer
-  if (loading) { stale = true; return; } // the read in flight answers for both askers
-  loading = true;
-  try {
-    do {
-      stale = false;
-      items = (await api.schedules()).schedules || [];
-      // Only the schedule in the panel is re-read — its firings must not go on
-      // saying a firing ago is the newest one, and a panel nobody opened costs
-      // nothing.
-      if (openName) {
-        try { runs.set(openName, (await api.schedule(openName)).runs || []); }
-        catch (e) { runs.delete(openName); shutPanel(); }
-      }
-    } while (stale);
-  } catch (e) {
-    // A read that failed says so where a press says so — blanking a list that is
-    // still true on screen would be the worse lie.
-    if (items) say('⚠ ' + e.message);
-    else listEl.textContent = '⚠ ' + e.message;
-    return;
-  } finally { loading = false; }
-  if (reload) loadPickers();
-  // A schedule removed from under an open panel takes the panel with it — the
-  // ✕ on this screen and one typed at a terminal are the same removal.
-  if (openName && !items.some((s) => s.name === openName)) shutPanel();
-  paint();
-  repaintAuxDetail(); // the firings just re-read are what the panel is showing
+// Every render ASKS, not just the entering one — a schedule fires, is paused
+// from the CLI, or has its hook deleted, and the board event is this column's
+// only nudge. So there is no polling either.
+const section = listSection({
+  live: true,
+  load: async () => {
+    items = (await api.schedules()).schedules || [];
+    // Only the schedule in the panel is re-read — its firings must not go on
+    // saying a firing ago is the newest one, and a panel nobody opened costs
+    // nothing.
+    if (openName) {
+      try { runs.set(openName, (await api.schedule(openName)).runs || []); }
+      catch (e) { runs.delete(openName); shutPanel(); }
+    }
+  },
+  paint: () => {
+    // A schedule removed from under an open panel takes the panel with it — the
+    // ✕ on this screen and one typed at a terminal are the same removal.
+    if (openName && !items.some((s) => s.name === openName)) shutPanel();
+    paint();
+    repaintAuxDetail(); // the firings just re-read are what the panel is showing
+  },
+  fail: (e, had) => { if (had) say('⚠ ' + e.message); else listEl.textContent = '⚠ ' + e.message; },
+});
+
+/** Read and repaint the column; `reload` is what ENTERING the mode passes. */
+export function renderSchedules(reload) {
+  if (reload) { say(''); focus = ''; loadPickers(); } // entering is a fresh look, not last visit's answer
+  return section(reload);
 }
 
 function paint() {
   if (!items) return;
-  listEl.textContent = '';
-  let marked = null;
-  for (const s of ordered()) {
-    const el = row(s);
-    if (s.name === focus) marked = el;
-    listEl.appendChild(el);
-  }
-  if (!items.length) listEl.append(empty('no schedules — the board keeps no clock yet'));
-  countEl.textContent = items.length ? countText(items) : '';
-  if (marked) marked.scrollIntoView({ block: 'nearest' });
+  const views = rankSort(items, scheduleRank).map((s) =>
+    scheduleView(s, { busy: busy.has(s.name), focus, open: s.name === openName }));
+  paintCards(listEl, views, press, 'no schedules — the board keeps no clock yet');
+  countEl.textContent = items.length ? scheduleCountText(items) : '';
 }
 
-// Broken first, paused next, working last — a red card below the fold is a red
-// card he does not see, and this screen is opened BECAUSE something went red.
-// Stable within a rank, so the server's order survives and nothing shuffles
-// under a finger while everything is green.
-function ordered() {
-  const rank = (s) => (isBad(s) ? 0 : s.paused ? 1 : 2);
-  return items.map((s, i) => [s, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1])
-    .map(([s]) => s);
-}
-
-function countText(list) {
-  const bad = list.filter(isBad).length;
-  const off = list.filter((s) => !isBad(s) && s.paused).length;
-  const parts = [list.length + ' total'];
-  if (bad) parts.push(bad + ' failing');
-  if (off) parts.push(off + ' paused');
-  return parts.join(' · ');
-}
-
-function empty(text) {
-  const el = document.createElement('div');
-  el.className = 'au-empty';
-  el.textContent = text;
-  return el;
-}
-
-function row(s) {
-  const el = document.createElement('div');
-  // One class for "this one is red", whichever way it went red: a `problem`
-  // (fires nothing, forever) and a last firing that came back non-zero are the
-  // same news to him, and a rail that only lit for one of them would teach him
-  // the other is fine.
-  el.className = 'sc-row' + (isBad(s) ? ' au-bad' : '') + (s.paused ? ' sc-off' : '')
-    + (s.name === focus ? ' au-focus' : '') + (s.name === openName ? ' au-open' : '');
-  el.append(head(s), stats(s));
-  // In full and above the fold: a problem is the reason to look at this tab, so
-  // it is not a title attribute and it is not truncated.
-  if (s.problem) el.append(problem(s));
-  return el;
-}
-
-function head(s) {
-  const el = document.createElement('div');
-  el.className = 'sc-head';
-  el.title = s.name === openName ? 'close the firings panel' : 'the recent firings, in the panel';
-  el.onclick = () => toggle(s);
-  const caret = document.createElement('span');
-  caret.className = 'au-caret';
-  // ▸ / ▾ still means "this one is showing" — it just shows to the side now, so
-  // pressing a card never grows the column under his finger.
-  caret.textContent = s.name === openName ? '▾' : '▸';
-  const nm = document.createElement('span');
-  nm.className = 'sc-name';
-  nm.textContent = s.name;
-  el.append(caret, nm, hookLink(s));
-  // Paused is a state, not a shade: a greyed row and a row on a dim screen look
-  // the same, and "why did this stop firing" is the question the tab answers.
-  if (s.paused) {
-    const chip = document.createElement('span');
-    chip.className = 'sc-chip';
-    chip.textContent = 'PAUSED';
-    chip.title = 'this schedule fires nothing until it is resumed';
-    el.append(chip);
-  }
-  el.append(acts(s));
-  return el;
-}
-
-// The hint is OURS, not the browser's: a native title is drawn wherever the
-// pointer happens to be, and on this pill that is on top of the schedule's own
-// name — the one word the card exists to say. `data-tip` renders it under the
-// head row instead, where it covers nothing.
-function hookLink(s) {
-  const b = document.createElement('button');
-  b.type = 'button';
-  b.className = 'sc-hook';
-  b.textContent = '→ ' + s.hook;
-  b.setAttribute('aria-label', 'the hook this fires: ' + s.hook);
-  b.title = ''; // empty, not absent: it stops the head's own title firing here
-  b.onclick = (e) => { e.stopPropagation(); if (openHookFn) openHookFn(s.hook); };
-  // The pill itself clips its text to an ellipsis, so the hint hangs off a
-  // wrapper — inside the pill it would be clipped away with the overflow.
-  const wrap = document.createElement('span');
-  wrap.className = 'sc-hook-wrap';
-  wrap.setAttribute('data-tip', 'the hook this fires — show it on the hooks list');
-  wrap.append(b);
-  return wrap;
-}
-
-function acts(s) {
-  const el = document.createElement('span');
-  el.className = 'sc-acts';
-  el.onclick = (e) => e.stopPropagation(); // the head toggles the firings; these do not
-  const b = busy.has(s.name);
-  // '‖' rather than the pause pictograph: U+23F8 has no glyph in the fonts this
-  // board ships with and renders as a box, which is not a button anyone presses.
-  el.append(
-    act(b ? '…' : s.paused ? '▶' : '‖', b,
-      s.paused ? 'resume — the cursor re-arms at now, so it wakes up owing no windows'
-        : 'pause — it fires nothing until resumed',
-      () => setPaused(s, !s.paused)),
-    act('✕', b, 'remove this schedule — the hook itself survives', () => remove(s)),
-  );
-  return el;
-}
-
-function act(label, disabled, title, onClick) {
-  const b = document.createElement('button');
-  b.type = 'button';
-  b.className = 'au-act';
-  b.textContent = label;
-  b.title = title;
-  b.disabled = disabled;
-  b.onclick = onClick;
-  return b;
-}
-
-// ---------- the words, exactly the ones `schedule list` says ----------
-// A screen and a CLI describing the same clock in two vocabularies is two
-// things to learn, so these are the CLI's own phrasings.
-
-// 'in 3m' — how far off the next fire is.
-function until(iso) {
-  const t = Date.parse(iso || '');
-  if (!t) return 'never';
-  const s = Math.round((t - Date.now()) / 1000);
-  if (s <= 0) return 'due now';
-  if (s < 60) return 'in ' + s + 's';
-  if (s < 3600) return 'in ' + Math.round(s / 60) + 'm';
-  if (s < 86400) return 'in ' + Math.round(s / 3600) + 'h';
-  return 'in ' + Math.round(s / 86400) + 'd';
-}
-
-// 'now' is not a thing a past event is, so the smallest unit here is seconds —
-// util's ago() rounds the first minute to "now", which would read "fired now".
-function since(iso) {
-  const t = Date.parse(iso || '');
-  if (!t) return '';
-  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
-  if (s < 60) return s + 's ago';
-  if (s < 3600) return Math.round(s / 60) + 'm ago';
-  if (s < 86400) return Math.round(s / 3600) + 'h ago';
-  return Math.round(s / 86400) + 'd ago';
-}
-
-function howRunEnded(r) {
-  return r.skipped ? 'skipped' : r.timedOut ? 'timed out' : r.error ? 'failed to start'
-    : r.canceled ? 'restarted mid-run' : r.code === null ? 'killed' : 'exit ' + r.code;
-}
-
-// A SKIP is a firing too — that is the whole point of recording it — so it reads
-// as one rather than as silence.
-function fireOutcome(r) {
-  if (!r) return 'never fired';
-  if (r.skipped) return 'skipped ' + since(r.started) + ' (previous firing still going)';
-  return 'fired ' + since(r.started) + ' · ' + howRunEnded(r);
-}
-
-function outcomeClass(r) {
-  if (!r) return 'sc-never';
-  return r.skipped ? 'sc-skip' : r.ok ? 'sc-ok' : 'sc-bad';
-}
-
-// The four facts a schedule IS, each under its own caption: when it fires, how
-// long until the next one, how the last one ended, and who a failure wakes. The
-// tab this replaced ran them together as one dim line — six facts in 11px grey,
-// which is how a screen says nothing on it matters.
-//
-// The last fire keeps a colour of its own, because a red one has to be what the
-// eye lands on.
-function stats(s) {
-  const el = document.createElement('div');
-  el.className = 'au-stats';
-  el.append(
-    stat('when', s.describe),
-    stat('next fire', nextText(s), s.paused || s.problem ? 'au-off' : 'sc-next'),
-    stat('last fire', fireOutcome(s.last), outcomeClass(s.last)),
-    stat('owner', s.owner, 'au-who'),
-  );
-  return el;
-}
-
-// A schedule with a problem has a next window and will not take it — the tick
-// refuses to fire it — so "in 4m" would be the plausible-looking lie the problem
-// is there to replace. Paused is the same shape of not-coming.
-function nextText(s) {
-  return s.paused ? 'paused' : s.problem ? 'fires nothing' : until(s.next);
-}
-
-// caption over value. The caption is what lets the value be a bare "in 3m"
-// rather than "next fire: in 3m" on every card.
-function stat(cap, value, cls) {
-  const el = document.createElement('div');
-  el.className = 'au-stat';
-  const c = document.createElement('div');
-  c.className = 'au-cap';
-  c.textContent = cap;
-  const v = document.createElement('div');
-  v.className = 'au-val' + (cls ? ' ' + cls : '');
-  v.textContent = value;
-  el.append(c, v);
-  return el;
-}
-
-function problem(s) {
-  const el = document.createElement('div');
-  el.className = 'sc-problem';
-  el.textContent = '⚠ ' + s.problem;
-  return el;
+function press(b, v) {
+  const s = items.find((x) => x.name === v.name);
+  if (!s) return;
+  if (b.key === 'toggle') toggle(s);
+  else if (b.key === 'hook' && openHookFn) openHookFn(s.hook);
+  else if (b.key === 'pause') setPaused(s, !s.paused);
+  else if (b.key === 'remove') remove(s);
 }
 
 // ---------- the firings, in the board's own detail panel ----------
@@ -376,7 +154,7 @@ function paintFirings(el, name) {
   const list = runs.get(name);
   // Signature, not a blind rebuild: the panel repaints on every board event and
   // a rebuild under a finger would drop the press that is landing on it.
-  const sig = name + '\n' + (list ? list.map((r) => r.started + '|' + r.ms + '|' + howRunEnded(r)).join('\n') : '…');
+  const sig = name + '\n' + (list ? list.map((r) => r.started + '|' + r.ms + '|' + runOutcome(r)).join('\n') : '…');
   if (el.__bcSig === sig) return;
   el.__bcSig = sig;
   el.textContent = '';
@@ -410,7 +188,7 @@ function firingLine(name, r) {
   when.textContent = hhmm(r.started);
   const how = document.createElement('span');
   how.className = 'dt-run-how ' + outcomeClass(r);
-  how.textContent = howRunEnded(r);
+  how.textContent = runOutcome(r);
   const ms = document.createElement('span');
   ms.className = 'dt-run-ms';
   ms.textContent = r.ms + 'ms';
@@ -518,11 +296,7 @@ function fill(sel, values, empty) {
   if (values.includes(had)) sel.value = had;
 }
 
-// Opening the form is the moment its pickers have to be right — a hook dropped
-// in a minute ago belongs on the list he is about to choose from.
-addEl.ontoggle = () => { if (addEl.open) loadPickers(); };
-
-formEl.onsubmit = async (e) => {
+async function submit(e) {
   e.preventDefault();
   say('');
   try {
@@ -541,4 +315,4 @@ formEl.onsubmit = async (e) => {
     // parse, which hook is not there — and "invalid" would throw all of it away.
     say('⚠ ' + err.message);
   }
-};
+}

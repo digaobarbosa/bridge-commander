@@ -10,12 +10,12 @@ import { esc, setHtmlIfChanged, ctxBarHtml, owedIndHtml } from './util.js';
 import { avatarHtml, avatarGridHtml, wireAvatarGrid } from './avatars.js';
 import { openLieutenantChat } from './chat.js';
 import { openLieutenantPane } from './pane.js';
-import { openNewLieutenant, closeMoveMenu } from './board.js';
+import { openNewLieutenant } from './board.js';
 import { voiceOptions } from './voice.js';
+import { openPopover } from './popover.js';
 
 const trigEl = document.getElementById('chat-lt');
 const panelEl = document.getElementById('lt-switcher');
-const menuEl = document.getElementById('move-menu'); // shared with the board's move menu
 
 let open = false;
 // The row order, in ids, captured when the panel opens and FROZEN while it
@@ -49,8 +49,6 @@ headPeekEl.onclick = () => {
   if (id) { closeLtSwitcher(); openLieutenantPane(id); }
 };
 headMenuEl.onclick = (e) => {
-  // stop before the board's document closer would dismiss the menu we just opened
-  e.stopPropagation();
   const id = currentLtId();
   if (id) { closeLtSwitcher(); openLtMenu(id, e.clientX, e.clientY); }
 };
@@ -114,8 +112,6 @@ panelEl.addEventListener('click', (e) => {
   if (!row) return;
   const id = row.dataset.id;
   if (e.target.closest('.lts-menu')) {
-    // stop before board.js's document closer would dismiss the menu we just opened
-    e.stopPropagation();
     closeLtSwitcher();
     openLtMenu(id, e.clientX, e.clientY);
     return;
@@ -127,39 +123,28 @@ panelEl.addEventListener('click', (e) => {
 
 // lieutenant ⋯ menu — lieutenant.retire lives here (explicit only, per the DNA:
 // the server refuses while the lieutenant still owns non-archived cards).
-// Shares the #move-menu element, so the board's outside-click closer covers it.
+// It takes the move menu's id: one card-or-lieutenant action menu at a time.
 function openLtMenu(ltId, x, y) {
   const l = lieutenant(ltId);
   if (!l) return;
-  menuEl.textContent = '';
-  const head = document.createElement('div');
-  head.className = 'mm-head';
-  head.textContent = l.name || ltId;
-  menuEl.appendChild(head);
-  const settings = document.createElement('button');
-  settings.textContent = '⚙ settings';
-  settings.onclick = (e) => { e.stopPropagation(); closeMoveMenu(); openLtSettings(ltId); };
-  menuEl.appendChild(settings);
   const owned = cards().filter((c) => c.owner === ltId).length;
-  const retire = document.createElement('button');
-  retire.className = 'danger';
-  retire.textContent = '⚓ retire' + (owned ? ' (' + owned + ' card' + (owned > 1 ? 's' : '') + ' in the way)' : '');
-  retire.onclick = async () => {
-    closeMoveMenu();
-    if (!confirm('Retire ' + (l.name || ltId) + '? Its live session is killed and its queue removed;'
-      + ' its memory file in the workspace is kept.')) return;
-    // A later lieutenant on this same id is launched on that charter — a choice
-    // the captain should make with the path in front of them, not a surprise.
-    try {
-      const r = await api.retireLieutenant(ltId);
-      if (r && r.memory) alert('Memory file kept: ' + r.memory + '\nA new lieutenant with id ' + ltId + ' would be launched on it.');
-    } catch (e) { alert(e.message); }
-  };
-  menuEl.appendChild(retire);
-  menuEl.hidden = false;
-  const r = menuEl.getBoundingClientRect();
-  menuEl.style.left = Math.max(8, Math.min(x, window.innerWidth - r.width - 8)) + 'px';
-  menuEl.style.top = Math.max(8, Math.min(y, window.innerHeight - r.height - 8)) + 'px';
+  openPopover({ x, y }, [
+    { head: l.name || ltId },
+    { label: '⚙ settings', onClick: () => openLtSettings(ltId) },
+    { label: '⚓ retire' + (owned ? ' (' + owned + ' card' + (owned > 1 ? 's' : '') + ' in the way)' : ''),
+      danger: true, onClick: () => retire(l) },
+  ], { id: 'move-menu' });
+}
+async function retire(l) {
+  const ltId = l.id;
+  if (!confirm('Retire ' + (l.name || ltId) + '? Its live session is killed and its queue removed;'
+    + ' its memory file in the workspace is kept.')) return;
+  // A later lieutenant on this same id is launched on that charter — a choice
+  // the captain should make with the path in front of them, not a surprise.
+  try {
+    const r = await api.retireLieutenant(ltId);
+    if (r && r.memory) alert('Memory file kept: ' + r.memory + '\nA new lieutenant with id ' + ltId + ' would be launched on it.');
+  } catch (e) { alert(e.message); }
 }
 
 // ---------- lieutenant settings modal (⋯ → settings) ----------
