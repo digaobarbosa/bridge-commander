@@ -222,9 +222,10 @@ function createWorkers(deps) {
   // server never builds a harness file path. A harness without it (or one that
   // cannot answer) simply attaches nothing.
   async function briefOf(ref) {
-    const impl = deps.harnessFor(ref);
-    if (typeof impl.brief !== 'function') return null;
-    try { return (await impl.brief(ref)) || null; } catch (e) { return null; }
+    try {
+      const impl = deps.harnessFor(ref);
+      return typeof impl.brief === 'function' ? (await impl.brief(ref)) || null : null;
+    } catch (e) { return null; }
   }
   // Attached once: a resume never regenerates the brief, so the uri dedup
   // keeps this idempotent.

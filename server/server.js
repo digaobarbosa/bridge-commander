@@ -1195,7 +1195,7 @@ function resolvePaneRef(kind, id, want) {
   return { ref: lt.ref, reason: '' };
 }
 const panes = new Map(); // paneKey -> { clients: Set<res>, handle, last }
-function paneKey(ref) { return ref.harness + '/' + ref.session + (ref.window ? ':' + ref.window : ''); }
+function paneKey(ref) { return ref.harness + '/' + keyOf(ref); }
 function paneWrite(res, event, data) { res.write(sseFrame(event, data)); }
 function paneStream(req, res, ref, reason) {
   res.writeHead(200, SSE_HEADERS);
