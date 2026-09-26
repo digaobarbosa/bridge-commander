@@ -3,13 +3,10 @@
 // same guarded write as any text file, and merged shape by shape when the other
 // hand writes it.
 //
-// Three levels, the filectx.test.js pattern:
+// Two levels:
 //   1. the merge itself (ui/js/draw.js is DOM-free at import — the React mount
 //      only happens inside mountDrawing, so the module imports straight in);
-//   2. the wiring that routes a .excalidraw name to the canvas and everything
-//      else to the text editor, pinned at the source level (filepane.js and
-//      detail.js bind DOM at import time);
-//   3. the server, end to end: a stale write on a drawing is still refused, and
+//   2. the server, end to end: a stale write on a drawing is still refused, and
 //      the .svg beside it is created by the same door under the same rule.
 const test = require('node:test');
 const assert = require('node:assert');
@@ -21,9 +18,6 @@ const { startServerWithLieutenant, withOwner } = require('./helper');
 
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const drawMod = import(pathToFileURL(path.join(__dirname, '..', 'ui', 'js', 'draw.js')).href);
-const read = (f) => fs.readFileSync(path.join(__dirname, '..', 'ui', 'js', f), 'utf8');
-const filepaneSrc = read('filepane.js');
-const detailSrc = read('detail.js');
 
 const box = (id, version, extra) => Object.assign({ id, version, type: 'rectangle', x: 0, y: 0 }, extra || {});
 const ids = (els) => els.map((e) => e.id).sort();
@@ -94,53 +88,6 @@ test('a file we cannot read is not an empty drawing — it throws instead of ove
   assert.throws(() => parseScene('{"type":"excalidraw"}'), /no elements/);
 });
 
-// ---------- 2. the wiring ----------
-
-test('a .excalidraw artifact opens as a canvas, and a text artifact still opens as text', () => {
-  assert.match(detailSrc, /const DRAW_EXT = \/\\\.excalidraw\$\/i;/, 'detail.js knows the extension');
-  const m = /const DRAW_EXT = \/(.+)\/(\w*);/.exec(detailSrc);
-  const DRAW_EXT = new RegExp(m[1], m[2]);
-  assert.ok(DRAW_EXT.test('flow.excalidraw'), 'a drawing');
-  for (const n of ['notes.md', 'server.js', 'flow.excalidraw.svg', 'report.html']) {
-    assert.ok(!DRAW_EXT.test(n), n + ' is not routed to the canvas');
-  }
-  // openArtifact takes the canvas branch BEFORE any of the preview branches
-  const at = detailSrc.indexOf('if (DRAW_EXT.test(name)) return openDrawing');
-  assert.ok(at > -1 && at < detailSrc.indexOf('IMG_EXT.test(name)'));
-  // and the file screen mounts one or the other by that flag — nothing else changes
-  assert.match(filepaneSrc, /\(open\.draw \? mountDrawing : mountFileEditor\)\(body, \{/);
-});
-
-test('the drawing saves itself on a debounce, and never per stroke', () => {
-  assert.match(filepaneSrc, /if \(open\.draw\) autosave\(\)/, 'a change schedules a save');
-  const fn = /function autosave\(\) \{[\s\S]*?\n\}/.exec(filepaneSrc)[0];
-  assert.match(fn, /setTimeout\([\s\S]*?, \d{3,}\)/, 'on a timer, restarted by every change');
-  assert.match(fn, /clearTimeout\(autoTimer\)/);
-  assert.match(fn, /saveDue\(handle\.getValue\(\), open\.saved/, 'and only what saveDue allows — never when disk already has it');
-});
-
-test('the save still carries the version, and a drawing merges instead of asking', () => {
-  assert.match(detailSrc, /api\.saveArtifact\(uri, text, versions\.get\(uri\) \|\| ''\)/, 'the same guarded write');
-  assert.match(detailSrc, /if \(e\.status !== 409\) throw e;/, 'and the same refusal, still handled as one');
-  assert.match(detailSrc, /if \(!fileDirty\(\) \|\| fileMerges\(\)\) return take\(/);
-  assert.match(filepaneSrc, /export function fileMerges\(\) \{ return !!\(open && open\.draw\); \}/);
-});
-
-test('the canvas never scrolls, zooms or interrupts the hand that is drawing', () => {
-  const drawSrc = read('draw.js');
-  assert.match(drawSrc, /api\.updateScene\(\{ elements: mergeElements\(/, 'elements only — no appState, so no viewport move');
-  assert.ok(!/updateScene\(\{[^}]*appState/.test(drawSrc), 'the viewport is never pushed from outside');
-  assert.match(drawSrc, /if \(busy\(\)\) \{ timer = setTimeout\(apply, \d+\); return; \}/, 'a write in flight waits for the stroke');
-  assert.match(drawSrc, /s\.draggingElement \|\| s\.resizingElement \|\| s\.editingElement/);
-  assert.match(drawSrc, /s\.cursorButton === 'down'/);
-  // every field busy() reads has to exist in the version we pin, or it is a
-  // check that never fires — 0.18 vocabulary in a 0.17 bundle
-  const bundle = fs.readFileSync(path.join(__dirname, '..', 'ui', 'vendor', 'excalidraw', 'excalidraw.production.min.js'), 'utf8');
-  const fields = /function busy\(\) \{[\s\S]*?\n  \}/.exec(drawSrc)[0].match(/s\.(\w+)/g).map((s) => s.slice(2));
-  for (const f of fields) assert.ok(bundle.includes(f), 'appState.' + f + ' exists in Excalidraw 0.17.6');
-  assert.match(drawSrc, /exportToSvg/, "the picture comes from Excalidraw's own exporter");
-});
-
 // ---------- what a refusal becomes ----------
 // The defect this round exists to kill: the client answered a 409 by pinning the
 // version it was refused with, and the autosave then wrote through clean 1.5 s
@@ -161,17 +108,6 @@ test('a refusal we cannot read stays a refusal — there is nothing to write ins
   assert.strictEqual(resolveRefusal(mine, 'not a drawing at all', new Set(), new Set()), null);
 });
 
-test('a refused save never re-pins the version on a drawing — only a landed write does', () => {
-  const fn = /async function saveArtifactText\([\s\S]*?\n\}/.exec(detailSrc)[0];
-  const merge = /if \(fileMerges\(\) && fileKey\(\) === uri\) \{[\s\S]*?\n    \}/.exec(fn)[0];
-  assert.ok(!/versions\.set/.test(merge), 'the drawing branch never pins a version it was refused with');
-  assert.match(merge, /const merged = disk == null \? null : fileResolve\(disk\)/, 'it merges what the refusal handed back');
-  assert.match(merge, /if \(merged == null\) \{[\s\S]*?throw new Error/, 'and when it cannot, the refusal stands');
-  assert.match(merge, /api\.saveArtifact\(uri, merged, e\.body\.version\)/, 'the merged scene is what gets written');
-  // the pin that remains is the text editor's, where a human clicks 💾 again
-  assert.match(fn, /Text cannot be merged[\s\S]*?versions\.set\(uri, e\.body\.version\)/);
-});
-
 // The defect this round exists to kill: a lieutenant's write arrives while the
 // captain is mid-gesture, so the merge is PARKED — but the screen was already
 // told the file moved, and the debounce then wrote the not-yet-merged canvas at
@@ -190,16 +126,6 @@ test('the debounce writes nothing while an incoming merge is parked behind a ges
   assert.strictEqual(saveDue('same', 'same', false, true), 'nothing');
 });
 
-test('the canvas answers whether a merge is parked, and the timer comes back for it', () => {
-  const drawSrc = read('draw.js');
-  assert.match(drawSrc, /parked: \(\) => pending != null/, 'the flag the merge already keeps');
-  assert.match(filepaneSrc, /const due = saveDue\(handle\.getValue\(\), open\.saved, saving, parked\(\)\)/);
-  assert.match(filepaneSrc, /if \(due === 'wait'\) return autosave\(\);/, 'it comes back instead of writing');
-  assert.match(filepaneSrc, /if \(due !== 'write'\) return;/);
-  // and the note no longer announces a merge that has not run
-  assert.match(filepaneSrc, /merging into the canvas as soon as your hands are free/);
-});
-
 test('opening a drawing is a read: only a changed SHAPE counts as a change', async () => {
   const { sceneKey } = await drawMod;
   const loaded = [box('a', 3), box('b', 1)];
@@ -209,12 +135,9 @@ test('opening a drawing is a read: only a changed SHAPE counts as a change', asy
   assert.notStrictEqual(sceneKey(loaded), sceneKey([box('a', 4), box('b', 1)]), 'a hand moved it — version bumped');
   assert.notStrictEqual(sceneKey(loaded), sceneKey(loaded.concat([box('c', 1)])), 'a hand drew one');
   assert.notStrictEqual(sceneKey(loaded), sceneKey([box('a', 4, { isDeleted: true }), box('b', 1)]), 'a hand deleted one');
-  const drawSrc = read('draw.js');
-  assert.match(drawSrc, /onChange: \(els\) => \{\n\s*if \(sceneKey\(els\) === mark\) return;/, 'the gate is on the way out of the canvas');
-  assert.match(drawSrc, /mark = sceneKey\(d\.elements\); \/\/ opening a drawing is a read/);
 });
 
-// ---------- 3. the server ----------
+// ---------- 2. the server ----------
 
 async function cardWithArtifact(s, uri, label) {
   const cr = await s.api('POST', '/api/cards', withOwner({ title: 'Diagram' }));

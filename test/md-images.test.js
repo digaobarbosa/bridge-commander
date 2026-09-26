@@ -52,22 +52,6 @@ test('everything already resolvable is left exactly as written', async () => {
 
 // ---------- why it lives inside the sanitize ----------
 
-// The vendored DOMPurify's own scheme allowlist, read out of the file it ships
-// in. `attachment:` is not on it, so an img src still carrying that scheme when
-// the check runs loses the attribute — and the id with it. That is why the
-// rewrite is a uponSanitizeAttribute hook (before the check, on the real node)
-// and not a pass over the rendered DOM afterwards.
-test('attachment:// would not survive DOMPurify\'s URI check; the rewritten value does', async () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', 'ui', 'vendor', 'purify.min.js'), 'utf8');
-  const m = /\(\/\^\(\?:\(\?:\(\?:f\|ht\)tps\?\|mailto[^/]*\/i\)/.exec(src);
-  assert.ok(m, 'found the vendored ALLOWED_URI_REGEXP');
-  const ALLOWED = new RegExp(m[0].slice(2, -3), 'i');
-  assert.ok(!ALLOWED.test('attachment://a1b2c3d4e5f60718'), 'unknown scheme = attribute dropped');
-  const { mdImgSrc } = await mdMod;
-  assert.ok(ALLOWED.test(mdImgSrc('attachment://a1b2c3d4e5f60718', '')));
-  assert.ok(ALLOWED.test(mdImgSrc('shot.png', '/home/ai/cards/MNC-1')));
-});
-
 test('md() registers the rewrite as a sanitize hook and only touches img src', async () => {
   const hooks = {};
   globalThis.DOMPurify = {

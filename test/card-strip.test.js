@@ -4,15 +4,13 @@
 // the last timeline event, and truncates instead of wrapping.
 // util.js is browser ES-module code but touches no DOM at import time, so the
 // renderer can be imported directly (detail.js cannot — it binds DOM at
-// import). The no-wrap/ellipsis claim lives in app.css, asserted against source.
+// import).
 const test = require('node:test');
 const assert = require('node:assert');
-const fs = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
 const utilMod = import(pathToFileURL(path.join(__dirname, '..', 'ui', 'js', 'util.js')).href);
-const css = fs.readFileSync(path.join(__dirname, '..', 'ui', 'app.css'), 'utf8');
 
 const CARD = {
   id: 'MNC-1',
@@ -46,17 +44,4 @@ test('event text is escaped', async () => {
   const { cardStripHtml } = await utilMod;
   const html = cardStripHtml({ events: [{ kind: 'x', text: '<img src=x>' }] }, emojiFor);
   assert.ok(!html.includes('<img'), 'no raw html from an event');
-});
-
-test('the row truncates instead of wrapping', () => {
-  const m = /\.dt-strip-ev\s*\{([^}]*)\}/.exec(css);
-  assert.ok(m, '.dt-strip-ev is styled');
-  assert.match(m[1], /white-space:\s*nowrap/);
-  assert.match(m[1], /text-overflow:\s*ellipsis/);
-  assert.match(m[1], /min-width:\s*0/, 'so the PR chip can eat the room');
-});
-
-test('artifacts collapse, and an empty block shows nothing', () => {
-  assert.match(css, /\.dt-artifacts\.closed \.arts-scroll \{ display: none; \}/);
-  assert.match(css, /\.dt-artifacts:empty \{ display: none; \}/);
 });

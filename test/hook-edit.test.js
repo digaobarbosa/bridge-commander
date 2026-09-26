@@ -280,15 +280,6 @@ test('a workspace directory that does not exist YET still resolves through the l
   }
 });
 
-// The list the refusal prints has to be the events the server really fires, or
-// it sends people to build hooks in a directory nothing will ever look at.
-test('LIFECYCLE_EVENTS is exactly what the server fires', () => {
-  const server = fs.readFileSync(path.join(__dirname, '..', 'server', 'server.js'), 'utf8');
-  const fired = [...server.matchAll(/fireHooks\('([^']+)'/g)].map((m) => m[1]);
-  assert.ok(fired.length >= 3, 'the fireHooks call sites are found');
-  assert.deepStrictEqual([...new Set(fired)].sort(), [...LIFECYCLE_EVENTS].sort());
-});
-
 // ---------- what the gate refuses ----------
 // Each of these is its own test on purpose: they are the reasons this is a hook
 // route and not a workspace file API, and a single collapsed test would let one

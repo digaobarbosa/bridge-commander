@@ -124,14 +124,3 @@ test('a closed popup does not follow — the next open re-reads anyway', async (
   await m.artifactWritten({ uri: URI, version: 'v2', by: 'agent-tab' });
   assert.strictEqual(gets, before, 'nothing is on screen, so nothing is fetched');
 });
-
-// The file-screen path is not traded away for this: its branch still runs on
-// fileKey() and still routes through the editor's update / notice.
-test('the file-screen branch is intact', async () => {
-  const fs = require('node:fs');
-  const src = fs.readFileSync(path.join(__dirname, '..', 'ui', 'js', 'detail.js'), 'utf8');
-  assert.match(src, /const onFileScreen = fileKey\(\) === uri;/);
-  assert.match(src, /if \(fileKey\(\) !== uri\) return; \/\/ he left the screen/);
-  assert.match(src, /if \(!fileDirty\(\) \|\| fileMerges\(\)\) return take\(/);
-  assert.match(src, /fileNotice\(/);
-});

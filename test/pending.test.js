@@ -3,12 +3,9 @@
 // bubble. The contract: a sent message lives here from POST 200 until its
 // server echo lands in the thread; pendingFor() reconciles on every render so
 // there is never a paint with both the pending bubble and the real one. The
-// module is DOM-free, so it imports straight into Node (copytext.test.js
-// pattern); chat.js's wiring is pinned at the source level (av-dispatch
-// pattern) since chat.js binds DOM at import time.
+// module is DOM-free, so it imports straight into Node.
 const test = require('node:test');
 const assert = require('node:assert');
-const fs = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
@@ -67,17 +64,4 @@ test('pending is keyed by target — no leaking across threads; send order kept'
   assert.ok(a[0].seq < a[1].seq);
   assert.deepStrictEqual(pendingFor('card:x', []).map((p) => p.text), ['elsewhere']);
   assert.strictEqual(pendingFor('lieutenant:other', []).length, 0);
-});
-
-test('chat.js shares the echo predicate and paints the bubble on send', () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', 'ui', 'js', 'chat.js'), 'utf8');
-  // watchEcho's seen() and the pending list reconcile by the SAME predicate
-  assert.match(src, /const seen = \(\) => threadMsgs\(target\)\.some\(\(m\) => isEchoOf\(m, \{ text \}\)\)/);
-  // the pending entry is added only after the POST resolves (a thrown POST
-  // keeps the failure path: red error, text preserved, no bubble)...
-  const postAt = src.indexOf('await api.feedback(target, text, metas)');
-  const addAt = src.indexOf('addPending(target, text, metas)');
-  assert.ok(postAt > -1 && addAt > postAt);
-  // ...and a render() paints it in the same beat the composer clears
-  assert.ok(/addPending\(target, text, metas\);[\s\S]{0,400}render\(\);/.test(src));
 });

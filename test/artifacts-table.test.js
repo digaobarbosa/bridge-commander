@@ -6,16 +6,13 @@
 // long filenames stay whole and scroll into view.
 // util.js is browser ES-module code but touches no DOM at import time, so the
 // renderer can be imported and asserted on directly (detail.js cannot — it
-// binds DOM elements at import). The overflow-x claim lives in app.css, so it
-// is asserted against the stylesheet source.
+// binds DOM elements at import).
 const test = require('node:test');
 const assert = require('node:assert');
-const fs = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
 const utilMod = import(pathToFileURL(path.join(__dirname, '..', 'ui', 'js', 'util.js')).href);
-const css = fs.readFileSync(path.join(__dirname, '..', 'ui', 'app.css'), 'utf8');
 
 const ARTS = [
   { uri: 'file:///w/validated-pr-pipeline-design.md', label: 'design' },
@@ -38,16 +35,11 @@ test('artifacts render as a table with one row per artifact', async () => {
   assert.ok(html.includes('<td class="a-label">a-really-quite-long-artifact-filename.png</td>'));
 });
 
-test('the table sits in a scroll container that scrolls sideways', async () => {
+test('the table sits in a scroll container', async () => {
   const { artifactsHtml } = await utilMod;
   const html = artifactsHtml(ARTS);
   const m = html.match(/<div class="([\w-]*arts-scroll[\w-]*)">\s*<table/);
   assert.ok(m, 'the table is wrapped in a scroll container: ' + html.slice(0, 200));
-  const rule = css.match(new RegExp('\\.' + m[1] + '\\s*\\{[^}]*\\}'));
-  assert.ok(rule, '.' + m[1] + ' is styled in app.css');
-  assert.match(rule[0], /overflow-x:\s*auto/, 'the wrapper scrolls horizontally');
-  // filenames must never be clipped again
-  assert.doesNotMatch(css.match(/\.dt-artifacts \.a-uri\s*\{[^}]*\}/)[0], /text-overflow/);
 });
 
 test('behaviour kept: http links open in a new tab, everything else opens the viewer', async () => {

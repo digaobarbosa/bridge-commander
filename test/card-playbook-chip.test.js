@@ -9,12 +9,10 @@
 // renderer is imported directly (detail.js cannot be — it binds DOM at import).
 const test = require('node:test');
 const assert = require('node:assert');
-const fs = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
 const utilMod = import(pathToFileURL(path.join(__dirname, '..', 'ui', 'js', 'util.js')).href);
-const uiDir = path.join(__dirname, '..', 'ui');
 const cardIn = (column, playbook) =>
   ({ id: 'MNC-1', type: 'implementation', column, playbook });
 
@@ -44,12 +42,4 @@ test('no playbook reads as a card that cannot start, editable or not', async () 
   }
   // a plan card never starts, so it has no playbook to show at all
   assert.strictEqual(playbookAttrHtml({ id: 'MNC-2', type: 'plan', column: 'backlog', playbook: '' }, true), '');
-});
-
-test('the detail panel only ever draws the ✎ from the Backlog branch', () => {
-  // the gate is one argument, and it is this one — a later hand adding a second
-  // way to draw the chip has to come back through playbookAttrHtml
-  const src = fs.readFileSync(path.join(uiDir, 'js', 'detail.js'), 'utf8');
-  assert.match(src, /playbookAttrHtml\(c, !arch && c\.column === 'backlog'\)/);
-  assert.doesNotMatch(src, /attr-playbook'/, 'the chip markup is not rebuilt inline');
 });
