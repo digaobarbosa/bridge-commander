@@ -122,7 +122,8 @@ const opts = parseArgs(process.argv.slice(2));
 // Worth the walk even though a restart would fix it: until then the whole life of
 // that process answers 404 to every hook on the tab, and nobody would ever connect
 // "the board came up before its directory did" to "the pencil stopped working".
-function realWorkspace(dir) {
+// A card artifact's directory takes the same walk (normalizeArtifactUri).
+function realDir(dir) {
   const missing = [];
   for (let at = dir; ;) {
     try { return path.join(fs.realpathSync(at), ...missing); } catch (e) {}
@@ -132,7 +133,7 @@ function realWorkspace(dir) {
     at = up;
   }
 }
-const WORKSPACE = realWorkspace(path.resolve(opts.workspace || process.cwd()));
+const WORKSPACE = realDir(path.resolve(opts.workspace || process.cwd()));
 // One-shot rename migrations (bridge-command → bridge-commander). Boot-time and
 // idempotent: the server owns this workspace as it starts, so renaming the state
 // dir before any path below is used is safe. Legacy installs survive the flag day.
@@ -1877,12 +1878,24 @@ function patchCard(card, body) {
 // This is the ONLY path (besides the investigation auto-attach) that puts an
 // entry there — a chat upload alone never does. Idempotent by uri, mirroring the
 // investigation auto-attach shape. A bare filesystem path is normalized to a
-// file:// absolute uri; attachment:// and http(s):// / file:// uris pass through.
-function normalizeArtifactUri(raw) {
+// file:// absolute uri; attachment:// and http(s):// uris pass through.
+function literalArtifactUri(raw) {
   const s = String(raw || '').trim();
   if (!s) return '';
   if (/^(attachment|https?|file):\/\//.test(s)) return s;
   return 'file://' + path.resolve(s);
+}
+// The stored uri is the file's REAL directory: the write gate refuses a path
+// whose realpath differs, so `/tmp/x.md` on macOS (/tmp → /private/tmp) would
+// read forever and never save. Only the directory is followed — a symlinked
+// leaf stays as given, and the gate still refuses it. An unclean file:// path
+// stays verbatim so the gate refuses the traversal instead of it being resolved away.
+function normalizeArtifactUri(raw) {
+  const uri = literalArtifactUri(raw);
+  if (!uri.startsWith('file://')) return uri;
+  const file = uri.slice('file://'.length);
+  if (!path.isAbsolute(file) || path.resolve(file) !== file) return uri;
+  return 'file://' + path.join(realDir(path.dirname(file)), path.basename(file));
 }
 function cardArtifactAdd(card, body) {
   const uri = normalizeArtifactUri(body && body.uri);
@@ -1908,8 +1921,10 @@ function cardArtifactAdd(card, body) {
 function cardArtifactRemove(card, body) {
   const uri = normalizeArtifactUri(body && body.uri);
   if (!uri) return { error: 'uri required' };
+  // The literal form too: an entry stored before uris were realpath'd must stay removable.
+  const literal = literalArtifactUri(body && body.uri);
   const arts = Array.isArray(card.attributes.artifacts) ? card.attributes.artifacts : [];
-  const next = arts.filter((a) => !(a && a.uri === uri));
+  const next = arts.filter((a) => !(a && (a.uri === uri || a.uri === literal)));
   const removed = next.length !== arts.length;
   card.attributes.artifacts = next;
   if (removed) card.updated = now();
