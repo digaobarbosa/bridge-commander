@@ -221,7 +221,7 @@ function tmuxAdapter(profile) {
     spawn, send, alive, resumable, resume, kill,
     onTurnEnd: s.onTurnEnd,
     openPane: s.openPane, paneSnapshot: s.paneSnapshot, paneInput: s.paneInput,
-    adoptWindow: s.adoptWindow,
+    adoptWindow: s.adoptWindow, panePids: s.panePids,
     commands, runCommand, status, brief,
   };
 }

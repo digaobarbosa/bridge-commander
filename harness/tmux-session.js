@@ -207,6 +207,23 @@ async function adoptWindow(ref, window, taken = []) {
   return { ...ref, window };
 }
 
+// panePids(ref | session) -> [{ window, pid }] — OPTIONAL capability verb:
+// every pane of the SESSION (all its windows, not just the ref's), so a caller
+// can attribute sibling windows to their own agents. [] when tmux or the
+// session is gone. The exact-match target, like every command here: a bare
+// name is a prefix match and could read another session's panes.
+async function panePids(refOrSession) {
+  const session = typeof refOrSession === 'string' ? refOrSession : refOrSession && refOrSession.session;
+  if (!session) return [];
+  const out = await t.tryTmux('list-panes', '-s', '-t', `=${session}:`, '-F', '#{window_name}\t#{pane_pid}');
+  const panes = [];
+  for (const line of String(out || '').split('\n')) {
+    const m = /^(.*)\t(\d+)$/.exec(line.trim());
+    if (m) panes.push({ window: m[1], pid: parseInt(m[2], 10) });
+  }
+  return panes;
+}
+
 // launchAndSettle — send the launch command into the pane, wait for the agent
 // process and its main UI, auto-accepting the harness's trust dialog if it
 // appears (a fresh cwd shows one even in bypass mode; the accept option is
@@ -536,6 +553,7 @@ module.exports = {
   createPane,
   killPane,
   adoptWindow,
+  panePids,
   launchAndSettle,
   verifyLive,
   onTurnEnd,

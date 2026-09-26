@@ -263,6 +263,27 @@ for (const sub of SUBJECTS) {
   });
 }
 
+// panePids — the load panel's pane pids, through the port instead of a tmux
+// call in the server. Exact-match target, every window of the session.
+for (const sub of SUBJECTS) {
+  const h = sub.impl;
+  test(`${sub.name}: panePids lists every pane of the session by exact name; [] when tmux cannot say`, async () => {
+    const tmuxMod = require('../tmux.js');
+    const original = tmuxMod.tryTmux;
+    const calls = [];
+    let answer = 'lt\t200\nw-c1\t100\n';
+    tmuxMod.tryTmux = async (...args) => { calls.push(args); return answer; };
+    try {
+      const ref = { harness: sub.name, session: 'bc-lt-ada', window: 'lt', cwd: '/tmp' };
+      assert.deepStrictEqual(await h.panePids(ref), [{ window: 'lt', pid: 200 }, { window: 'w-c1', pid: 100 }]);
+      assert.deepStrictEqual(calls[0], ['list-panes', '-s', '-t', '=bc-lt-ada:', '-F', '#{window_name}\t#{pane_pid}']);
+      assert.deepStrictEqual(await h.panePids('bc-lt-ada'), [{ window: 'lt', pid: 200 }, { window: 'w-c1', pid: 100 }], 'a bare session name too');
+      answer = null;
+      assert.deepStrictEqual(await h.panePids(ref), []);
+    } finally { tmuxMod.tryTmux = original; }
+  });
+}
+
 // ---------- the fake, where the same promises apply ----------
 test('fake: spawn returns a clean ref; resume with no memory comes back with NO resumeId key', async () => {
   fake.reset();

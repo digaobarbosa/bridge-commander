@@ -1272,16 +1272,24 @@ function sysloadTargets() {
     if (w.done || !isHarnessRef(w.ref)) continue;
     const card = findCard(w.card);
     out.push({ kind: 'worker', id: w.card, label: (card && card.title) || w.card,
-      session: w.ref.session, window: w.ref.window || null });
+      session: w.ref.session, window: w.ref.window || null, ref: w.ref });
   }
   for (const lt of board.lieutenants) {
     if (!isHarnessRef(lt.ref)) continue;
     out.push({ kind: 'lieutenant', id: lt.id, label: lt.name,
-      session: lt.ref.session, window: lt.ref.window || null });
+      session: lt.ref.session, window: lt.ref.window || null, ref: lt.ref });
   }
   return out;
 }
-const sysload = createSampler({ workspace: WORKSPACE, targets: sysloadTargets, intervalMs: SYSLOAD_MS });
+// Pane pids come through the port (its optional panePids verb): a harness
+// without it contributes no rows, and an unknown one throws into the sampler,
+// which reads that as no rows too.
+function sysloadPanePids(target) {
+  const impl = harnessFor(target.ref);
+  return typeof impl.panePids === 'function' ? impl.panePids(target.ref) : [];
+}
+const sysload = createSampler({ workspace: WORKSPACE, targets: sysloadTargets, panePids: sysloadPanePids,
+  intervalMs: SYSLOAD_MS });
 
 // Named ping (not an SSE comment): comments are invisible to EventSource, so
 // the client's staleness watchdog couldn't see the stream is alive. Pane

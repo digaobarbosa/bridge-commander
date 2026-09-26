@@ -45,7 +45,7 @@ The port also exports `keyOf(ref)` — the state key (`session` or
 `isSpawnableSession(name)`, the `bc-<id>` rule `spawn` enforces. Nothing outside
 the harness builds either.
 
-## Optional capability verbs (pane viewing, slash commands, session status, window adoption, brief)
+## Optional capability verbs (pane viewing, slash commands, session status, window adoption, brief, pane pids)
 
 Optional verbs are features not every harness can honor, so `port.js` never
 validates them — adding one to the required list would force every harness
@@ -56,7 +56,7 @@ and degrades gracefully when the verb is absent (the pane endpoints answer
 
 **The inventory lives in one place:** [`docs/api/overview.md`](../docs/api/overview.md), which
 lists every optional verb with its signature and the endpoint it serves — `openPane`,
-`paneSnapshot`, `paneInput`, `commands`, `runCommand`, `status`, `adoptWindow`, `brief`. Add a verb
+`paneSnapshot`, `paneInput`, `commands`, `runCommand`, `status`, `adoptWindow`, `brief`, `panePids`. Add a verb
 there; what follows is how to implement them, not what they are.
 
 `brief(ref, opts?)` names the file the brief was persisted to at spawn
@@ -64,6 +64,13 @@ there; what follows is how to implement them, not what they are.
 there is none — so the server can attach it to the card without building a
 harness path itself. It reads `opts.stateDir` like `status`; a bound instance
 supplies it.
+
+`panePids(ref | session)` answers `[{ window, pid }]` for EVERY pane of the
+session — all its windows, not only the ref's — so the load panel
+(`server/sysload.js`) can attribute a lieutenant's worker windows to their own
+cards. The tmux adapters read `list-panes -s` on the exact-match `=<session>:`
+target, like every other tmux call here; `[]` when tmux or the session is gone.
+The fake has no processes and does not offer it: its agents have no load rows.
 
 `runCommand(ref, line, opts?)` and `status(ref, opts?)` take the same `opts` bag;
 `stateDir` matters there, because codex resolves its thread-id from the
