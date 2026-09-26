@@ -11,6 +11,13 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+// macOS hands out a temp dir under /var, a symlink to /private/var. The server
+// realpaths its workspace and refuses to write through a symlink, so a test
+// that builds paths from the linked form sees 403s and /private/var mismatches.
+// Resolve it once here: every test that requires the helper, and every child it
+// spawns, then gets the real path from os.tmpdir().
+process.env.TMPDIR = fs.realpathSync(os.tmpdir());
+
 const SERVER_JS = path.join(__dirname, '..', 'server', 'server.js');
 const CLI = path.join(__dirname, '..', 'cli', 'bc-axi');
 
