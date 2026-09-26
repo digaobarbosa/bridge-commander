@@ -20,8 +20,9 @@ const SELF_DIR = path.dirname(fs.realpathSync(process.argv[1]));
 // BC_SERVER_JS is a test-only seam: it lets tests point auto-boot at a
 // deliberately-crashing script to exercise the boot-failure path.
 const SERVER_JS = process.env.BC_SERVER_JS || path.join(SELF_DIR, '..', 'server', 'server.js');
-const { STATE_DIR_NAME, LEGACY_STATE_DIR_NAME, migrateStateDir, resolveStateDir, migrateHomeStateDir, isWorkspace } =
-  require(path.join(SELF_DIR, '..', 'server', 'statedir.js'));
+const { STATE_DIR_NAME, LEGACY_STATE_DIR_NAME, migrateStateDir, resolveStateDir, migrateHomeStateDir, isWorkspace, isId,
+  ONBOARDING_STEPS } =
+  require(path.join(SELF_DIR, '..', 'server', 'layout.js'));
 const gitrev = require(path.join(SELF_DIR, '..', 'server', 'gitrev.js'));
 // The playbooks a workspace is seeded with, and the worker-duties skill that
 // goes with them — one call, because they are one thing (see playbooks.js).
@@ -30,8 +31,8 @@ const { seedPlaybooksAndDuties } = require(path.join(SELF_DIR, '..', 'server', '
 // the way the packaged playbooks are — copies, and only the missing ones.
 const { seedHooks } = require(path.join(SELF_DIR, '..', 'server', 'hooks.js'));
 // --charter-file writes the lieutenant's memory file, not a board field — the
-// charter is prose the agent reads at launch (see server/charter.js).
-const { charterPath, readCharter, writeCharter } = require(path.join(SELF_DIR, '..', 'server', 'charter.js'));
+// charter is prose the agent reads at launch (see server/layout.js).
+const { charterPath, readCharter, writeCharter } = require(path.join(SELF_DIR, '..', 'server', 'layout.js'));
 const DEFAULT_PORT = 4780;
 
 function die(msg) { console.error(msg); process.exit(1); }
@@ -374,7 +375,7 @@ function slugId(s) {
 // The id is checked against the SERVER's rule first, so a `--id ../../foo`
 // never reaches the filesystem on its way to a 400.
 function seedCharter(id, source) {
-  if (!/^[\w][\w.-]*$/.test(id)) die('bad lieutenant id (use [A-Za-z0-9_.-]): ' + id);
+  if (!isId(id)) die('bad lieutenant id (use [A-Za-z0-9_.-]): ' + id);
   const file = charterPath(WORKSPACE, id);
   if (fs.existsSync(file)) console.log('charter left alone — ' + file + ' already exists (edit it to replace it)');
   else console.log('charter written to ' + writeCharter(WORKSPACE, id, readInput(source)));
@@ -608,7 +609,7 @@ async function settleOnboardPort(fr) {
 }
 
 async function cmdInitOnboard() {
-  const fr = require(path.join(SELF_DIR, '..', 'server', 'firstrun.js'));
+  const fr = require(path.join(SELF_DIR, 'firstrun.js'));
 
   // 1. What IS this directory? Decided before one byte is written, in the one
   //    order that works: workspace, then empty, then refuse and name what it found.
@@ -791,7 +792,7 @@ async function cmdOnboarding() {
   if (sub !== 'set') die('usage: bc-axi onboarding [--json] | bc-axi onboarding set <step> [--note "..."]');
   const step = positional[1];
   if (!step) die('usage: bc-axi onboarding set <step> [--note "..."]  (steps: '
-    + require(path.join(SELF_DIR, '..', 'server', 'firstrun.js')).ONBOARDING_STEPS.join(' | ') + ')');
+    + ONBOARDING_STEPS.join(' | ') + ')');
   const body = { step };
   if (opts.note != null) body.note = opts.note;
   let r;

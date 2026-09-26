@@ -11,7 +11,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { startServerWithLieutenant, withOwner, sleep, LT } = require('./helper');
-const { lieutenantSession, workerWindow } = require('../server/names.js');
+const { lieutenantSession, workerWindow } = require('../server/layout.js');
 
 // A worker's harness key: a WINDOW inside its lieutenant's session.
 function workerKey(dir, cardId) {

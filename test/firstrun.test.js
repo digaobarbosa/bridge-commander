@@ -9,7 +9,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { runCli } = require('./helper');
-const fr = require('../server/firstrun.js');
+const fr = require('../cli/firstrun.js');
 
 function tmp(seed) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-firstrun-'));

@@ -1,11 +1,14 @@
 'use strict';
-// External TTS: the engine is served from the board's own origin. /api/config
-// hands the browser the proxy prefix instead of the engine's address, and
-// /api/tts/<rest> is a dumb passthrough to <engine>/<rest> — same method, same
-// path, same headers, same status, same bytes, streamed both ways, and a client
-// that hangs up hangs up on the engine.
+// External engines (TTS, STT), served from the board's own origin by one
+// proxy (server/proxy.js). /api/<engine>/<rest> is a dumb passthrough to
+// <engine>/<rest> — same method, same path, same headers, same status, same
+// bytes, streamed both ways, and a client that hangs up hangs up on the
+// engine. /api/stt/ws/<rest> is the same passthrough one layer down: the
+// handshake and then raw bytes. /api/config hands the browser the TTS proxy
+// prefix instead of the engine's address.
 const { test } = require('node:test');
 const assert = require('node:assert');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
@@ -21,9 +24,11 @@ function seedConfig(cfg) {
 }
 
 // A stand-in engine: whatever the handler does is what the board must relay.
-function startEngine(handler) {
+// `onUpgrade` is optional: only the websocket test needs one.
+function startEngine(handler, onUpgrade) {
   return new Promise((resolve) => {
-    const srv = http.createServer(handler);
+    const srv = http.createServer(handler || ((req, res) => res.end()));
+    if (onUpgrade) srv.on('upgrade', onUpgrade);
     srv.listen(0, '127.0.0.1', () => resolve({
       url: 'http://127.0.0.1:' + srv.address().port,
       stop: () => new Promise((r) => srv.close(r)),
@@ -41,6 +46,78 @@ test('no tts in config: /api/config is unchanged', async () => {
   } finally { await s.stop(); }
 });
 
+// The handshake an engine owes a client, computed from the client's own key.
+function accept(key) {
+  return crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+}
+
+// ---------- both engines: the same proxy, the same promises ----------
+for (const engineName of ['tts', 'stt']) {
+  const prefix = '/api/' + engineName;
+
+  // Method, path, query, headers and body go up; status, headers and body come
+  // back. The proxy knows none of the names involved.
+  test(engineName + ': the passthrough relays the request up and the answer back, whole', async () => {
+    let seen = null;
+    const engine = await startEngine((req, res) => {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        seen = { method: req.method, url: req.url, ctype: req.headers['content-type'], mark: req.headers['x-mark'], body };
+        res.writeHead(418, { 'Content-Type': 'audio/wav', 'x-engine': 'large-v3-turbo' });
+        res.end('{"text":"olá capitão"}');
+      });
+    });
+    const s = await startServer({ seed: seedConfig({ [engineName]: { url: engine.url } }) });
+    try {
+      const r = await fetch(s.base + prefix + '/v1/audio/speech?fast=1', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-mark': 'up' },
+        body: JSON.stringify({ input: 'olá' }),
+      });
+      assert.deepEqual(seen, {
+        method: 'POST',
+        url: '/v1/audio/speech?fast=1',                    // prefix stripped, query kept
+        ctype: 'application/json',
+        mark: 'up',
+        body: '{"input":"olá"}',
+      });
+      assert.equal(r.status, 418);                       // the engine's status, not ours
+      assert.equal(r.headers.get('content-type'), 'audio/wav');
+      assert.equal(r.headers.get('x-engine'), 'large-v3-turbo');
+      assert.equal(await r.text(), '{"text":"olá capitão"}');
+    } finally { await s.stop(); await engine.stop(); }
+  });
+
+  // Any path, any method, and an engine error is an engine error — the proxy
+  // does not turn a 500 into something friendlier.
+  test(engineName + ': an unknown path and a failing engine both pass straight through', async () => {
+    const engine = await startEngine((req, res) => {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end('boom ' + req.method + ' ' + req.url);
+    });
+    const s = await startServer({ seed: seedConfig({ [engineName]: { url: engine.url } }) });
+    try {
+      const r = await fetch(s.base + prefix + '/anything/at/all', { method: 'DELETE' });
+      assert.equal(r.status, 500);
+      assert.equal(await r.text(), 'boom DELETE /anything/at/all');
+    } finally { await s.stop(); await engine.stop(); }
+  });
+
+  // No engine, no route: the board is exactly as silent as it is without one,
+  // and /api/config is untouched.
+  test(engineName + ': no block in config: the proxy path is a plain 404', async () => {
+    const s = await startServer({ seed: seedConfig({ voices: ['Luciana'] }) });
+    try {
+      assert.equal((await s.api('GET', prefix + '/v1/voices')).status, 404);
+      assert.equal((await s.api('POST', prefix + '/v1/audio/speech', { input: 'olá' })).status, 404);
+      assert.equal((await s.api('GET', prefix)).status, 404);
+      assert.deepEqual((await s.api('GET', '/api/config')).body, { voices: ['Luciana'], permissionMode: 'auto' });
+    } finally { await s.stop(); }
+  });
+}
+
+// ---------- TTS: what the browser is handed ----------
 // The engine's address is the server's business now. The browser gets a path,
 // which resolves against the origin the page came from — the whole point: an
 // https page, or a phone off the tailnet, can reach it.
@@ -70,55 +147,7 @@ test('malformed tts config reads as not configured', async () => {
   }
 });
 
-// Method, path, query, headers and body go up; status, headers and body come
-// back. The proxy knows none of the names involved.
-test('the passthrough relays the request up and the answer back, whole', async () => {
-  let seen = null;
-  const engine = await startEngine((req, res) => {
-    let body = '';
-    req.on('data', (c) => (body += c));
-    req.on('end', () => {
-      seen = { method: req.method, url: req.url, ctype: req.headers['content-type'], mark: req.headers['x-mark'], body };
-      res.writeHead(418, { 'Content-Type': 'audio/wav', 'x-sample-rate': '24000' });
-      res.end('AUDIO');
-    });
-  });
-  const s = await startServer({ seed: seedConfig({ tts: { url: engine.url, lang: 'pt' } }) });
-  try {
-    const r = await fetch(s.base + '/api/tts/v1/audio/speech?fast=1', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-mark': 'up' },
-      body: JSON.stringify({ input: 'olá' }),
-    });
-    assert.deepEqual(seen, {
-      method: 'POST',
-      url: '/v1/audio/speech?fast=1',
-      ctype: 'application/json',
-      mark: 'up',
-      body: '{"input":"olá"}',
-    });
-    assert.equal(r.status, 418);                       // the engine's status, not ours
-    assert.equal(r.headers.get('content-type'), 'audio/wav');
-    assert.equal(r.headers.get('x-sample-rate'), '24000');
-    assert.equal(await r.text(), 'AUDIO');
-  } finally { await s.stop(); await engine.stop(); }
-});
-
-// Any path, any method, and an engine error is an engine error — the proxy does
-// not turn a 500 into something friendlier.
-test('an unknown path and a failing engine both pass straight through', async () => {
-  const engine = await startEngine((req, res) => {
-    res.writeHead(500, { 'Content-Type': 'text/plain' });
-    res.end('boom ' + req.method + ' ' + req.url);
-  });
-  const s = await startServer({ seed: seedConfig({ tts: { url: engine.url } }) });
-  try {
-    const r = await fetch(s.base + '/api/tts/anything/at/all', { method: 'DELETE' });
-    assert.equal(r.status, 500);
-    assert.equal(await r.text(), 'boom DELETE /anything/at/all');
-  } finally { await s.stop(); await engine.stop(); }
-});
-
+// ---------- streaming, aborts and the idle gap (shown on TTS; one relay) ----------
 // Sound has to start while synthesis is still running. If the proxy buffered,
 // both chunks would land together at the end.
 test('the response streams: the first chunk arrives before the second is written', async () => {
@@ -265,12 +294,68 @@ test('a client that stops draining is not mistaken for a quiet engine', async ()
   } finally { await s.stop(); await engine.stop(); }
 });
 
-// No engine, no route: the board is exactly as silent as it is today.
-test('no tts block: the proxy path is a plain 404', async () => {
-  const s = await startServer({ seed: seedConfig({ voices: ['Luciana'] }) });
+// ---------- STT: the websocket half ----------
+// The half only STT has: the upgrade goes up, the 101 comes
+// back, and then it is raw bytes each way — audio up, JSON down, neither of
+// them anything the proxy looks at.
+test('the websocket reaches the engine and carries bytes both ways', async () => {
+  let seenPath = null;
+  const engine = await startEngine(null, (req, sock) => {
+    seenPath = req.url;
+    sock.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+      + 'Sec-WebSocket-Accept: ' + accept(req.headers['sec-websocket-key']) + '\r\n\r\n');
+    sock.write('HELLO');                                    // the engine speaks first
+    sock.on('data', (d) => sock.write('ECHO:' + d));        // ...and answers what it is sent
+    sock.on('end', () => sock.destroy());                   // ...and lets go when the proxy does
+  });
+  const s = await startServer({ seed: seedConfig({ stt: { url: engine.url } }) });
   try {
-    assert.equal((await s.api('GET', '/api/tts/v1/voices')).status, 404);
-    assert.equal((await s.api('POST', '/api/tts/v1/audio/speech', { input: 'olá' })).status, 404);
-    assert.equal((await s.api('GET', '/api/tts')).status, 404);
+    const key = crypto.randomBytes(16).toString('base64');
+    const up = await new Promise((resolve, reject) => {
+      const req = http.request({
+        port: s.port, host: '127.0.0.1', path: '/api/stt/ws/transcribe?lang=pt',
+        headers: { Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Key': key, 'Sec-WebSocket-Version': '13' },
+      });
+      req.on('upgrade', (res, socket, head) => resolve({ res, socket, head }));
+      req.on('response', (res) => reject(new Error('no upgrade, HTTP ' + res.statusCode)));
+      req.on('error', reject);
+      req.end();
+    });
+    assert.equal(seenPath, '/ws/transcribe?lang=pt');        // prefix stripped, query kept
+    assert.equal(up.res.statusCode, 101);
+    // The accept hash is the ENGINE's, computed from the client's own key — the
+    // browser checks it, so a proxy that invented one would be caught here.
+    assert.equal(up.res.headers['sec-websocket-accept'], accept(key));
+
+    const said = [];
+    if (up.head && up.head.length) said.push(up.head.toString());
+    const heard = new Promise((resolve) => {
+      up.socket.on('data', (d) => {
+        said.push(d.toString());
+        if (said.join('').includes('ECHO:AUDIO')) resolve(said.join(''));
+      });
+      if (said.join('').includes('ECHO:AUDIO')) resolve(said.join(''));
+    });
+    up.socket.write('AUDIO');
+    assert.equal(await heard, 'HELLOECHO:AUDIO');
+    up.socket.destroy();
+  } finally { await s.stop(); await engine.stop(); }
+});
+
+// No engine, no websocket: the upgrade is dropped rather than answered.
+test('no stt block: an upgrade on the prefix is refused', async () => {
+  const s = await startServer({ seed: seedConfig({}) });
+  try {
+    const outcome = await new Promise((resolve) => {
+      const req = http.request({
+        port: s.port, host: '127.0.0.1', path: '/api/stt/ws/transcribe',
+        headers: { Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Key': crypto.randomBytes(16).toString('base64'), 'Sec-WebSocket-Version': '13' },
+      });
+      req.on('upgrade', () => resolve('upgraded'));
+      req.on('response', (res) => resolve('http ' + res.statusCode));
+      req.on('error', () => resolve('dropped'));
+      req.end();
+    });
+    assert.equal(outcome, 'dropped');
   } finally { await s.stop(); }
 });

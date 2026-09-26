@@ -13,7 +13,7 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { runHooks } = require('../server/hooks.js');
 const { startServerWithLieutenant, startServer, withOwner, sleep, LT } = require('./helper');
-const { lieutenantSession, workerWindow } = require('../server/names.js');
+const { lieutenantSession, workerWindow } = require('../server/layout.js');
 
 // A worker's harness key: a WINDOW in its lieutenant's session — the form the
 // fake harness's marker files carry, so a test can make a session dead.

@@ -70,20 +70,22 @@ const crypto = require('crypto');
 const { isHarnessRef, harnessFor, getHarness } = require(path.join(__dirname, '..', 'harness', 'port.js'));
 const { createWorktree, releaseWorktree, worktreeToolFor } = require(path.join(__dirname, 'worktrees.js'));
 const { runHooks, runTeardown, listAllHooks, runNamedHook, runningHook, readRuns, lastRuns, hookKey,
-  hooksDir, namedHookFile, cancelNamedHook, traceSkip, lastRunsFor,
-  TEARDOWN_TIMEOUT_MS: TEARDOWN_DEFAULT_MS, HOOK_NAME_RE, LIFECYCLE_EVENTS } = require(path.join(__dirname, 'hooks.js'));
-const { parseWhen, nextAfter, dueWindows, pickWindows, describeWhen, normalizeSchedules,
+  hooksDir, namedHookFile,
+  TEARDOWN_TIMEOUT_MS: TEARDOWN_DEFAULT_MS, HOOK_NAME_RE } = require(path.join(__dirname, 'hooks.js'));
+const { parseWhen, normalizeSchedules,
   NAME_RE: SCHEDULE_NAME_RE, OVERLAP, CATCHUP } = require(path.join(__dirname, 'schedules.js'));
 const { createSampler } = require(path.join(__dirname, 'sysload.js'));
 const { workerBrief, listPlaybooks, resolvePlaybook, playbooksDir, PACKAGED_PLAYBOOKS_DIR, parsePlaybook, attrVar, attrCardKey, PLACEHOLDERS, FRONTMATTER } = require(path.join(__dirname, 'playbooks.js'));
-const names = require(path.join(__dirname, 'names.js'));
-const { createConversation, parseTarget, CAPTAIN } = require(path.join(__dirname, 'conversation.js'));
-const { STATE_DIR_NAME, migrateStateDir, migrateHomeStateDir } = require(path.join(__dirname, 'statedir.js'));
+// layout.js: where things live in a workspace — the state dir, the charter,
+// and the session names (still read as `names.<fn>` below).
+const names = require(path.join(__dirname, 'layout.js'));
+const { STATE_DIR_NAME, migrateStateDir, migrateHomeStateDir, isId, ONBOARDING_STEPS,
+  charterPath, readCharter, writeCharter } = require(path.join(__dirname, 'layout.js'));
 const gitrev = require(path.join(__dirname, 'gitrev.js'));
-const { charterPath, readCharter, writeCharter } = require(path.join(__dirname, 'charter.js'));
-const { ONBOARDING_STEPS } = require(path.join(__dirname, 'firstrun.js'));
-const { proxyTts } = require(path.join(__dirname, 'ttsproxy.js'));
-const { proxyStt, proxySttUpgrade } = require(path.join(__dirname, 'sttproxy.js'));
+const { makeProxy, engineUrl } = require(path.join(__dirname, 'proxy.js'));
+const { createFileGate } = require(path.join(__dirname, 'filegate.js'));
+const { createClock } = require(path.join(__dirname, 'clock.js'));
+const { createConversation, parseTarget, CAPTAIN } = require(path.join(__dirname, 'conversation.js'));
 const { permissionMode, summarize, createPermissions } = require(path.join(__dirname, 'permissions.js'));
 const { readJsonl, sealJsonl } = require(path.join(__dirname, 'jsonl.js'));
 const { createDelivery } = require(path.join(__dirname, 'delivery.js'));
@@ -108,10 +110,10 @@ const opts = parseArgs(process.argv.slice(2));
 
 // ---------- paths (workspace-scoped; no global state) ----------
 // Resolved AND real: every path the board hands out is built from this one, and
-// hookTarget() compares a hook's containing directory against realpathSync of
-// itself. A workspace reached through a symlinked parent (/tmp on macOS,
-// ~/work → /mnt/data/work anywhere) would fail that comparison for the board's
-// OWN hooks, so the link is followed once here rather than at each call site.
+// the file gate (filegate.js) compares a hook's containing directory against
+// realpathSync of itself. A workspace reached through a symlinked parent (/tmp
+// on macOS, ~/work → /mnt/data/work anywhere) would fail that comparison for the
+// board's OWN hooks, so the link is followed once here rather than at each call site.
 // A workspace that is not on disk YET is the same question one level up: `--workspace
 // ~/work/newboard` through a ~/work → /mnt/data/work link has a link to follow even
 // though the board's own directory does not exist. So this resolves the deepest
@@ -172,30 +174,11 @@ const UPLOAD_MAX_BYTES = parseInt(process.env.BC_UPLOAD_MAX_BYTES, 10) > 0
 // preview cap; over-cap → 413.
 const ARTIFACT_MAX_BYTES = parseInt(process.env.BC_ARTIFACT_MAX_BYTES, 10) > 0
   ? parseInt(process.env.BC_ARTIFACT_MAX_BYTES, 10) : 25 * 1024 * 1024;
-// Extension → Content-Type for raw artifact byte serving. Images, video, and
-// audio render inline in the viewer; pdf may render inline; everything else
-// downloads.
-const ARTIFACT_MIME = {
-  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
-  '.webp': 'image/webp', '.svg': 'image/svg+xml', '.bmp': 'image/bmp', '.avif': 'image/avif',
-  '.pdf': 'application/pdf',
-  '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
-  '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.wav': 'audio/wav',
-  '.ogg': 'audio/ogg', '.oga': 'audio/ogg', '.opus': 'audio/ogg', '.flac': 'audio/flac',
-  // A rendered page and the things it pulls in beside itself.
-  '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
-  '.json': 'application/json', '.txt': 'text/plain; charset=utf-8',
-  '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf',
-};
 
 const DEFAULT_PORT = 4780;
 // The one prefix the TTS engine is served under, both ends of it: what the
 // browser is handed as its engine address, and what the proxy strips.
 const TTS_PREFIX = '/api/tts';
-// Same idea for the STT engine, http and websocket both. Nothing is handed to
-// the UI under this one — ui/stt-test.html is the only page that speaks it.
-const STT_PREFIX = '/api/stt';
 // ---------- workspace config (.bridge-commander/config.json) ----------
 function readConfig() {
   try {
@@ -240,9 +223,8 @@ function userConfig() {
 // Anything malformed (or a missing url) reads as "not configured".
 function ttsConfig() {
   const t = readConfig().tts;
-  if (!t || typeof t !== 'object' || Array.isArray(t)) return null;
-  const url = typeof t.url === 'string' ? t.url.trim().replace(/\/+$/, '') : '';
-  if (!/^https?:\/\/\S+$/.test(url)) return null;
+  const url = engineUrl(t);
+  if (!url) return null;
   const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
   return {
     url,
@@ -251,17 +233,13 @@ function ttsConfig() {
     params: t.params && typeof t.params === 'object' && !Array.isArray(t.params) ? t.params : {},
   };
 }
-// External STT engine (whisper API), optional: config.json
-//   "stt": { "url": "http://127.0.0.1:8878" }
-// Anything malformed (or a missing url) reads as "not configured", and the
-// /api/stt routes 404 like they were never there.
-function sttConfig() {
-  const t = readConfig().stt;
-  if (!t || typeof t !== 'object' || Array.isArray(t)) return null;
-  const url = typeof t.url === 'string' ? t.url.trim().replace(/\/+$/, '') : '';
-  if (!/^https?:\/\/\S+$/.test(url)) return null;
-  return { url };
-}
+// The engines themselves, on the board's own origin (server/proxy.js). No
+// engine configured means no route at all: the prefix falls through to the
+// ordinary 404. STT is config.json "stt": { "url": "http://127.0.0.1:8878" },
+// and nothing is handed to the UI for it — ui/stt-test.html is the only page
+// that speaks it, over http and websocket both.
+const ttsProxy = makeProxy({ prefix: TTS_PREFIX, idleEnv: 'BC_TTS_IDLE_MS', urlOf: () => engineUrl(readConfig().tts) });
+const sttProxy = makeProxy({ prefix: '/api/stt', idleEnv: 'BC_STT_IDLE_MS', urlOf: () => engineUrl(readConfig().stt) });
 // Port: --port flag > config.json "port" > 4780. The resolved port is written
 // back into config.json when absent, so the CLI and UI can always find it.
 const cfg = readConfig();
@@ -497,6 +475,13 @@ const BUILTIN_KINDS = {
   'harness-switch': { emoji: '🔀', level: 1 },
   'needs-captain': { emoji: '🚨', level: 1 },
   line: { emoji: '📞', level: 2 },
+  // Kinds the server's own verbs emit (/reset, worker send, PR watch, permission
+  // decisions): without
+  // an entry here they render on the timeline with no emoji.
+  reset: { emoji: '🧹', level: 1 },
+  'worker-send': { emoji: '📨', level: 2 },
+  'pr-merged': { emoji: '🟣', level: 2 },
+  permission: { emoji: '🔐', level: 2 },
 };
 function validKindEntry(v) {
   return !!(v && typeof v === 'object' && typeof v.emoji === 'string' && v.emoji.trim() &&
@@ -681,7 +666,7 @@ function createLieutenant(body) {
   const name = String(body.name || '').trim();
   if (!name) return { error: 'name required' };
   const id = body.id ? String(body.id) : lieutenantIdFrom(name);
-  if (!/^[\w][\w.-]*$/.test(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])' };
+  if (!isId(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])' };
   if (findLieutenant(id)) return { error: 'lieutenant exists: ' + id, code: 409 };
   if (body.avatar !== undefined && body.avatar !== null && !validAvatar(body.avatar)) {
     return { error: 'avatar must be an integer 0-63' };
@@ -813,7 +798,7 @@ async function spawnLieutenant(body) {
   const name = String(body.name || '').trim();
   if (!name) return { error: 'name required' };
   const id = body.id ? String(body.id) : lieutenantIdFrom(name);
-  if (!/^[\w][\w.-]*$/.test(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])' };
+  if (!isId(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])' };
   // revive:true is what makes `bc-axi init --onboard` re-runnable: the founding
   // lieutenant already exists, and the question is only whether her session is
   // still up. A live one is left strictly alone (spawning over a live session
@@ -838,7 +823,7 @@ async function spawnLieutenant(body) {
   try {
     ref = await impl.spawn(WORKSPACE, lieutenantPrompt(name, id), ltLaunchOpts({ model }, {
       session,
-      window: names.LIEUTENANT_WINDOW, // its own window in its own session — see names.js
+      window: names.LIEUTENANT_WINDOW, // its own window in its own session — see layout.js
       // Only the first run sends this, and only when the person said so out
       // loud: the harness decides what it means (for claude, IS_SANDBOX=1).
       allowRoot: !!body.allowRoot,
@@ -1084,9 +1069,16 @@ function setStatus(card, body) {
 }
 
 // ---------- SSE clients ----------
+// Every stream the board serves (board, pane peek, sysload) opens the same way
+// and speaks the same named-event frame, so a proxy or client quirk is fixed once.
+const SSE_HEADERS = { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' };
+/** sseFrame(event, data) -> one named SSE frame; `data` defaults to {}. */
+function sseFrame(event, data) {
+  return 'event: ' + event + '\ndata: ' + JSON.stringify(data === undefined ? {} : data) + '\n\n';
+}
 const sseClients = new Set();
 function sseSend(event, data) {
-  const payload = 'event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n';
+  const payload = sseFrame(event, data);
   for (const res of sseClients) res.write(payload);
 }
 function broadcast() { sseSend('board', publicBoard('user')); }
@@ -1198,11 +1190,9 @@ function resolvePaneRef(kind, id, want) {
 }
 const panes = new Map(); // paneKey -> { clients: Set<res>, handle, last }
 function paneKey(ref) { return ref.harness + '/' + ref.session + (ref.window ? ':' + ref.window : ''); }
-function paneWrite(res, event, data) {
-  res.write('event: ' + event + '\ndata: ' + JSON.stringify(data === undefined ? {} : data) + '\n\n');
-}
+function paneWrite(res, event, data) { res.write(sseFrame(event, data)); }
 function paneStream(req, res, ref, reason) {
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  res.writeHead(200, SSE_HEADERS);
   if (!ref) { paneWrite(res, 'no-pane', { reason }); return res.end(); }
   let impl;
   try { impl = harnessFor(ref); }
@@ -1291,8 +1281,9 @@ const sysload = createSampler({ workspace: WORKSPACE, targets: sysloadTargets, i
 // the client's staleness watchdog couldn't see the stream is alive. Pane
 // streams piggyback on the same ping so proxies don't drop them either.
 setInterval(() => {
-  for (const res of sseClients) res.write('event: ping\ndata: {}\n\n');
-  for (const hub of panes.values()) for (const res of hub.clients) res.write('event: ping\ndata: {}\n\n');
+  const ping = sseFrame('ping');
+  for (const res of sseClients) res.write(ping);
+  for (const hub of panes.values()) for (const res of hub.clients) res.write(ping);
 }, 25000).unref();
 
 // ---------- helpers ----------
@@ -1317,9 +1308,6 @@ function sendBytes(req, res, data, headers) {
   res.writeHead(200, { ...base, 'Content-Length': data.length });
   res.end(data);
 }
-// Content-derived version for a file the UI may edit: the GET hands it out,
-// the PUT demands it back, and a mismatch is a 409 instead of a lost edit.
-const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 function sendJson(res, code, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
@@ -2022,7 +2010,7 @@ async function addProject(body) {
   const source = String((body && body.source) || '').trim();
   if (!source) return { error: 'source required (git URL or local path)' };
   const name = String((body && body.name) || path.basename(source.replace(/\/+$/, '')).replace(/\.git$/, '')).trim();
-  if (!/^[\w][\w.-]*$/.test(name)) return { error: 'bad project name: ' + name + ' (use [A-Za-z0-9_.-], or pass --name)' };
+  if (!isId(name)) return { error: 'bad project name: ' + name + ' (use [A-Za-z0-9_.-], or pass --name)' };
   if (findProject(name)) return { error: 'project exists: ' + name, code: 409 };
   if (addingProjects.has(name)) return { error: 'project add already in progress: ' + name, code: 409 };
   const dest = path.join(WORKSPACE, 'projects', name);
@@ -3599,370 +3587,32 @@ async function prWatchTick() {
 }
 if (Number.isInteger(PRWATCH_MS) && PRWATCH_MS > 0) setInterval(prWatchTick, PRWATCH_MS).unref();
 
-// ---------- the clock (schedules; server/schedules.js holds the timing) ----------
-//
-// A schedule fires A HOOK, through `hook run` and nothing else — the clock gets
-// no private door. Everything a firing needs to decide (which card, whether to
-// wake anybody, what to say) is the hook's business, because a hook is bash
-// with `bc-axi` on its PATH.
-//
-// The cursor is `lastWindow`: the DUE TIME of the last window this schedule
-// handled. Windows are a function of that cursor and the clock, so a restart
-// neither loses a due window nor fires one twice — the tick after the boot sees
-// exactly the windows that came due while nobody was looking, and the catch-up
-// policy says what to do with them.
+// ---------- the clock (schedules; server/clock.js runs them) ----------
+// A schedule fires a NAMED hook through `hook run`, and a failed firing lands
+// on its owner. The tick, the claims and the overlap policy are clock.js's;
+// what it touches on the board comes in here.
 const SCHEDULE_MS = process.env.BC_SCHEDULE_INTERVAL_MS !== undefined
   ? parseInt(process.env.BC_SCHEDULE_INTERVAL_MS, 10) : 15000;
-// The line between "missed while the server was down" and "came due while we
-// were watching" — the whole meaning of catch-up `none`.
-const SCHEDULER_BOOT = Date.now();
-
-function findSchedule(name) { return board.schedules.find((s) => s.name === name); }
-// The trace's `trigger` for a firing. It names the SCHEDULE, not just "a
-// schedule": two schedules on one hook each read their own last fire out of
-// hookruns.jsonl, and nobody keeps a second copy of what already happened.
-function scheduleTrigger(s) { return 'schedule:' + s.name; }
-
-// scheduleProblem(s) -> '' or why this schedule cannot fire right now. Checked
-// on EVERY tick, not just at `add`: a hook deleted out from under a live
-// schedule has to make that schedule say so, rather than failing silently every
-// window forever.
-function scheduleProblem(s) {
-  try { parseWhen(s.when); } catch (e) { return e.message; }
-  // A cursor that is not a date is a DEAD window: every due-window question is
-  // asked from it, and all of them answer nothing, forever. board.json is
-  // git-tracked, so a bad merge or a hand edit is how this arrives — and a
-  // clock that quietly stops is the exact failure this card replaces. Said out
-  // loud here for the same reason an unparseable `when` is, and healed the same
-  // way any cursor is: pause and resume re-arms it at now.
-  if (s.lastWindow && Number.isNaN(Date.parse(s.lastWindow))) {
-    return 'cursor "' + s.lastWindow + '" is not a date — this schedule cannot work out what is due'
-      + ' (bc-axi schedule pause ' + s.name + ' && bc-axi schedule resume ' + s.name + ' re-arms it at now)';
-  }
-  if (!namedHookFile(WORKSPACE, s.hook)) {
-    return 'hook "' + s.hook + '" is gone from ' + hooksDir(WORKSPACE) + ' — this schedule fires nothing';
-  }
-  if (!findLieutenant(s.owner)) {
-    return 'owner "' + s.owner + '" is not a registered lieutenant — a failure here would land nowhere';
-  }
-  return '';
-}
-
-// A problem is announced ONCE, when it appears, and once when it clears. The
-// board's bell is level 1 because a schedule that stopped firing is exactly the
-// silent failure this card exists to end; a level-2 line marks the recovery.
-// An unregistered owner cannot be woken, so the board stream is all there is.
-// The kind travels onto the QUEUE ITEM as well as the timeline entry, and the
-// two must be the same one: the drain dispatches on the item's kind alone, so a
-// recovery labelled `schedule-failed` reaches its owner headlined "a firing
-// failed" and advised to fix the hook and pause the schedule — advice that is
-// exactly backwards for the schedule that just told them it is working again.
-function announceScheduleProblem(s, problem) {
-  const text = problem
-    ? 'schedule ' + s.name + ' cannot fire: ' + problem
-    : 'schedule ' + s.name + ' is healthy again';
-  const kind = problem ? 'schedule-failed' : 'schedule';
-  board.events.push(mkEvent({ text, actor: 'server', level: problem ? 1 : 2 }, { kind }));
-  if (findLieutenant(s.owner)) {
-    queuePush(s.owner, { kind, schedule: s.name, text, source: 'schedule ' + s.name });
-  }
-}
-
-// A schedule is not a card, so it gets its own scope in the key store rather
-// than a parallel store of its own. The `@` is what keeps the two apart for
-// good: a card id has to start with a word character, so no card can ever be
-// spelled like this.
-function scheduleKeyScope(s) { return '@schedule:' + s.name; }
-
-// The SIGNATURE of a failure: how it went wrong, plus the tail of what it said.
-// Two windows that failed the same way are the same failure and are worth one
-// wake between them; a hook that starts exiting 4 instead of 3, or says
-// something new, is a different failure and is worth hearing about.
-function failureKey(run) {
-  const how = run.timedOut ? 'timeout' : run.error ? 'spawn' : 'exit:' + run.code;
-  const tail = String(run.output || '').slice(-500);
-  return how + ':' + crypto.createHash('sha1').update(tail).digest('hex').slice(0, 12);
-}
-
-// A firing that fails lands on its OWNER, carrying the hook's output — never
-// only in a log. The trace already holds the run detail; this is the wake.
-//
-// Announced ONCE, the way announceScheduleProblem announces a problem once, and
-// through the key store MNC-24 already built for this shape. A 5m schedule
-// whose hook is permanently broken fails 288 times a day, and a drain holding
-// 288 identical items is quieter than one holding a single item, because its
-// owner stops reading it. A repeat still lands on the timeline at level 2 — the
-// record stays whole; the bell and the queue item are the only things the key
-// spends.
-function landScheduleFailure(s, run) {
-  const how = run.timedOut ? 'timed out' : run.error ? String(run.error)
-    : run.code === null ? 'killed' : 'exit ' + run.code;
-  const text = ('schedule ' + s.name + ' — hook ' + s.hook + ' FAILED (' + how + ')'
-    + (run.output ? ':\n' + run.output : '')).slice(0, 2000);
-  // ask -> deliver -> claim, the order the pair documents: claiming first would
-  // make a delivery that throws a wake forever answered "duplicate".
-  const scope = scheduleKeyScope(s);
-  const key = failureKey(run);
-  const fresh = !seenEventKey(scope, key);
-  board.events.push(mkEvent({ text, actor: 'server', level: fresh ? 1 : 2 },
-    { kind: 'schedule-failed' }));
-  if (fresh && findLieutenant(s.owner)) {
-    queuePush(s.owner, { kind: 'schedule-failed', schedule: s.name, text,
-      source: 'schedule ' + s.name });
-  }
-  saveBoard(); broadcast();
-  if (fresh) claimEventKey(scope, key);
-}
-
-// The other half of announcing once: silence has to mean one thing. The first
-// green firing after a failing one says so on the timeline and forgets the key,
-// so the next failure is heard as new rather than swallowed as a repeat of one
-// that is already fixed.
-function landScheduleRecovery(s) {
-  if (!forgetEventKeys(scheduleKeyScope(s))) return;
-  board.events.push(mkEvent({ text: 'schedule ' + s.name + ' — hook ' + s.hook + ' is green again',
-    actor: 'server', level: 2 }, { kind: 'schedule' }));
-  saveBoard(); broadcast();
-}
-
-// recordSkip(s, why) — a firing that did NOT run is still a firing. `skip` that
-// swallows its windows makes a schedule which never runs look exactly like one
-// that is working, so every skipped window gets a line in the same trace the
-// runs land in.
-function recordSkip(s, why) {
-  traceSkip(WORKSPACE, { hook: s.hook, trigger: scheduleTrigger(s), reason: 'skipped: ' + why });
-}
-
-// The run this schedule's hook is holding, named the way the EBUSY refusal
-// names it — an operator reading a skip afterwards has to be able to find the
-// firing that displaced the window, and `started` + `trigger` is what identifies
-// it on the trace. A pass between windows holds no run: say so rather than
-// invent one.
-function inFlightFiring(s) {
-  const run = runningHook(WORKSPACE, s.hook);
-  if (!run) return 'the firing in flight is still running';
-  return 'the firing in flight (trigger ' + run.trigger + ', started ' + run.started
-    + (run.card ? ', card ' + run.card : '') + ') is still running';
-}
-
-// fireSchedule(s) -> 'ran' | 'skipped' | 'queued' — one window, awaited to the
-// end. The EBUSY here is the OTHER overlap: not this schedule's own previous
-// firing (the tick handles that, below) but somebody else's run of the same
-// hook — the board's ▶, a lieutenant at the CLI, a second schedule. Same
-// policy, because from the window's point of view it is the same situation.
-async function fireSchedule(s) {
-  const trigger = scheduleTrigger(s);
-  for (let attempt = 0; ; attempt++) {
-    try {
-      const run = await runNamedHook(WORKSPACE, s.hook, {}, {
-        trigger, timeoutMs: HOOK_TIMEOUT_MS || 0,
-      });
-      // A run cancelled to make room for another already answered its own
-      // caller; only a genuine failure wakes the owner, and only a genuine
-      // success closes a failure that is still open.
-      if (!run.ok && !run.canceled) landScheduleFailure(s, run);
-      else if (run.ok) landScheduleRecovery(s);
-      return 'ran';
-    } catch (e) {
-      if (e && e.code === 'ENOHOOK') return 'skipped'; // scheduleProblem says it on the next tick
-      if (!e || e.code !== 'EBUSY') throw e;
-      if (s.overlap === 'queue') return 'queued';
-      if (s.overlap === 'restart' && attempt === 0) {
-        await cancelNamedHook(WORKSPACE, s.hook);
-        continue; // and if someone took the name in that instant, skip below
-      }
-      recordSkip(s, e.message);
-      return 'skipped';
+const clock = createClock({
+  workspace: WORKSPACE,
+  schedules: () => board.schedules,
+  findLieutenant,
+  // The kind travels onto the queue item as well as the timeline entry: the
+  // drain dispatches on the item's kind alone.
+  notify: (s, { text, kind, level, wake }) => {
+    board.events.push(mkEvent({ text, actor: 'server', level }, { kind }));
+    if (wake && findLieutenant(s.owner)) {
+      queuePush(s.owner, { kind, schedule: s.name, text, source: 'schedule ' + s.name });
     }
-  }
-}
-
-// runSchedule(s, windows) — one schedule's due windows, oldest first, ONE AT A
-// TIME. A catch-up backlog is not an overlap: `all` over a weekend means fire
-// each of those windows, in order, and the next one starts when the last one is
-// done. Runs outside the tick, which decides and never waits.
-//
-// Two cursors, deliberately, and the difference between them is the whole
-// durability story:
-//
-//   the CLAIM   in memory, keyed by the schedule OBJECT, alive for exactly as
-//               long as a pass is. The windows a pass took stop being due the
-//               moment it takes them, so the ticks that go by while a
-//               six-minute hook runs see the overlap policy and not the same
-//               backlog again. Keyed by the object and not by the name because
-//               a name can be removed and given to a new schedule while a pass
-//               is still running, and that new schedule is not the one firing.
-//   lastWindow  on disk, and it lags the claim on purpose. board.json still
-//               names the pre-pass window for the whole run, so a machine
-//               powered off mid-hook comes back and offers that window again.
-//               At-least-once is the promise a clock can keep; at-most-once
-//               would lose the firing outright, with nothing anywhere to say a
-//               window had ever come due.
-//
-// A pass writes the claim it REACHED — which the overlap policy's skips have
-// been moving all along — never the cursor it started with, or `skip` would
-// turn into back-to-back firing and the trace would hold skips for windows that
-// then ran. `queue` is the one outcome that lands somewhere earlier: the window
-// it could not take is re-offered on the next tick.
-const claimed = new Map();
-async function runSchedule(s, windows) {
-  let requeue = null;
-  try {
-    for (const w of windows) {
-      const outcome = await fireSchedule(s);
-      if (outcome === 'queued') { requeue = w - 1; break; } // re-offered next tick
-    }
-  } catch (e) {
-    console.error(now() + ' schedule ' + s.name + ' failed to fire: ' + String((e && e.message) || e));
-  } finally {
-    // Nothing above this line is awaited by anybody, so a board write that fails
-    // here is an unhandled rejection — which is to say the whole server, killed
-    // by a full disk while a hook was running. It is contained like every other
-    // background loop's failure.
-    try {
-      const reached = requeue !== null ? requeue : claimed.get(s);
-      // FORWARD only, and only onto the schedule this pass actually owns. Both
-      // halves are load-bearing. A `resume` that landed while the hook ran has
-      // already re-armed the cursor at now — a pause is not a queue — and
-      // stamping an older claim over it would make the whole paused interval
-      // due. And a schedule removed and re-added under the same name is a
-      // different schedule: it must not start life owing a dead pass's backlog.
-      // The `queue` pull-back is not a rewind, so it survives this: `w - 1` is
-      // never earlier than the cursor the pass started from.
-      const owned = findSchedule(s.name) === s;
-      if (owned && reached !== undefined && reached > (Date.parse(s.lastWindow) || 0)) {
-        s.lastWindow = new Date(reached).toISOString();
-        saveBoard(); broadcast();
-      }
-    } catch (e) {
-      console.error(now() + ' schedule ' + s.name + ': the board would not save after a firing: '
-        + String((e && e.message) || e));
-    }
-  }
-}
-
-// The overlap POLICY: a window came due while this schedule's PREVIOUS firing
-// is still running. It is a policy over `hook run`'s refusal, not a second
-// opinion about what is running — the five-minute poll that takes six minutes
-// is the case, and all three answers are defensible depending on the hook.
-//
-//   skip     don't run — and record every window it dropped
-//   queue    leave the cursor where it is; the window is re-offered when the
-//            firing in flight finishes. It survives a restart because the
-//            cursor is board state, not a list in memory
-//   restart  kill what is running (the whole process group, traced as canceled)
-//            and let the next tick start the window that displaced it
-function overlapPolicy(s, due) {
-  if (s.overlap === 'queue') return;
-  if (s.overlap === 'restart') {
-    cancelNamedHook(WORKSPACE, s.hook).catch(() => {});
-    return;
-  }
-  // Two different firings in one line, and keeping them apart is the whole
-  // point of writing it: the window being DROPPED, and the firing it lost to.
-  // The run in flight is read off `hook run`'s own registry (started, trigger)
-  // rather than guessed from the windows here, which are the dropped ones.
-  const lost = inFlightFiring(s);
-  for (const w of due) recordSkip(s, 'window ' + new Date(w).toISOString() + ' — ' + lost);
-  // Against the CLAIM, because a skip belongs to the pass in flight: it reaches
-  // board.json when that pass finishes, and a crash before then leaves the
-  // window due again — which is the honest answer, since nothing ran.
-  claimed.set(s, due[due.length - 1]);
-}
-
-let scheduleTicking = false;
-async function scheduleTick() {
-  if (scheduleTicking) return;
-  scheduleTicking = true;
-  try {
-    let changed = false;
-    const nowMs = Date.now();
-    for (const s of [...board.schedules]) {
-      const problem = scheduleProblem(s);
-      if (problem !== s.problem) {
-        // A paused schedule still reports a problem it has — you pause a clock,
-        // you do not stop wanting to know its hook was deleted — but announcing
-        // it would be a wake nobody asked for.
-        if (!s.paused) announceScheduleProblem(s, problem);
-        s.problem = problem;
-        changed = true;
-      }
-      if (problem || s.paused) continue;
-      const when = parseWhen(s.when);
-      const anchor = Date.parse(s.created) || 0;
-      // A schedule that has never fired starts its cursor HERE: `add` is not a
-      // firing, and a fresh 5m schedule that fired the instant it was created
-      // would make every `add` a surprise.
-      if (!s.lastWindow) { s.lastWindow = new Date(nowMs).toISOString(); changed = true; continue; }
-      // The claim, when a pass holds one, is ahead of the stored cursor — see
-      // runSchedule. Reading past both is what stops a pass being offered the
-      // windows it already took.
-      const from = Math.max(Date.parse(s.lastWindow), claimed.get(s) || 0);
-      const due = dueWindows(when, from, nowMs, anchor);
-      if (!due.windows.length) continue;
-      // Its own previous firing is still running: that is what `overlap` is for.
-      if (claimed.has(s)) { overlapPolicy(s, due.windows); continue; }
-      const { fire, dropped } = pickWindows(due, s.catchup, SCHEDULER_BOOT);
-      if (dropped) {
-        // No silent caps: a policy that drops windows says how many, so `all`
-        // hitting its ceiling is never mistaken for full coverage.
-        console.error(now() + ' schedule ' + s.name + ': ' + dropped + ' due window(s) not fired (catch-up '
-          + s.catchup + ')');
-      }
-      // The claim is taken HERE, before anything is awaited, so no second pass
-      // can ever be handed these windows. It reaches board.json when the pass
-      // ends, and it reaches it even for a firing that threw — at-least-once
-      // belongs to delivery, and a schedule that retries a broken hook every
-      // tick forever is a wake storm, not a recovery. The trace and the owner's
-      // drain hold what happened.
-      claimed.set(s, due.windows[due.windows.length - 1]);
-      // Deliberately not awaited: the tick's job is to decide, not to wait out
-      // a hook. Every window still fires in order, one at a time, per schedule.
-      // The claim is dropped out here rather than inside, so a pass that somehow
-      // dies on the way out cannot wedge the schedule shut forever.
-      runSchedule(s, fire)
-        .finally(() => claimed.delete(s))
-        .catch((e) => console.error(now() + ' schedule ' + s.name + ': '
-          + String((e && e.message) || e)));
-    }
-    if (changed) { saveBoard(); broadcast(); }
-  } catch (e) {
-    console.error(now() + ' schedule tick failed: ' + String((e && e.message) || e));
-  } finally {
-    scheduleTicking = false;
-  }
-}
-if (Number.isInteger(SCHEDULE_MS) && SCHEDULE_MS > 0) setInterval(scheduleTick, SCHEDULE_MS).unref();
-
-// What `schedule list` and `schedule show` read: the stored schedule plus the
-// two things that make it trustworthy — when it fires next, and how it last
-// went. The last fire comes off hookruns.jsonl (one backward walk for the whole
-// list); there is no second copy of a run anywhere on this board.
-function publicSchedules() {
-  const last = lastRunsFor(WORKSPACE, board.schedules.map((s) => ({
-    key: s.name, hook: s.hook, trigger: scheduleTrigger(s),
-  })));
-  return board.schedules.map((s) => {
-    let next = null;
-    try {
-      const when = parseWhen(s.when);
-      // A schedule that has never fired will arm at now, so now is the honest
-      // answer for an empty cursor. An unparseable one is a different thing
-      // entirely: there is no next fire to compute, and printing a plausible
-      // "in 4m" for a clock that will never fire again is the lie `problem` is
-      // there to replace.
-      const from = s.lastWindow ? Date.parse(s.lastWindow) : Date.now();
-      if (!Number.isNaN(from)) {
-        const t = nextAfter(when, from, Date.parse(s.created) || 0);
-        next = t ? new Date(t).toISOString() : null;
-      }
-    } catch (e) { /* an unparseable `when` has no next fire — `problem` says why */ }
-    return Object.assign({}, s, { next, last: last.get(s.name) || null, describe: describeWhenSafe(s.when) });
-  });
-}
-function describeWhenSafe(text) {
-  try { return describeWhen(parseWhen(text)); } catch (e) { return String(text || ''); }
-}
+  },
+  keys: { seen: seenEventKey, claim: claimEventKey, forget: forgetEventKeys },
+  save: () => { saveBoard(); broadcast(); },
+  runNamedHook,
+  now,
+  hookTimeoutMs: HOOK_TIMEOUT_MS,
+});
+const { publicSchedules, findSchedule, scheduleTrigger, describeWhenSafe } = clock;
+if (Number.isInteger(SCHEDULE_MS) && SCHEDULE_MS > 0) setInterval(clock.tick, SCHEDULE_MS).unref();
 
 // validateSchedule(body) -> {error} | {schedule}
 // The refusals are the point of `add`: a bad expression names the offending
@@ -4044,127 +3694,16 @@ function serveStatic(res, rel) {
   res.end(data);
 }
 
-// The one uri the artifact routes accept that is not listed on a card: a
-// playbook. The config screen edits them in the same editor a card artifact
-// opens in, which means the same GET, the same version check and the same 409 —
-// a second file API would be a second place to get all of that wrong. So the
-// widening is exactly one shape and nothing else: `<playbooks dir>/<name>.md`,
-// one level deep, no symlink. The directory is DERIVED here, never taken from
-// the client.
-//
-// Returns 'workspace' | 'packaged' | '' — the same two populations
-// resolvePlaybook picks between, and the difference is what may be written.
-// The packaged set is a git checkout of this repo: readable, so the captain can
-// open one and copy it, and never written in place.
-function playbookSource(uri) {
-  if (typeof uri !== 'string' || !uri.startsWith('file://')) return '';
-  const file = uri.slice('file://'.length);
-  // path.resolve is idempotent on a clean absolute path — a `..` segment or a
-  // relative path changes it, so `<dir>/../../board.json` never gets this far.
-  if (path.resolve(file) !== file) return '';
-  if (path.extname(file) !== '.md') return '';
-  const dir = path.dirname(file);
-  const source = dir === playbooksDir(STATE_DIR) ? 'workspace'
-    : dir === PACKAGED_PLAYBOOKS_DIR ? 'packaged' : '';
-  if (!source) return '';
-  // A symlink IN the dir is not a file in the dir: what it points at is what
-  // would be read or written. Refused here rather than followed. (ENOENT is
-  // fine — that is the copy-to-workspace create, and PUT guards the dir itself.)
-  try { if (fs.lstatSync(file).isSymbolicLink()) return ''; }
-  catch (e) { if (e.code !== 'ENOENT') return ''; }
-  return source;
-}
-
-// The second — and last — uri the artifact routes accept that is no card's:
-// a lieutenant's charter, `<workspace>/lieutenants/<id>/README.md`. The config
-// screen edits it in the same editor a playbook opens in, so it rides the same
-// GET, the same version check and the same 409.
-//
-// The widening is exactly one shape. charterPath() BUILDS the only acceptable
-// path from the workspace root and a REGISTERED id, and the uri has to equal
-// it — which is what refuses an unregistered id, another file in that folder, a
-// subdirectory of it, and a directory prefix from the client all at once.
-// Returns the path when it is one, '' otherwise.
-function charterFile(uri) {
-  if (typeof uri !== 'string' || !uri.startsWith('file://')) return '';
-  const file = uri.slice('file://'.length);
-  // path.resolve is idempotent on a clean absolute path — a `..` segment or a
-  // relative path changes it, so `<dir>/../../board.json` never gets this far.
-  if (path.resolve(file) !== file) return '';
-  if (!board.lieutenants.some((l) => charterPath(WORKSPACE, l.id) === file)) return '';
-  // A symlink named README.md is not the charter: what it points at is what
-  // would be read or written. Refused here rather than followed. (ENOENT is
-  // fine — a lieutenant that has never written its memory file still opens it.)
-  try { if (fs.lstatSync(file).isSymbolicLink()) return ''; }
-  catch (e) { if (e.code !== 'ENOENT') return ''; }
-  return file;
-}
-
-// The third — and last — uri the artifact routes accept that is no card's: a
-// HOOK file. The hooks tab's ✎ opens one in the same editor a playbook opens
-// in, which is where "he asks a lieutenant to help build one" happens: a file
-// on a screen he can point at.
-//
-// The widening is exactly one shape, and it is the namespace hooks.js already
-// defines: an executable file under <workspace>/.bridge-commander/hooks/, ONE
-// level deep (a named hook) or TWO (a lifecycle hook, in its event's
-// directory). The containing directory is BUILT here from STATE_DIR and
-// compared for equality — never taken from the client — the way charterFile()
-// does it, and the two names in it have to look like ids, so a traversal never
-// survives the comparison.
-//
-// Returns the path when the uri is one, '' otherwise. A file that is not there
-// YET is still one (that is the create), which is why the leaf check tolerates
-// ENOENT and nothing else: a symlink, a directory and a socket all fail
-// isFile() and are refused rather than followed.
-// Three answers, because two of them are different things:
-//   null      — not a hook path at all. Falls through to the other allowlists,
-//               and the caller gets the ordinary "unknown artifact" refusal.
-//   {file}    — a hook path the board reads and writes.
-//   {error}   — a hook path that is LEGAL and whose tree is not there. Answering
-//               "unknown artifact" to a legal path is a lie: the name is fine,
-//               the id is fine, the only thing missing is a directory. So it
-//               says which one, and what would have fired it.
-function hookTarget(uri) {
-  if (typeof uri !== 'string' || !uri.startsWith('file://')) return null;
-  const file = uri.slice('file://'.length);
-  // path.resolve is idempotent on a clean absolute path — a `..` segment or a
-  // relative path changes it, so `<dir>/../../board.json` never gets this far.
-  if (path.resolve(file) !== file) return null;
-  if (!HOOK_NAME_RE.test(path.basename(file))) return null;
-  const dir = path.dirname(file);
-  const root = hooksDir(WORKSPACE);
-  // '' = a named hook, one level deep. Otherwise the EVENT directory it sits in.
-  let event = '';
-  if (dir !== root) {
-    if (path.dirname(dir) !== root || !HOOK_NAME_RE.test(path.basename(dir))) return null;
-    event = path.basename(dir);
-  }
-  let real;
-  try { real = fs.realpathSync(dir); }
-  catch (e) {
-    if (e.code !== 'ENOENT') return null;
-    // The directory is not there. `hooks/` is a CONSTANT the board owns, so the
-    // write below makes it — the same one level `charterFile` makes for a
-    // lieutenant that never wrote its memory file, and the path the card names
-    // when it says a new hook is a file a lieutenant writes.
-    if (!event) return { file };
-    // An event directory is NOT a constant: creating one invents a lifecycle
-    // event, and a typo'd event is a hook that silently never fires, forever,
-    // with nothing to notice it. So this stays a refusal — one that names the
-    // event and the ones that exist, instead of pretending the path is unknown.
-    return { code: 400, error: 'no hook event directory "' + event + '" — the board fires '
-      + LIFECYCLE_EVENTS.join(', ') + '. Create ' + dir + ' yourself if that is really the event: '
-      + 'one invented here would be a hook that never runs' };
-  }
-  // The directory has to be reached without following a link: a symlinked
-  // hooks/ (or event dir) points somewhere else, and somewhere else is the
-  // whole thing this refuses. Not a hook path, so it refuses as one.
-  if (real !== dir) return null;
-  try { if (!fs.lstatSync(file).isFile()) return null; }
-  catch (e) { if (e.code !== 'ENOENT') return null; }
-  return { file };
-}
+// ---------- the file gate (server/filegate.js) ----------
+// Which files the artifact routes may read and write: a card's listed
+// artifacts, the workspace's playbooks, charters and hooks — nothing else.
+const files = createFileGate({
+  workspace: WORKSPACE,
+  cards: () => board.cards,
+  lieutenants: () => board.lieutenants,
+  attachment: readAttachmentMeta,
+  maxBytes: ARTIFACT_MAX_BYTES,
+});
 
 // ---------- server ----------
 
@@ -4180,20 +3719,11 @@ const server = http.createServer(async (req, res) => {
     // ----- reads -----
     if (route === 'GET /api/board') return sendJson(res, 200, publicBoard(url.searchParams.get('user') || 'user'));
     if (route === 'GET /api/config') return sendJson(res, 200, userConfig());
-    // ----- the TTS engine, on the board's own origin -----
-    // Any method, any path under the prefix, streamed both ways. No engine
-    // configured means no route at all: this falls through to the ordinary 404
-    // and the board is as silent as it is with no tts block.
-    if (p === TTS_PREFIX || p.startsWith(TTS_PREFIX + '/')) {
-      const t = ttsConfig();
-      // p, not a decoded path: what the browser encoded is what the engine gets.
-      if (t) return proxyTts(req, res, t.url, p.slice(TTS_PREFIX.length) + url.search);
-    }
-    // ----- the STT engine, same deal (the websocket half is on 'upgrade') -----
-    if (p === STT_PREFIX || p.startsWith(STT_PREFIX + '/')) {
-      const t = sttConfig();
-      if (t) return proxyStt(req, res, t.url, p.slice(STT_PREFIX.length) + url.search);
-    }
+    // ----- the TTS and STT engines, on the board's own origin -----
+    // Any method, any path under the prefix, streamed both ways (the STT
+    // websocket half is on 'upgrade').
+    if (ttsProxy.handle(req, res, p, url.search)) return;
+    if (sttProxy.handle(req, res, p, url.search)) return;
     if (route === 'GET /api/status') {
       const pending = delivery.pending().length;
       return sendJson(res, 200, {
@@ -4249,151 +3779,36 @@ const server = http.createServer(async (req, res) => {
     // so there is no directory for a relative path to sit in — which is why
     // artifact pages had to inline their assets as base64. `/artifacts/<dir>/<rel>`
     // gives the page a folder, and its siblings load the way every relative path
-    // on the web does. Scoped to the artifact's own directory: <dir> must be the
-    // directory of a listed artifact, and the resolved file must stay inside it —
-    // not as a security claim, but because "this URL means this folder" is what
-    // makes a relative path mean anything.
+    // on the web does. Scoped by the file gate to the directory of a listed
+    // artifact.
     const adir = /^\/artifacts\/([^/]+)\/(.+)$/.exec(p);
     if (adir && req.method === 'GET') {
       let dir, rel;
       try { dir = decodeURIComponent(adir[1]); rel = decodeURIComponent(adir[2]); }
       catch (e) { return sendJson(res, 400, { error: 'bad artifact path' }); }
-      const listed = dir && path.resolve(dir) === dir &&
-        board.cards.some((c) => Array.isArray(c.attributes && c.attributes.artifacts) &&
-          c.attributes.artifacts.some((a) => a && typeof a.uri === 'string' && a.uri.startsWith('file://') &&
-            path.dirname(a.uri.slice('file://'.length)) === dir));
-      if (!listed) return sendJson(res, 404, { error: 'unknown artifact directory' });
-      const file = path.resolve(dir, rel);
-      if (!file.startsWith(dir + path.sep)) return sendJson(res, 403, { error: 'outside the artifact directory' });
-      let st;
-      try { st = fs.statSync(file); }
-      catch (e) { return sendJson(res, 404, { error: 'unreadable: ' + e.message }); }
-      if (!st.isFile()) return sendJson(res, 404, { error: 'not a file' });
-      if (st.size > ARTIFACT_MAX_BYTES) return sendJson(res, 413, { error: 'artifact too large (max ' + ARTIFACT_MAX_BYTES + ' bytes)' });
-      // No sandbox CSP: the board has no auth and binds to the tailnet, so anyone
-      // who reaches it can already ask a lieutenant to run anything. Hardening
-      // this page against that board defends nothing.
-      return sendBytes(req, res, fs.readFileSync(file), {
-        'Content-Type': ARTIFACT_MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
-        'Cache-Control': 'no-store',
-        'X-Content-Type-Options': 'nosniff',
-      });
+      const r = files.readDir(dir, rel);
+      if (r.error) return sendJson(res, r.code, { error: r.error });
+      return sendBytes(req, res, r.bytes, r.headers);
     }
-    // Artifact serve, for the UI's popup viewer. Servable is a uri listed
-    // verbatim in some live card's attributes.artifacts, or one of the
-    // workspace-owned files the same screen edits (playbookSource, charterFile,
-    // hookTarget) — never an arbitrary file read. Same allowlist the write below
-    // uses, plus the packaged playbooks, which are read-only.
-    // Default (no raw): TEXT content of the file. raw=1: the raw
-    // bytes with a real Content-Type, backing the inline <img> and downloads.
+    // Artifact serve, for the UI's popup viewer: whatever the file gate allows
+    // (a card's listed artifacts, or the workspace files the config screen
+    // edits) — never an arbitrary file read. Default: the TEXT content and its
+    // version. raw=1: the bytes with a real Content-Type, backing the inline
+    // <img> and downloads.
     if (route === 'GET /api/artifact') {
-      const uri = url.searchParams.get('uri') || '';
       const raw = url.searchParams.get('raw') === '1' || url.searchParams.get('raw') === 'true';
-      const charter = charterFile(uri);
-      const ht = hookTarget(uri);
-      if (ht && ht.error) return sendJson(res, ht.code, { error: ht.error });
-      const hook = (ht && ht.file) || '';
-      const listed = board.cards.some((c) => Array.isArray(c.attributes && c.attributes.artifacts) &&
-        c.attributes.artifacts.some((a) => a && a.uri === uri)) || !!playbookSource(uri) || !!charter || !!hook;
-      if (!listed) return sendJson(res, 404, { error: 'unknown artifact' });
-      // A promoted chat attachment (attachment://id) resolves to its stored file
-      // via the sidecar; file:// / bare paths read directly.
-      let file = uri.startsWith('file://') ? uri.slice('file://'.length) : uri;
-      let name = path.basename(file);
-      let attMime = '';
-      const am = /^attachment:\/\/(.+)$/.exec(uri);
-      if (am) {
-        const meta = readAttachmentMeta(am[1]);
-        if (!meta) return sendJson(res, 404, { error: 'unknown attachment' });
-        file = meta.path; name = meta.name; attMime = meta.mime || '';
-      }
-      if (raw) {
-        // Byte mode. Only a real local file is servable: an attachment path is
-        // already vetted by readAttachmentMeta; a plain artifact must be a
-        // file:// absolute path with no traversal escaping it (path.resolve is
-        // idempotent on a clean absolute path — a `..` segment or a relative
-        // path changes it, so it is rejected).
-        if (!am) {
-          if (!uri.startsWith('file://')) return sendJson(res, 400, { error: 'not a file artifact' });
-          if (path.resolve(file) !== file) return sendJson(res, 400, { error: 'unsafe artifact path' });
-        }
-        let st;
-        try { st = fs.statSync(file); }
-        catch (e) { return sendJson(res, 404, { error: 'unreadable: ' + e.message }); }
-        if (!st.isFile()) return sendJson(res, 404, { error: 'not a file' });
-        if (st.size > ARTIFACT_MAX_BYTES) return sendJson(res, 413, { error: 'artifact too large (max ' + ARTIFACT_MAX_BYTES + ' bytes)' });
-        const ext = path.extname(name).toLowerCase();
-        // A curated .html/.htm artifact (teach-me page, report) is a self-contained
-        // document meant to be *rendered*: serve it as text/html inline so a page
-        // opened here shows, not its source. Scoped to plain file artifacts, not
-        // attachments (an uploaded .html keeps its neutralized download behavior)
-        // and never a HOOK: a hook is a script whose basename the writer chooses,
-        // so `hooks/report.html` is a legal hook path and rendering it would make
-        // the gate that writes hooks a way to run script on the board's origin.
-        const isHtml = !am && !hook && (ext === '.html' || ext === '.htm');
-        const ctype = isHtml ? 'text/html; charset=utf-8'
-          : am ? (attMime || 'application/octet-stream')
-          : (ARTIFACT_MIME[ext] || 'application/octet-stream');
-        // Images, video, audio, pdf, and rendered html show inline in the browser;
-        // other binaries download. nosniff pins the Content-Type; the sandbox CSP
-        // neutralizes an uploaded SVG/HTML if it is navigated to as a document
-        // (inline <img>/<video> subresources unaffected). A curated .html artifact
-        // is exempt — it is the captain's own deliverable, and sandboxing it against
-        // a board anyone on the tailnet can drive defends nothing.
-        const inline = isHtml || /^(image|video|audio)\//.test(ctype) || ctype === 'application/pdf';
-        let data;
-        try { data = fs.readFileSync(file); }
-        catch (e) { return sendJson(res, 404, { error: 'unreadable: ' + e.message }); }
-        return sendBytes(req, res, data, {
-          'Content-Type': ctype,
-          'Cache-Control': 'private, max-age=31536000, immutable',
-          'X-Content-Type-Options': 'nosniff',
-          ...(isHtml ? {} : { 'Content-Security-Policy': 'sandbox' }),
-          'Content-Disposition': (inline ? 'inline' : 'attachment') + '; filename="' + name.replace(/["\\\r\n]/g, '_') + '"',
-        });
-      }
-      let data;
-      try { data = fs.readFileSync(file); }
-      catch (e) {
-        // A BOARD-OWNED file that is not written yet reads as the empty document
-        // at version '' — whatever kind it is. The board owns the path (it built
-        // it, not the client), so the file's absence is a state, not a 404: a
-        // lieutenant that has never written its memory, a hook nobody has typed
-        // yet. And '' is exactly what the PUT below reads as "I expect no file",
-        // so the first 💾 creates it. A card artifact is NOT board-owned — that
-        // path came from the card, and a missing one is genuinely unreadable.
-        if ((charter || hook) && e.code === 'ENOENT') return sendJson(res, 200, { name, content: '', version: '' });
-        return sendJson(res, 404, { error: 'unreadable: ' + e.message });
-      }
-      if (data.length > 2e6) return sendJson(res, 413, { error: 'file too large to preview' });
-      if (data.includes(0)) return sendJson(res, 415, { error: 'binary file' });
-      // The version travels with the content so an editor can hand it back on
-      // save: sha256 of the exact bytes on disk. Content-derived on purpose —
-      // mtime+size misses two writes in the same second at the same length.
-      return sendJson(res, 200, { name, content: data.toString('utf8'), version: sha256(data) });
+      const r = files.read(url.searchParams.get('uri') || '', { raw });
+      if (r.error) return sendJson(res, r.code, { error: r.error });
+      if (raw) return sendBytes(req, res, r.bytes, r.headers);
+      return sendJson(res, 200, r);
     }
 
-    // Artifact WRITE — what the file editor's save actually does. Deliberately
-    // narrow: this is an artifact editor, not remote arbitrary-file write on
-    // this machine. The board has no auth of its own (the network boundary is
-    // the auth boundary), so every guard below is load-bearing:
-    //   - the uri must ALREADY be listed on a live card, or be a WORKSPACE
-    //     playbook (playbookSource), or a registered lieutenant's charter
-    //     (charterFile), or a hook file (hookTarget) — the GET's allowlist minus
-    //     the packaged playbooks, which are read-only. Anything else is 403, and
-    //     there is no flag to turn it off;
-    //   - file:// only, absolute, no `..` (path.resolve is idempotent on a
-    //     clean absolute path), and no symlink anywhere along it (realpath must
-    //     come back unchanged), so a listed artifact can never be a door to
-    //     somewhere else;
-    //   - attachment:// is immutable: an upload is the record of what was sent.
-    // Lost-update guard: the client sends the version it read. If disk has
-    // moved since, nothing is written and the answer is 409 carrying what is
-    // there now — the captain's text stays on his screen either way. It applies
-    // to EVERY writer, agent included (`bc-axi artifact write`): the door is
-    // locked on both sides or it is not locked.
-    // A write that lands also announces itself on the board SSE (event
-    // `artifact`), so an editor already open on the file follows along.
+    // Artifact WRITE — what the file editor's save actually does. The file
+    // gate decides what is writable and guards the write (no symlink, no `..`,
+    // atomic swap); a version the writer read that no longer matches the disk
+    // is a 409 carrying what is there now, and nothing is written. A write that
+    // lands announces itself on the board SSE (event `artifact`), so an editor
+    // already open on the file follows along.
     if (route === 'PUT /api/artifact') {
       let raw;
       try { raw = await readBodyUpto(req, ARTIFACT_MAX_BYTES + 65536); }
@@ -4404,88 +3819,19 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(raw || '{}');
       const uri = String(body.uri || '');
       if (typeof body.content !== 'string') return sendJson(res, 400, { error: 'content required' });
-      const pbSource = playbookSource(uri);
-      const charter = charterFile(uri);
-      const ht = hookTarget(uri);
-      if (ht && ht.error) return sendJson(res, ht.code, { error: ht.error });
-      const hook = (ht && ht.file) || '';
-      const listed = board.cards.some((c) => Array.isArray(c.attributes && c.attributes.artifacts) &&
-        c.attributes.artifacts.some((a) => a && a.uri === uri)) || pbSource === 'workspace' || !!charter || !!hook;
-      if (!listed) {
-        // A packaged playbook is readable and never writable: it is a git
-        // checkout of this repo, so the edit is a copy into the workspace.
-        if (pbSource === 'packaged') {
-          return sendJson(res, 403, { error: 'a packaged playbook is never written — copy it to the workspace first' });
-        }
-        return sendJson(res, 403, { error: 'not an artifact of any card — refusing to write' });
+      const w = files.write(uri, body.content, body.version);
+      if (w.conflict) {
+        return sendJson(res, 409, {
+          error: 'the file changed on disk since you opened it — nothing was written',
+          version: w.conflict.version, content: w.conflict.content,
+        });
       }
-      if (!uri.startsWith('file://')) return sendJson(res, 403, { error: 'only file:// artifacts are writable' });
-      const file = uri.slice('file://'.length);
-      if (path.resolve(file) !== file) return sendJson(res, 403, { error: 'unsafe artifact path' });
-      // A listed artifact that is not on disk yet is CREATED — that is how a
-      // derived file gets written beside its source (a drawing's .svg), and it
-      // is the SAME lost-update rule with "nothing there" as the version read:
-      // an empty version means "I expect no file", so a file that turned up
-      // meanwhile is still a 409 below. The directory has to be real, for the
-      // same reason the file does.
-      let st = null, real;
-      try { st = fs.statSync(file); real = fs.realpathSync(file); }
-      catch (e) {
-        if (e.code !== 'ENOENT' || String(body.version || '') !== '') {
-          return sendJson(res, 404, { error: 'unreadable: ' + e.message });
-        }
-        const dir = path.dirname(file);
-        // A charter's folder is the board's to make: a lieutenant registered
-        // without one has no other way to get `lieutenants/<id>/`. So is a
-        // workspace's `hooks/` — a fixed name the board owns, and the card's
-        // "a new hook is a file you or a lieutenant writes" goes through this
-        // very route, so a workspace that has no hooks yet must not be the one
-        // place a lieutenant cannot write the first one. An EVENT directory is
-        // never made here: hookTarget refused before we got this far, because a
-        // directory invented from a typo is a hook that never runs.
-        // mkdir is a no-op when it is already there — including when it is a
-        // symlink, which the check right below still refuses.
-        if (charter || hook) { try { fs.mkdirSync(dir, { recursive: true }); } catch (e2) { /* the check below answers */ } }
-        try { if (fs.realpathSync(dir) !== dir) throw new Error('symlink'); }
-        catch (e2) { return sendJson(res, 403, { error: 'artifact path resolves elsewhere (symlink) — refusing to write' }); }
-      }
-      if (st) {
-        if (!st.isFile()) return sendJson(res, 403, { error: 'not a regular file' });
-        if (real !== file) return sendJson(res, 403, { error: 'artifact path resolves elsewhere (symlink) — refusing to write' });
-        let cur;
-        try { cur = fs.readFileSync(file); }
-        catch (e) { return sendJson(res, 404, { error: 'unreadable: ' + e.message }); }
-        if (cur.includes(0)) return sendJson(res, 415, { error: 'binary file' });
-        const version = sha256(cur);
-        if (String(body.version || '') !== version) {
-          return sendJson(res, 409, {
-            error: 'the file changed on disk since you opened it — nothing was written',
-            version, content: cur.toString('utf8'),
-          });
-        }
-      }
-      const next = Buffer.from(body.content, 'utf8');
-      if (next.length > ARTIFACT_MAX_BYTES) return sendJson(res, 413, { error: 'content too large (max ' + ARTIFACT_MAX_BYTES + ' bytes)' });
-      // Atomic swap: write a sibling temp file, then rename over the original.
-      // Truncating the artifact and writing into it would leave it half-written
-      // if the process died mid-write; a rename either happened or it didn't.
-      const tmp = path.join(path.dirname(file), '.' + path.basename(file) + '.bc-' + process.pid + '-' + Date.now() + '.tmp');
-      try {
-        // An existing file keeps its mode. A hook created here is born
-        // EXECUTABLE — a hook the runner would skip silently is not a hook, and
-        // there is no chmod on a phone.
-        fs.writeFileSync(tmp, next, st ? { mode: st.mode & 0o777 } : (hook ? { mode: 0o755 } : {}));
-        fs.renameSync(tmp, file);
-      } catch (e) {
-        try { fs.unlinkSync(tmp); } catch (e2) {}
-        return sendJson(res, 500, { error: 'write failed: ' + e.message });
-      }
-      const newVersion = sha256(next);
+      if (w.error) return sendJson(res, w.code, { error: w.error });
       // Whoever has this file open hears about it right away — that is what
       // makes four hands four hands instead of two taking turns around a
       // reload button. The writer's own client recognizes the echo.
-      broadcastArtifact(uri, newVersion, String(body.client || ''));
-      return sendJson(res, 200, { ok: true, version: newVersion, bytes: next.length });
+      broadcastArtifact(uri, w.version, String(body.client || ''));
+      return sendJson(res, 200, { ok: true, version: w.version, bytes: w.bytes });
     }
 
     // ----- chat attachments (uploads) -----
@@ -5416,9 +4762,9 @@ const server = http.createServer(async (req, res) => {
     // pane streams: connect to watch, disconnect to release. Each sample lands
     // as one `sample` event; samples flow every ~2s, so no extra ping rides here.
     if (route === 'GET /api/sysload/stream') {
-      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+      res.writeHead(200, SSE_HEADERS);
       const unsubscribe = sysload.subscribe((sample) => {
-        res.write('event: sample\ndata: ' + JSON.stringify(sample) + '\n\n');
+        res.write(sseFrame('sample', sample));
       });
       req.on('close', unsubscribe);
       return;
@@ -5426,8 +4772,8 @@ const server = http.createServer(async (req, res) => {
 
     // ----- SSE -----
     if (route === 'GET /api/events') {
-      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-      res.write('event: board\ndata: ' + JSON.stringify(publicBoard('user')) + '\n\n');
+      res.writeHead(200, SSE_HEADERS);
+      res.write(sseFrame('board', publicBoard('user')));
       sseClients.add(res);
       req.on('close', () => sseClients.delete(res));
       return;
@@ -5447,11 +4793,7 @@ const server = http.createServer(async (req, res) => {
 // with no upgrade handler does anyway.
 function onUpgrade(req, socket, head) {
   const u = new URL(req.url, 'http://localhost');
-  const p = u.pathname;
-  if (p === STT_PREFIX || p.startsWith(STT_PREFIX + '/')) {
-    const t = sttConfig();
-    if (t) return proxySttUpgrade(req, socket, head, t.url, p.slice(STT_PREFIX.length) + u.search);
-  }
+  if (sttProxy.upgrade(req, socket, head, u.pathname, u.search)) return;
   socket.destroy();
 }
 server.on('upgrade', onUpgrade);

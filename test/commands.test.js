@@ -13,7 +13,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { startServer, startServerWithLieutenant, withOwner, LT } = require('./helper');
-const { lieutenantSession, workerWindow } = require('../server/names.js');
+const { lieutenantSession, workerWindow } = require('../server/layout.js');
 
 function fakeSession(dir, session) {
   fs.mkdirSync(dir, { recursive: true });

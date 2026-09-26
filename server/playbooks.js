@@ -21,7 +21,7 @@ const PACKAGED_PLAYBOOKS_DIR = path.join(__dirname, '..', 'playbooks');
 // README.md documents the folder for whoever is editing it — it is not a
 // playbook, so it never lists and never resolves as an id.
 const NOT_A_PLAYBOOK = /^readme$/i;
-const ID_RE = /^[\w][\w.-]*$/;
+const { ID_RE } = require(path.join(__dirname, 'layout.js'));
 
 // playbooksDir(stateDir) — the workspace's own playbooks, the ones the user edits.
 function playbooksDir(stateDir) { return path.join(stateDir, 'playbooks'); }
@@ -75,7 +75,6 @@ function resolvePlaybook(stateDir, id) {
 // grow into — and anything else in the block is an error naming its line,
 // because a guess here silently starts the wrong worker.
 const FM_KEYS = ['harness', 'model', 'requires', 'branch', 'keep_worktree', 'teardown'];
-const FM_NAME_RE = /^[\w][\w.-]*$/;
 
 function unquote(s) {
   const m = /^(['"])([\s\S]*)\1$/.exec(s);
@@ -110,7 +109,7 @@ function fmCheck(key, val, at) {
   if (key === 'requires') {
     const names = Array.isArray(val) ? val : [val]; // a lone name is a one-item list
     for (const n of names) {
-      if (typeof n !== 'string' || !FM_NAME_RE.test(n)) {
+      if (typeof n !== 'string' || !ID_RE.test(n)) {
         throw new Error(at + 'requires takes attribute names, e.g. [pr_url, repo_slug] — got: ' + JSON.stringify(n));
       }
     }

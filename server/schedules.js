@@ -13,8 +13,9 @@
 // itself. `hook run` is the one door, and the clock gets no private one.
 //
 // This module is the PURE half — when a window is due, and what a `when` string
-// means. It holds no state, reads no disk and starts no timers; the tick, the
-// firing and the persistence live in server.js, which is where the board is.
+// means. It holds no state, reads no disk and starts no timers; the tick and
+// the firing live in clock.js, and the persistence in server.js, which is
+// where the board is.
 //
 //   when      a cron expression (5 fields, LOCAL time) or an interval (`5m`)
 //   overlap   skip (default) | queue | restart — the policy over `hook run`'s
@@ -27,8 +28,8 @@
 // lose a window nor double-fire one — the windows are a function of the cursor
 // and the clock, not of when the process happened to be awake.
 
-// A schedule name, and the shape every id on this board has.
-const NAME_RE = /^[\w][\w.-]*$/;
+// A schedule name, and the shape every id on this board has (layout.js).
+const { ID_RE: NAME_RE } = require('./layout.js');
 const OVERLAP = ['skip', 'queue', 'restart'];
 const CATCHUP = ['latest', 'all', 'none'];
 

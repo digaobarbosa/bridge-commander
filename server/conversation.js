@@ -6,7 +6,7 @@
 // goes through say(), so the thread append, the QueueItem, the wake and the
 // line move are decided once.
 //
-// A worker is a WINDOW inside its lieutenant's tmux SESSION (names.js —
+// A worker is a WINDOW inside its lieutenant's tmux SESSION (layout.js —
 // workerWindow), so the session alone names the lieutenant for both of them.
 // The window is what tells them apart.
 //

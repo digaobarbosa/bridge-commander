@@ -2,7 +2,7 @@
 // Editing a lieutenant's charter through the artifact routes — what the config
 // screen's lieutenants section rides on.
 //
-// The charter is a file (server/charter.js: <workspace>/lieutenants/<id>/README.md),
+// The charter is a file (server/layout.js: <workspace>/lieutenants/<id>/README.md),
 // so editing one is the file screen and the same PUT /api/artifact a card
 // artifact is saved with: one editor, one version check, one 409. That means
 // exactly one more widening of the gate, and this file is where its edges live.
@@ -16,7 +16,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { startServerWithLieutenant, withOwner } = require('./helper');
-const { charterPath } = require('../server/charter.js');
+const { charterPath } = require('../server/layout.js');
 
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const uriOf = (f) => 'file://' + f;

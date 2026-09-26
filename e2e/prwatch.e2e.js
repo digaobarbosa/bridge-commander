@@ -93,7 +93,7 @@ async function until(what, fn, ms, step = 2000) {
 const RUN = crypto.randomBytes(3).toString('hex');
 const CARD = 'prwatch-' + RUN;
 // the worker lives as a WINDOW inside the owning lieutenant's session
-const names = require(path.join(__dirname, '..', 'server', 'names.js'));
+const names = require(path.join(__dirname, '..', 'server', 'layout.js'));
 const SESSION = names.lieutenantSession(ws, 'ada');
 const WINDOW = names.workerWindow(CARD);
 const TARGET = '=' + SESSION + ':=' + WINDOW;

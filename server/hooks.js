@@ -68,8 +68,8 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { STATE_DIR_NAME, ID_RE } = require(path.join(__dirname, 'layout.js'));
 
-const STATE_DIRNAME = '.bridge-commander';
 const HOOKS_DIRNAME = 'hooks'; // under <workspace>/.bridge-commander/
 const RUNS_FILENAME = 'hookruns.jsonl'; // the trace, under <workspace>/.bridge-commander/
 // Where `bc-axi` lives, APPENDED to every hook's PATH. A hook's whole API is
@@ -80,9 +80,9 @@ const RUNS_FILENAME = 'hookruns.jsonl'; // the trace, under <workspace>/.bridge-
 // is a debugging afternoon nobody asked for.
 const CLI_DIR = path.join(__dirname, '..', 'cli');
 // A hook name, and an event directory name: the id shape the rest of the
-// board uses (playbook ids, lieutenant ids). Keeps `../` and an empty name out
-// of every path this module builds.
-const NAME_RE = /^[\w][\w.-]*$/;
+// board uses (layout.js). Keeps `../` and an empty name out of every path this
+// module builds.
+const NAME_RE = ID_RE;
 // The lifecycle events the board actually fires, alphabetical. Not a gate — a
 // workspace may hold any directory it likes and runHooks runs whatever it is
 // handed — but the ONE list to print when someone spells an event and nothing
@@ -95,9 +95,9 @@ const TEARDOWN_TIMEOUT_MS = 300000;
 const OUTPUT_CAP = 4096; // combined stdout+stderr bytes kept per run
 
 // hooksDir(workspace) — the one directory this module builds every path from.
-function hooksDir(workspace) { return path.join(workspace, STATE_DIRNAME, HOOKS_DIRNAME); }
+function hooksDir(workspace) { return path.join(workspace, STATE_DIR_NAME, HOOKS_DIRNAME); }
 // runsFile(workspace) — the trace.
-function runsFile(workspace) { return path.join(workspace, STATE_DIRNAME, RUNS_FILENAME); }
+function runsFile(workspace) { return path.join(workspace, STATE_DIR_NAME, RUNS_FILENAME); }
 
 // Executable regular files in the event's hook dir, alphabetical. Anything
 // else (subdirs, non-executables, unreadables) is skipped silently.

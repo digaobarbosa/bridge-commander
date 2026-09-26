@@ -1,6 +1,6 @@
 'use strict';
 // Caller identity: a worker is a WINDOW inside its lieutenant's tmux SESSION
-// (names.js — workerWindow), so bc-axi sends both and the server resolves them
+// (layout.js — workerWindow), so bc-axi sends both and the server resolves them
 // through ONE resolver (server/conversation.js identify). A worker must never
 // be taken for its lieutenant: its say wakes the owner, its drain is empty,
 // its ack is refused. Driven end to end through bc-axi with a stub tmux.

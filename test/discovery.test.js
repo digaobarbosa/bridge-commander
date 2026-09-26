@@ -13,7 +13,7 @@ const { spawn } = require('node:child_process');
 const { CLI } = require('./helper');
 const {
   STATE_DIR_NAME, LEGACY_STATE_DIR_NAME, isWorkspace,
-} = require('../server/statedir.js');
+} = require('../server/layout.js');
 
 function tmp() { return fs.mkdtempSync(path.join(os.tmpdir(), 'bc-discovery-')); }
 function write(dir, rel, content) {

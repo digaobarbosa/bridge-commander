@@ -13,7 +13,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { startServerWithLieutenant, withOwner, sleep, LT } = require('./helper');
-const { lieutenantSession, workerWindow } = require('../server/names.js');
+const { lieutenantSession, workerWindow } = require('../server/layout.js');
 
 function git(dir, ...args) {
   return execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
