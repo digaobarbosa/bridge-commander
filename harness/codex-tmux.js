@@ -62,7 +62,15 @@ const TRUST_RE = /Do you trust the contents of this directory|Yes, continue/;
 // composer prompt glyph '›' at a line start. The directory-trust screen shows
 // none of these as a line of its own — and trustRe is checked first anyway.
 const UI_READY_RE = /OpenAI Codex \(v|YOLO mode|\n›/;
-const SETTLE = { trustRe: TRUST_RE, readyRe: UI_READY_RE, label: 'codex' };
+
+// FATAL_RE — screens a codex launch never gets past on its own (strings pinned
+// against the 0.155.1 binary): no binary, the first-run login picker, the
+// update modal (its preselected option runs `brew upgrade` — not ours to press),
+// and `codex resume` of a thread it has no rollout for.
+const FATAL_RE = /codex: command not found|command not found: codex|Sign in with ChatGPT to use Codex|Provide your own API key|Update now \(runs|Skip until next version|No saved session found with ID/;
+// No resumeRe: `codex resume <id>` goes straight into the thread — the picker
+// only appears for a bare `codex resume`, which we never run.
+const SETTLE = { trustRe: TRUST_RE, readyRe: UI_READY_RE, fatalRe: FATAL_RE, label: 'codex' };
 
 // The bypass + notify flags every codex launch (spawn AND resume) carries.
 function launchFlags(stateDir, key, callbackUrl) {
@@ -99,6 +107,8 @@ async function spawn(cwd, prompt, opts = {}) {
       + (extra ? ' ' + extra : '');
     await s.launchAndSettle(s.paneTarget(session, window), launchCmd, SETTLE);
     await deliverPrompt(s.paneTarget(session, window), prompt);
+    // Same last look claude's spawn takes: returning claims a session is here.
+    await s.verifyLive(s.paneTarget(session, window), SETTLE);
   } catch (err) {
     await s.killPane(session, window);
     try { fs.unlinkSync(promptFile); } catch { /* best-effort */ }
@@ -271,4 +281,6 @@ async function runCommand(ref, command, opts = {}) {
 const { onTurnEnd, openPane, paneSnapshot, paneInput, adoptWindow } = s;
 
 module.exports = { spawn, send, alive, resumable, resume, kill, onTurnEnd,
-  openPane, paneSnapshot, paneInput, commands, runCommand, status, adoptWindow };
+  openPane, paneSnapshot, paneInput, commands, runCommand, status, adoptWindow,
+  // Exported for settle-screens.test.js, which pins them against real screens.
+  SETTLE };

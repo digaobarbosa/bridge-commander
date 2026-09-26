@@ -132,3 +132,47 @@ test('slash commands: the shared trio only — codex has NO /autocompact (config
   const ref = { harness: 'codex', session: 'bc-cmd', cwd: '/tmp' };
   await assert.rejects(() => codex.runCommand(ref, '/autocompact 80'), /unknown command \/autocompact/);
 });
+
+// Bug A: codex spawn used to return after the brief was typed without looking
+// again, and its settle had no fatal screens — so a login picker or the update
+// modal could be reported as a running session. Both halves are pinned here.
+const CODEX_READY = 'OpenAI Codex (v0.155.1)\nYOLO mode\n› ';
+const CODEX_LOGIN = '  Welcome to Codex\n\n  Sign in with ChatGPT to use Codex as part of your paid plan\n'
+  + '  or connect an API key for usage-based billing\n\n› 1. Sign in with ChatGPT\n  2. Provide your own API key\n';
+
+test('codex spawn refuses to report success over a screen that is waiting for a person', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-codex-spawn-'));
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-codex-state-'));
+  // settle sees the UI, then the pane turns into the login picker: only the
+  // post-brief look can catch it
+  const mock = mockTmux({ readyTail: [CODEX_READY, CODEX_LOGIN] });
+  try {
+    await assert.rejects(
+      () => codex.spawn(dir, 'a brief', { session: 'bc-cx-verify', stateDir }),
+      (e) => {
+        assert.match(e.message, /needs a person/);
+        assert.match(e.message, /Sign in with ChatGPT/, 'the screen rides back on the failure');
+        return true;
+      });
+  } finally {
+    mock.restore();
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('a codex launch that can never come up ends the wait at once', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-codex-spawn-'));
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-codex-state-'));
+  const mock = mockTmux({ readyTail: '$ codex --dangerously-bypass-approvals-and-sandbox\nzsh: command not found: codex\n$ ' });
+  try {
+    await assert.rejects(
+      () => codex.spawn(dir, 'a brief', { session: 'bc-cx-missing', stateDir }),
+      /could not start[\s\S]*command not found: codex/);
+    assert.strictEqual(mock.calls.filter((c) => c.fn === 'capture').length, 1, 'first look, not 90 of them');
+  } finally {
+    mock.restore();
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
