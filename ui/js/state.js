@@ -27,6 +27,20 @@ let renderFn = () => {};
 export function onRender(fn) { renderFn = fn; }
 export function render() { renderFn(); }
 
+// ---------- board ingest ----------
+// Every board document — SSE push, reconnect refetch, the chat's echo refetch,
+// the 3D room — enters through applyBoard, so no path can skip a tracker.
+const boardSubs = [];
+/** Register fn(doc), run on every board document taken in, before the render. */
+export function onBoard(fn) { boardSubs.push(fn); }
+/** The one entry point for a board document: store it, notify subscribers, render. */
+export function applyBoard(doc) {
+  if (!doc) return;
+  S.doc = doc;
+  for (const fn of boardSubs) fn(doc);
+  render();
+}
+
 // ---------- selectors ----------
 export function cards() { return (S.doc && S.doc.cards) || []; }
 export function card(id) { return cards().find((c) => c.id === id); }
@@ -83,6 +97,21 @@ export function reads() {
     notifSeqs: r.notifSeqs || [],
     threads: r.threads || {},
   };
+}
+/**
+ * Apply a read marker to the local doc until the next broadcast carries it.
+ * The server persists reads without broadcasting (only this user's view moves).
+ */
+export function applyLocalRead(target, ts) {
+  if (!S.doc) return;
+  const all = S.doc.reads || (S.doc.reads = {});
+  const u = all[USER] || (all[USER] = { notifSeq: 0, notifSeqs: [], threads: {} });
+  const threads = u.threads || (u.threads = {});
+  if (!threads[target] || threads[target] < ts) threads[target] = ts;
+  // the board dot reads the server-derived card status, not the marker
+  const m = /^card:(.+)$/.exec(target);
+  const c = m && card(m[1]);
+  if (c && c.status) c.status.unread = false;
 }
 export function threadReadTs(target) { return reads().threads[target] || ''; }
 export function threadUnread(target, msgs) {

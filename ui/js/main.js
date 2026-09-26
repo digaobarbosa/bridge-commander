@@ -1,5 +1,5 @@
 // boot: SSE, header controls, mobile tabs, render orchestration
-import { S, onRender, render, cards, lieutenants, cardUnread, lieutenantUnread, notifUnreadCount, owedTargets, clearFilters, filtersActive } from './state.js';
+import { S, onRender, render, applyBoard, onBoard, cards, lieutenants, cardUnread, lieutenantUnread, notifUnreadCount, owedTargets, clearFilters, filtersActive } from './state.js';
 import { api } from './api.js';
 import { refreshAgoLabels } from './util.js';
 import { trackMessages } from './voice.js';
@@ -332,13 +332,9 @@ let es = null;
 let lastEventAt = Date.now();
 let serverBoot = null;
 
-function applyBoard(doc) {
-  serverBoot = doc.boot || serverBoot;
-  S.doc = doc;
-  trackMessages(S.doc);
-  trackEvents(S.doc);
-  render();
-}
+onBoard((doc) => { serverBoot = doc.boot || serverBoot; });
+onBoard(trackMessages);
+onBoard(trackEvents);
 function refetchBoard() {
   api.board().then(applyBoard).catch(() => {}); // still down — the watchdog retries
 }
