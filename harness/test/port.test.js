@@ -50,6 +50,16 @@ test('isHarnessRef rejects malformed refs', () => {
   assert.ok(isHarnessRef({ harness: 'claude', session: 'bc-1', cwd: '/x' })); // resumeId optional
 });
 
+test('keyOf is the state key; isSpawnableSession is the spawn name rule', () => {
+  const { keyOf, isSpawnableSession } = require('../port.js');
+  assert.strictEqual(keyOf({ harness: 'fake', session: 'bc-a', cwd: '/x' }), 'bc-a');
+  assert.strictEqual(keyOf({ harness: 'fake', session: 'bc-a', window: 'w-1', cwd: '/x' }), 'bc-a:w-1');
+  assert.ok(isSpawnableSession('bc-ws-1a2b3c-lt-ada'));
+  for (const bad of ['main', 'bc-', 'bc-a.b', 'bc-a:b', '', null, undefined]) {
+    assert.ok(!isSpawnableSession(bad), String(bad));
+  }
+});
+
 test('harnessFor dispatches by ref.harness', () => {
   const ref = { harness: 'fake', session: 'bc-1', cwd: '/x' };
   assert.strictEqual(harnessFor(ref), getHarness('fake'));

@@ -14,7 +14,9 @@
 // callbackUrl, extraArgs, allowRoot, installHooks, session, window.
 //
 // A HarnessRef is plain JSON: { harness, session, window?, cwd, resumeId? },
-// with window and resumeId either absent or strings.
+// with window and resumeId either absent or strings. keyOf(ref) is its state
+// key (`session` or `session:window`) — the name a turn-end relay posts and
+// every per-agent state file carries. Nobody outside the harness builds it.
 //
 // A verb a harness cannot honor THROWS with the reason, never silently
 // succeeds. The optional capability verbs (pane viewing, slash commands,
@@ -22,13 +24,15 @@
 // for them lives in ONE place, harness/README.md, and the inventory in
 // docs/api/overview.md.
 
+const { keyOf, isSpawnableSession } = require('./util.js');
+
 const VERBS = ['spawn', 'send', 'alive', 'resumable', 'resume', 'kill', 'onTurnEnd'];
 
 // ---------- paneInput payload validation (the port contract, in one place) ----------
 // Lives HERE, not in an implementation, because every harness that offers
 // paneInput must enforce the SAME contract: a fake that is laxer than the real
 // thing turns route tests green against payloads tmux would choke on. port.js
-// has no dependencies, so both the tmux adapters and the fake can require it.
+// depends only on util.js, so both the tmux adapters and the fake can require it.
 //
 // KEY_RE — tmux's key-name grammar. Anchored, and no branch can begin with '-':
 // tmux is spawned via execFile (an argv array, so no shell) and sendKey passes
@@ -124,4 +128,4 @@ function harnessFor(ref) {
 }
 
 module.exports = { VERBS, registerHarness, getHarness, isHarnessRef, harnessFor,
-  validatePaneInput, KEY_RE, PANE_INPUT_MAX };
+  keyOf, isSpawnableSession, validatePaneInput, KEY_RE, PANE_INPUT_MAX };

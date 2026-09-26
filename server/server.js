@@ -67,7 +67,7 @@ const crypto = require('crypto');
 // The harness port — the ONLY seam the server speaks to agent sessions through
 // (docs/api/overview.md, "harness port"). Lazy builtins: requiring port.js
 // drags in no tmux/claude machinery until a ref is actually dispatched.
-const { isHarnessRef, harnessFor, getHarness } = require(path.join(__dirname, '..', 'harness', 'port.js'));
+const { isHarnessRef, harnessFor, getHarness, keyOf, isSpawnableSession } = require(path.join(__dirname, '..', 'harness', 'port.js'));
 const { createWorktree, releaseWorktree, worktreeToolFor } = require(path.join(__dirname, 'worktrees.js'));
 const { createWorkers } = require(path.join(__dirname, 'workers.js'));
 const { runHooks, runTeardown, listAllHooks, runNamedHook, runningHook, readRuns, lastRuns, hookKey,
@@ -787,7 +787,7 @@ async function respawnFresh(lt, harness) {
   const impl = getHarness(harness || lt.ref.harness);
   // Keep the session name (an incarnation, not a new entity) when it is
   // spawnable; a founder's foreign name gets a workspace-scoped one.
-  const session = /^bc-[A-Za-z0-9_-]+$/.test(lt.ref.session)
+  const session = isSpawnableSession(lt.ref.session)
     ? lt.ref.session : names.lieutenantSession(WORKSPACE, lt.id);
   const window = lt.ref.window || names.LIEUTENANT_WINDOW;
   try { await harnessFor(lt.ref).kill({ ...lt.ref, window }); }
@@ -2069,7 +2069,7 @@ function ownerSession(card) {
   const lt = board.lieutenants.find((l) => l.id === card.owner);
   // Mirror the supervision respawn rule: a founder's foreign session name is
   // not spawnable — those workers get the workspace-scoped lieutenant name.
-  return lt && isHarnessRef(lt.ref) && /^bc-[A-Za-z0-9_-]+$/.test(lt.ref.session)
+  return lt && isHarnessRef(lt.ref) && isSpawnableSession(lt.ref.session)
     ? lt.ref.session
     : names.lieutenantSession(WORKSPACE, card.owner);
 }
@@ -2078,9 +2078,10 @@ function ownerSession(card) {
 // refKey — the harness state key an agent's turn-end hook posts as `session`:
 // the bare tmux session for a session-granular ref, `session:window` for a
 // window-granular one. Lieutenants are window-granular too (their own `lt`
-// window — names.LIEUTENANT_WINDOW), so this is NOT worker-only.
-function refKey(ref) { return ref.window ? ref.session + ':' + ref.window : ref.session; }
-function workerName(ref) { return refKey(ref); }
+// window — names.LIEUTENANT_WINDOW), so this is NOT worker-only. Both are the
+// port's keyOf: the harness owns the key's shape.
+function refKey(ref) { return keyOf(ref); }
+function workerName(ref) { return keyOf(ref); }
 function findWorker(cardId) { return workers.find(cardId); }
 
 // ---------- event dedupe keys (POST /api/cards/<id>/events `key`) ----------

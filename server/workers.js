@@ -13,6 +13,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { keyOf } = require(path.join(__dirname, '..', 'harness', 'port.js'));
 
 // ---------- transitions: the one writer of lifecycle flags ----------
 
@@ -173,7 +174,7 @@ function createWorkers(deps) {
 
   // ---------- lookups ----------
 
-  function refKey(ref) { return ref.window ? ref.session + ':' + ref.window : ref.session; }
+  const refKey = keyOf; // the harness owns the state key's shape
   function find(cardId) { return records().find((w) => w.card === cardId); }
   // A record stops being this card's the moment it is dropped or a newer worker
   // binds the card; every await in here re-asks before touching it.

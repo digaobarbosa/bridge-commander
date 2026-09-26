@@ -13,7 +13,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const t = require('./tmux.js');
 const { validatePaneInput } = require('./port.js');
-const { shellQuote, stateKey, readSessionId } = require('./util.js');
+const { shellQuote, stateKey, keyOf, isSpawnableSession, readSessionId } = require('./util.js');
 
 // A pane sitting back at a bare shell means the agent process exited.
 const SHELLS = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh']);
@@ -137,7 +137,7 @@ function paneExists(session, window, opts) {
 // numeric name would be parsed by tmux as a window INDEX (papercut #8).
 async function claimPaneNames(opts = {}) {
   const session = opts.session || newSessionName();
-  if (!/^bc-[A-Za-z0-9_-]+$/.test(session)) {
+  if (!isSpawnableSession(session)) {
     throw new Error(`invalid session name "${session}" (must match bc-<id>)`);
   }
   const window = opts.window === undefined || opts.window === null ? undefined : String(opts.window);
@@ -314,7 +314,7 @@ async function verifyLive(target, sig, ms = 6000) {
 // polling backstop, so no boundary is missed on filesystems with flaky watch.
 function onTurnEnd(ref, hook, opts = {}) {
   const stateDir = stateDirOf(opts);
-  const file = path.join(stateDir, `${stateKey(ref.session, ref.window)}.turnend.jsonl`);
+  const file = path.join(stateDir, `${keyOf(ref)}.turnend.jsonl`);
   let offset = 0;
   try {
     offset = fs.statSync(file).size;
@@ -500,7 +500,7 @@ async function paneSnapshot(ref, opts = {}) {
 async function paneInput(ref, input = {}) {
   const { key, text } = validatePaneInput(input);
   if (!(await paneExists(ref.session, ref.window))) {
-    throw new Error(`pane ${stateKey(ref.session, ref.window)} is gone`);
+    throw new Error(`pane ${keyOf(ref)} is gone`);
   }
   const target = paneTarget(ref.session, ref.window);
   if (key) await t.sendKey(target, key);
@@ -525,6 +525,7 @@ module.exports = {
   shellQuote,
   newSessionName,
   stateKey,
+  keyOf,
   readSessionId,
   paneTarget,
   paneCommand,

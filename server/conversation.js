@@ -14,11 +14,9 @@
 // in-process in a test (test/conversation.test.js).
 
 const path = require('node:path');
-const { isHarnessRef } = require(path.join(__dirname, '..', 'harness', 'port.js'));
-
-// Same shape as server.js refKey: the state key a harness hook posts as its
-// `session` — `session:window` for a window-granular ref, the bare session else.
-function refKey(ref) { return ref.window ? ref.session + ':' + ref.window : ref.session; }
+// keyOf(ref) — the state key a harness hook posts as its `session`:
+// `session:window` for a window-granular ref, the bare session else.
+const { isHarnessRef, keyOf } = require(path.join(__dirname, '..', 'harness', 'port.js'));
 
 // names.workerWindow always yields `w-<card>`, so the prefix marks a worker's
 // window even when its record is already gone (a stale caller is still not the
@@ -163,17 +161,17 @@ function createConversation(deps) {
     const sid = str(c.sessionId);
     const session = str(c.session);
     const window = str(c.window);
-    const key = str(c.key) || (session && window ? session + ':' + window : '');
+    const key = str(c.key) || (session && window ? keyOf({ session, window }) : '');
     const lts = b.lieutenants.filter((l) => isHarnessRef(l.ref));
     const asLt = (lt) => ({ kind: 'lieutenant', lt });
 
     // Exact addresses first: a conversation id or a full state key names one agent.
     let lt = (sid && lts.find((l) => l.ref.resumeId === sid))
-      || (key && lts.find((l) => refKey(l.ref) === key));
+      || (key && lts.find((l) => keyOf(l.ref) === key));
     if (lt) return asLt(lt);
     const workers = (b.workers || []).filter((w) => w && w.ref);
     const w = (sid && workers.find((x) => x.ref.resumeId === sid))
-      || (key && workers.find((x) => refKey(x.ref) === key));
+      || (key && workers.find((x) => keyOf(x.ref) === key));
     if (w) {
       const card = findCard(w.card);
       return { kind: 'worker', worker: w, card, owner: card ? findLieutenant(card.owner) : null };
@@ -299,4 +297,4 @@ function createConversation(deps) {
     lineHolder, lineFollow, captainTarget, say, pass };
 }
 
-module.exports = { createConversation, parseTarget, CAPTAIN, refKey, isWorkerWindow };
+module.exports = { createConversation, parseTarget, CAPTAIN, isWorkerWindow };

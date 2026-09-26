@@ -58,17 +58,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { SLASH_COMMANDS, runSlashCommand } = require('./agent-status.js');
 const { validatePaneInput } = require('./port.js');
-const { readSessionId } = require('./util.js');
+const { readSessionId, stateKey, keyOf } = require('./util.js');
 const relay = require('./turnend-relay.js');
 
 const sessions = new Map(); // key (session or session:window) -> { alive, cwd, resumeId, transcript, hooks, turns, stateDir, callbackUrl }
-
-function keyOf(session, window) {
-  return window ? session + ':' + window : session;
-}
-function refKey(ref) {
-  return keyOf(ref.session, ref.window);
-}
 
 function fakeStateDir() {
   const dir = process.env.BC_FAKE_STATE;
@@ -88,8 +81,8 @@ function logSend(session, text) {
 }
 
 function get(ref) {
-  const s = sessions.get(refKey(ref));
-  if (!s) throw new Error(`fake: unknown session ${refKey(ref)}`);
+  const s = sessions.get(keyOf(ref));
+  if (!s) throw new Error(`fake: unknown session ${keyOf(ref)}`);
   return s;
 }
 
@@ -176,7 +169,7 @@ const ALIVE_MS = parseInt(process.env.BC_FAKE_ALIVE_MS, 10) > 0
 async function spawn(cwd, prompt, opts = {}) {
   const session = opts.session || 'bc-' + crypto.randomBytes(3).toString('hex');
   const window = opts.window === undefined || opts.window === null ? undefined : String(opts.window);
-  const key = keyOf(session, window);
+  const key = stateKey(session, window);
   if (sessions.has(key) && sessions.get(key).alive) {
     throw new Error(`fake: session ${key} already exists`);
   }
@@ -216,7 +209,7 @@ async function spawn(cwd, prompt, opts = {}) {
 }
 
 async function send(ref, text) {
-  const key = refKey(ref);
+  const key = keyOf(ref);
   const s = sessions.get(key);
   if (!s) {
     // Cross-process fake session: alive iff its marker file exists.
@@ -248,7 +241,7 @@ function assertReadable(key) {
 
 async function alive(ref) {
   if (ALIVE_MS) await new Promise((r) => setTimeout(r, ALIVE_MS));
-  if (ref.window) { assertReadable(refKey(ref)); return live(refKey(ref)); }
+  if (ref.window) { assertReadable(keyOf(ref)); return live(keyOf(ref)); }
   const keys = siblings(ref.session);
   for (const k of keys) assertReadable(k);
   return keys.some(live);
@@ -257,19 +250,19 @@ async function alive(ref) {
 // The resume id, read the way the tmux adapters read it: the relay's record
 // in opts.stateDir first, the ref second.
 function resumeIdOf(ref, opts) {
-  return readSessionId(opts.stateDir, refKey(ref)) || ref.resumeId || undefined;
+  return readSessionId(opts.stateDir, keyOf(ref)) || ref.resumeId || undefined;
 }
 
 // resumable — introspection only: memory survives iff this process still
 // holds the session's transcript under that id.
 async function resumable(ref, opts = {}) {
-  const s = sessions.get(refKey(ref));
+  const s = sessions.get(keyOf(ref));
   const id = resumeIdOf(ref, opts);
   return !!(s && id && id === s.resumeId);
 }
 
 async function resume(ref, opts = {}) {
-  const key = refKey(ref);
+  const key = keyOf(ref);
   const s = sessions.get(key);
   if (s && s.alive) return { ...ref };
   const id = resumeIdOf(ref, opts);
@@ -313,7 +306,7 @@ function onTurnEnd(ref, hook) {
 // tmux semantics: a window-granular ref takes ONLY its window; a
 // session-granular one takes the whole session — every sibling window with it.
 function kill(ref) {
-  for (const key of (ref.window ? [refKey(ref)] : siblings(ref.session))) {
+  for (const key of (ref.window ? [keyOf(ref)] : siblings(ref.session))) {
     const s = sessions.get(key);
     if (s) s.alive = false;
     const marker = markerFile(key);
@@ -328,7 +321,7 @@ function kill(ref) {
 // `session:window` from now on.
 async function adoptWindow(ref, window) {
   if (ref.window) return ref;
-  const key = keyOf(ref.session, window);
+  const key = stateKey(ref.session, window);
   const s = sessions.get(ref.session);
   if (s) {
     sessions.delete(ref.session);
@@ -357,7 +350,7 @@ function logPane(session, event, extra) {
 }
 
 function openPane(ref, opts = {}) {
-  const key = refKey(ref);
+  const key = keyOf(ref);
   const onFrame = typeof opts.onFrame === 'function' ? opts.onFrame : () => {};
   const intervalMs = opts.intervalMs > 0 ? opts.intervalMs
     : (parseInt(process.env.BC_FAKE_PANE_MS, 10) > 0 ? parseInt(process.env.BC_FAKE_PANE_MS, 10) : 1000);
@@ -383,7 +376,7 @@ function openPane(ref, opts = {}) {
 }
 
 async function paneSnapshot(ref) {
-  return 'fake pane ' + refKey(ref) + ' — snapshot\n';
+  return 'fake pane ' + keyOf(ref) + ' — snapshot\n';
 }
 
 // paneInput records the keystroke into the same <key>.pane.jsonl the open/close
@@ -393,7 +386,7 @@ async function paneSnapshot(ref) {
 // would choke on, and two copies of a regex are two regexes that drift.
 async function paneInput(ref, input = {}) {
   const { key, text } = validatePaneInput(input);
-  logPane(refKey(ref), 'input', key ? { key } : { text });
+  logPane(keyOf(ref), 'input', key ? { key } : { text });
 }
 
 // ---------- slash commands + status (OPTIONAL capability verbs — see port.js) ----------
@@ -410,16 +403,16 @@ function commands() {
 }
 
 async function status(ref) {
-  const s = sessions.get(refKey(ref));
+  const s = sessions.get(keyOf(ref));
   if (s) return s.alive ? { ...FAKE_STATUS } : null;
-  const marker = markerFile(refKey(ref));
+  const marker = markerFile(keyOf(ref));
   return marker && fs.existsSync(marker) ? { ...FAKE_STATUS } : null;
 }
 
 function runCommand(ref, command, opts = {}) {
   // The same dispatch the tmux adapters use, so the fake cannot drift from it.
   return runSlashCommand(ref, command, opts, {
-    key: refKey(ref), commands, status, send, passthrough: ['/compact'],
+    key: keyOf(ref), commands, status, send, passthrough: ['/compact'],
   });
 }
 
