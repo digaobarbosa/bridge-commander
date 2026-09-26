@@ -266,8 +266,8 @@ export class Agents {
     this._last = now;
   }
 
-  // Read the board's liveness into the berths. Called from the same refresh that
-  // repaints everything else, so the room is never more than five seconds
+  // Read the board's liveness into the berths. Called from the same repaint that
+  // follows every pushed board, so the room is never more than a beat
   // behind what the board knows.
   paintLiveness(doc) {
     const live = crewLiveness(doc);

@@ -266,7 +266,7 @@ export class ChatPanel extends Panel {
 
   // Paint the tail of a thread. `messages` is the board's own shape:
   // {author, text, ts}. Cheap-skips when nothing has changed, because this is
-  // called from the 5 s refresh and re-laying out forty MSDF paragraphs on a
+  // called on every pushed board and re-laying out forty MSDF paragraphs on a
   // Quest is not free.
   paint(messages) {
     const list = (messages || []).slice(-TAIL);
@@ -330,8 +330,8 @@ export class ChatPanel extends Panel {
         body: JSON.stringify({ target: this.target, text }),
       });
       if (!r.ok) throw new Error(await r.text());
-      // Shown immediately, before the next refresh brings it back from the
-      // board — a reply that takes five seconds to appear feels broken even
+      // Shown immediately, before the next pushed board brings it back — a
+      // message that takes a beat to appear feels broken even
       // when it is not.
       this.addText('you  ' + clock(new Date().toISOString()), { size: W.TYPE.meta, color: COL.faint });
       this.addText(text, { color: COL.dim });
