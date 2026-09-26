@@ -29,6 +29,10 @@ const { seedPlaybooksAndDuties } = require(path.join(SELF_DIR, '..', 'server', '
 // The packaged hooks (this repo's hooks/) are installed into a fresh workspace
 // the way the packaged playbooks are — copies, and only the missing ones.
 const { seedHooks } = require(path.join(SELF_DIR, '..', 'server', 'hooks.js'));
+// The workspace's .claude/settings.local.json (Stop hook, statusLine) has ONE
+// writer, shared with the claude harness — see harness/claude-settings.js.
+const claudeSettings = require(path.join(SELF_DIR, '..', 'harness', 'claude-settings.js'));
+const { excludeFromGit } = require(path.join(SELF_DIR, '..', 'harness', 'util.js'));
 // --charter-file writes the lieutenant's memory file, not a board field — the
 // charter is prose the agent reads at launch (see server/charter.js).
 const { charterPath, readCharter, writeCharter } = require(path.join(SELF_DIR, '..', 'server', 'charter.js'));
@@ -332,7 +336,7 @@ async function cmdOpen() {
   await rebindIfAsked();
   if (opts.host) writeConfigKeys({ host: opts.host }); // a bind that does not survive a restart is not a bind
   const { st, started } = await ensureServer();
-  installStatusLine(WORKSPACE); // self-heal the statusLine wiring on every open
+  await claudeSettings.installStatusLine(WORKSPACE); // self-heal the statusLine wiring on every open
   console.log(boardUrl(st.host));
   console.log((started ? 'started' : 'already running') + ' workspace=' + st.workspace + ' cards=' + st.cards);
 }
@@ -343,16 +347,6 @@ async function cmdOpen() {
 // as the founding lieutenant (its tmux session is the ref), install the
 // workspace-level turn-end Stop hook, scaffold AGENTS.md + captain.md +
 // learnings/, print the board URL. Idempotent — safe to re-run.
-function excludeFromGit(dir, entry) {
-  try {
-    const rel = execFileSync('git', ['-C', dir, 'rev-parse', '--git-path', 'info/exclude'],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    const excl = path.isAbsolute(rel) ? rel : path.join(dir, rel);
-    fs.mkdirSync(path.dirname(excl), { recursive: true });
-    const cur = fs.existsSync(excl) ? fs.readFileSync(excl, 'utf8') : '';
-    if (!cur.split('\n').includes(entry)) fs.appendFileSync(excl, entry + '\n');
-  } catch (e) { /* not a git repo — nothing to exclude */ }
-}
 function slugId(s) {
   return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'lt';
 }
@@ -372,28 +366,6 @@ function seedCharter(id, source) {
   else console.log('charter written to ' + writeCharter(WORKSPACE, id, readInput(source)));
 }
 
-// installStatusLine — MERGE the BC statusLine command into the WORKSPACE's
-// .claude/settings.local.json (create if absent), preserving every other key
-// (hooks, permissions, …). Re-run on every init/open so a rewrite self-heals.
-// NEVER touches user-global ~/.claude/settings.json. The statusline script tees
-// the real context window + rate limits into the sidecar the board reads.
-function installStatusLine(workspace) {
-  const { shellQuote } = require(path.join(SELF_DIR, '..', 'harness', 'tmux-session.js'));
-  const script = path.join(SELF_DIR, '..', 'harness', 'statusline.js');
-  const command = 'node ' + shellQuote(script);
-  const dir = path.join(workspace, '.claude');
-  const file = path.join(dir, 'settings.local.json');
-  let settings = {};
-  try { settings = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { settings = {}; }
-  if (typeof settings !== 'object' || settings === null || Array.isArray(settings)) settings = {};
-  const cur = settings.statusLine;
-  if (!cur || cur.type !== 'command' || cur.command !== command) {
-    settings.statusLine = { type: 'command', command };
-  }
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(settings, null, 2) + '\n');
-  excludeFromGit(workspace, '.claude/settings.local.json');
-}
 // The first schedule, registered ONCE per workspace and never again: a captain
 // who removed gh-watch (or repointed it, or paused it) has said what he wants,
 // and an init that put it back would be an upgrade overwriting a decision.
@@ -465,7 +437,7 @@ async function cmdInit() {
 
   // 2. state dir + server (detached, idempotent)
   fs.mkdirSync(STATE_DIR, { recursive: true });
-  excludeFromGit(WORKSPACE, '.bridge-commander/');
+  await excludeFromGit(WORKSPACE, '.bridge-commander/');
   const { started } = await ensureServer();
   console.log('server ' + (started ? 'started' : 'already running') + ' on port ' + PORT);
 
@@ -500,13 +472,12 @@ async function cmdInit() {
 // dedupes by session_id. NOTE: claude captures hooks at startup, so the
 // founding session's own turn-ends start flowing on its next restart.
 async function installTurnEndHook() {
-  const { installHooks } = require(path.join(SELF_DIR, '..', 'harness', 'claude-tmux.js'));
   // Harness state is workspace-scoped (never the harness's global last-resort
   // dir); BC_HARNESS_STATE stays an explicit override, matching the server.
   const harnessState = process.env.BC_HARNESS_STATE || path.join(STATE_DIR, 'harness');
-  await installHooks(WORKSPACE, 'ws', harnessState, 'http://127.0.0.1:' + PORT + '/api/turn-end');
+  await claudeSettings.installTurnEndHook(WORKSPACE, 'ws', harnessState, 'http://127.0.0.1:' + PORT + '/api/turn-end');
   console.log('turn-end hook installed (.claude/settings.local.json -> /api/turn-end)');
-  installStatusLine(WORKSPACE);
+  await claudeSettings.installStatusLine(WORKSPACE);
   console.log('statusLine installed (.claude/settings.local.json -> real context window sidecar)');
 }
 
@@ -655,7 +626,7 @@ async function cmdInitOnboard() {
 
   // 3. The workspace itself.
   fs.mkdirSync(STATE_DIR, { recursive: true });
-  excludeFromGit(WORKSPACE, '.bridge-commander/');
+  await excludeFromGit(WORKSPACE, '.bridge-commander/');
   if (PORT !== DEFAULT_PORT) writeConfigKeys({ port: PORT }); // so every later bc-axi call finds it
   if (opts.host) writeConfigKeys({ host: opts.host }); // …and so the next start keeps the bind
   await rebindIfAsked(); // a --host that arrives after the board is up still means it

@@ -21,12 +21,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { execFile } = require('node:child_process');
-const s = require('./tmux-session.js');
 const { claudeStatus } = require('./agent-status.js');
 const { tmuxAdapter } = require('./tmux-adapter.js');
+const { installTurnEndHook, writeOutputStyle } = require('./claude-settings.js');
 
-const HOOK_SCRIPT = path.join(__dirname, 'turnend-hook.js');
 const TRUST_RE = /Yes, I trust this folder|Quick safety check/;
 
 // RESUME_RE — the picker `claude --resume` shows when the transcript is big
@@ -76,82 +74,6 @@ const UI_READY_RE = /bypass permissions|esc (to )?interrupt|\n❯/i;
 //              that skips permission prompts on their machine.
 const FATAL_RE = /cannot be used with root\/sudo privileges|Choose the text style|To change this later, run \/theme|claude: command not found|command not found: claude|Bypass Permissions mode|Yes, I accept/;
 const SETTLE = { trustRe: TRUST_RE, resumeRe: RESUME_RE, readyRe: UI_READY_RE, fatalRe: FATAL_RE, label: 'claude' };
-
-// mergeLocalSettings(cwd, mutate) — the read-modify-write of
-// <cwd>/.claude/settings.local.json, in ONE place.
-//
-// Two writers own this file: installHooks (the Stop hook every turn boundary on
-// the board rides on) and writeOutputStyle. Neither may clobber the other, so
-// both read first and write the whole object back — and every decision about
-// HOW that is done has to be the same on both sides. Kept apart, the second
-// copy is free to drift: a different indent, or a corrupt file that one hand
-// recovers from and the other throws on, and the drift shows up as a lieutenant
-// that stopped reporting turn ends.
-//
-// A file that is missing, unparseable, or not a JSON object is replaced by {}:
-// there is nothing to preserve in bytes nothing can read, and refusing to write
-// would leave the caller with no hook and no style either.
-function mergeLocalSettings(cwd, mutate) {
-  const dir = path.join(cwd, '.claude');
-  const file = path.join(dir, 'settings.local.json');
-  fs.mkdirSync(dir, { recursive: true });
-  let settings;
-  try {
-    settings = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    settings = null;
-  }
-  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) settings = {};
-  mutate(settings);
-  fs.writeFileSync(file, JSON.stringify(settings, null, 2) + '\n');
-  return file;
-}
-
-// excludeLocalSettings(cwd) — hide .claude/settings.local.json from git
-// (info/exclude) when cwd is a repo, so a file we wrote never dirties someone's
-// worktree. Sits next to mergeLocalSettings for the same reason: every writer of
-// that file has to make the same decisions about it, and a writer that skipped
-// this step left the untracked file this step exists to prevent. Best-effort —
-// not a repo, no permission, nothing to exclude, and the write still stands.
-async function excludeLocalSettings(cwd) {
-  try {
-    const gitDir = (await new Promise((resolve, reject) => {
-      execFile('git', ['-C', cwd, 'rev-parse', '--git-path', 'info/exclude'],
-        { encoding: 'utf8' }, (err, stdout) => (err ? reject(err) : resolve(stdout)));
-    })).trim();
-    const excl = path.isAbsolute(gitDir) ? gitDir : path.join(cwd, gitDir);
-    fs.mkdirSync(path.dirname(excl), { recursive: true });
-    const cur = fs.existsSync(excl) ? fs.readFileSync(excl, 'utf8') : '';
-    if (!cur.split('\n').includes('.claude/settings.local.json')) {
-      fs.appendFileSync(excl, '.claude/settings.local.json\n');
-    }
-  } catch {
-    // not a git repo — nothing to exclude
-  }
-}
-
-// installHooks — write/merge the Stop hook into <cwd>/.claude/settings.local.json.
-// Idempotent; preserves any existing settings/hooks. Also hides the file from
-// git (info/exclude) when cwd is a repo, so it never dirties a worktree.
-async function installHooks(cwd, session, stateDir, callbackUrl) {
-  const command = ['node', s.shellQuote(HOOK_SCRIPT), s.shellQuote(stateDir), s.shellQuote(session)]
-    .concat(callbackUrl ? [s.shellQuote(callbackUrl)] : [])
-    .join(' ');
-  mergeLocalSettings(cwd, (settings) => {
-    if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
-    if (!Array.isArray(settings.hooks.Stop)) settings.hooks.Stop = [];
-    const ours = settings.hooks.Stop.some((m) =>
-      Array.isArray(m.hooks) && m.hooks.some((h) => h.command === command));
-    if (!ours) {
-      // Drop stale bc hook entries (e.g. a previous session in this cwd) first.
-      settings.hooks.Stop = settings.hooks.Stop.filter((m) =>
-        !(Array.isArray(m.hooks) && m.hooks.some((h) =>
-          typeof h.command === 'string' && h.command.includes(HOOK_SCRIPT))));
-      settings.hooks.Stop.push({ hooks: [{ type: 'command', command }] });
-    }
-  });
-  await excludeLocalSettings(cwd);
-}
 
 // sandboxPrefix(allowRoot) — claude refuses --dangerously-skip-permissions as
 // uid 0 and exits, so as root there is no session to have unless the caller has
@@ -281,13 +203,6 @@ function outputStyles(opts = {}) {
   return out;
 }
 
-// writeOutputStyle — one key, through the shared merge, because installHooks
-// writes its Stop hook into this very file and must survive the write.
-async function writeOutputStyle(cwd, style) {
-  mergeLocalSettings(cwd, (settings) => { settings.outputStyle = style; });
-  await excludeLocalSettings(cwd);
-}
-
 // commands(ref?) — the ref is what makes the style list this SESSION's list: a
 // style installed in the worker's own worktree is offered to that worker and to
 // nobody else. Without a ref only the user-level directory is scanned.
@@ -324,10 +239,10 @@ const profile = {
   settle: SETTLE,
   // `--session-id <uuid>` makes the resume id known at birth (verified 2.1.202).
   idAtBirth: () => crypto.randomUUID(),
-  // installHooks: false — the cwd already carries a workspace-level hook, and
-  // installHooks keeps ONE bc entry per settings file.
+  // opts.installHooks: false — the cwd already carries a workspace-level hook,
+  // and a settings file holds only ONE bc Stop entry (claude-settings.js).
   async prepare(cwd, key, ctx) {
-    if (ctx.opts.installHooks !== false) await installHooks(cwd, key, ctx.stateDir, ctx.callbackUrl);
+    if (ctx.opts.installHooks !== false) await installTurnEndHook(cwd, key, ctx.stateDir, ctx.callbackUrl);
   },
   launch: (ctx) => launchPrefix(ctx.allowRoot)
     + `claude --dangerously-skip-permissions --session-id ${ctx.resumeId}`
@@ -345,9 +260,7 @@ const profile = {
   passthrough: ['/autocompact'],
 };
 
-// installHooks is exported beyond the port so `bc-axi init` can install the
-// workspace-level Stop hook (session-agnostic; the server dedupes by session_id).
-module.exports = { ...tmuxAdapter(profile), installHooks,
+module.exports = { ...tmuxAdapter(profile),
   // Exported for the tests that pin the style list against a temp directory and
   // the built-ins against the binary.
   outputStyles, BUILTIN_OUTPUT_STYLES,

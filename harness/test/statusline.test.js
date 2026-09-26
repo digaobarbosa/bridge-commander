@@ -7,7 +7,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { findWorkspace, writeSidecar, render, fmtEta, toEpochSecs } = require('../statusline.js');
+const { writeSidecar, render, fmtEta } = require('../statusline.js');
 
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -67,19 +67,6 @@ test('writeSidecar: null (writes nothing) when no workspace / no session_id — 
   }
 });
 
-test('findWorkspace: walks up to the nearest .bridge-commander/; null when none', () => {
-  const root = tmpdir('bc-statusline-find-');
-  try {
-    fs.mkdirSync(path.join(root, '.bridge-commander'), { recursive: true });
-    const deep = path.join(root, 'a', 'b', 'c');
-    fs.mkdirSync(deep, { recursive: true });
-    assert.strictEqual(findWorkspace(deep), root);
-    assert.strictEqual(findWorkspace('/'), null);
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-
 test('render: full payload — model, bar, used%, tokens, and both rate limits', () => {
   const now = Date.UTC(2033, 4, 18) / 1; // arbitrary fixed clock (epoch ms)
   const txt = plain(render(fullPayload('s', '/x'), Date.parse('2033-05-18T03:33:20Z')));
@@ -108,15 +95,11 @@ test('render: empty payload → Unknown', () => {
   assert.strictEqual(plain(render({}, 0)), 'Unknown');
 });
 
-test('fmtEta / toEpochSecs: compact forms and format coercion', () => {
+test('fmtEta: compact forms', () => {
   const now = 1_000_000 * 1000; // epoch ms
   assert.strictEqual(fmtEta(1_000_000 + 2 * 86400 + 4 * 3600, now), '2d4h');
   assert.strictEqual(fmtEta(1_000_000 + 3 * 3600 + 12 * 60, now), '3h12m');
   assert.strictEqual(fmtEta(1_000_000 + 45 * 60, now), '45m');
   assert.strictEqual(fmtEta(1_000_000 - 500, now), '0m'); // past → clamped
   assert.strictEqual(fmtEta('nonsense', now), '');
-  // ISO string and epoch-millis both coerce to seconds
-  assert.strictEqual(toEpochSecs('2026-01-01T00:00:00Z'), Math.floor(Date.parse('2026-01-01T00:00:00Z') / 1000));
-  assert.strictEqual(toEpochSecs(1700000000000), 1700000000);
-  assert.strictEqual(toEpochSecs(1700000000), 1700000000);
 });

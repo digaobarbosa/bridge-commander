@@ -13,6 +13,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const t = require('./tmux.js');
 const { validatePaneInput } = require('./port.js');
+const { shellQuote, stateKey, readSessionId } = require('./util.js');
 
 // A pane sitting back at a bare shell means the agent process exited.
 const SHELLS = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh']);
@@ -84,21 +85,8 @@ function recordedSpawnArgs(stateDir, key) {
   return { args: [], allowRoot: false };
 }
 
-function shellQuote(s) {
-  return `'` + String(s).replace(/'/g, `'\\''`) + `'`;
-}
-
 function newSessionName() {
   return 'bc-' + crypto.randomBytes(3).toString('hex');
-}
-
-// stateKey — the per-agent key for prompt/turnend/session-id state files and
-// the turn-end relay's `session` argument. Window-granular agents share their
-// tmux session name with the lieutenant (and sibling workers), so the bare
-// session would collide; the `session:window` form is unique — tmux session
-// names can never contain ':'.
-function stateKey(session, window) {
-  return window ? `${session}:${window}` : session;
 }
 
 // paneTarget — exact-match tmux target for an agent's pane.
@@ -107,19 +95,6 @@ function stateKey(session, window) {
 // `send-keys -t =name` fails with "can't find pane"); the trailing colon
 // (`=name:`) resolves for both. Window-granular: `=session:=window`, exact on
 // both halves, so tmux never pattern-matches or reads the window as an index.
-/**
- * readSessionId(stateDir, key) -> string | null — the resume id the turn-end
- * relay recorded for this agent (refreshed every turn, so it beats the ref's).
- */
-function readSessionId(stateDir, key) {
-  if (!stateDir) return null;
-  try {
-    return fs.readFileSync(path.join(stateDir, `${key}.session-id`), 'utf8').trim() || null;
-  } catch {
-    return null;
-  }
-}
-
 function paneTarget(session, window) {
   return window ? `=${session}:=${window}` : `=${session}:`;
 }
