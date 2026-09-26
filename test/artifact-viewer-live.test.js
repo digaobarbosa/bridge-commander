@@ -5,7 +5,7 @@
 // disk and the captain kept reading the old text until he closed and reopened.
 //
 // detail.js binds DOM at import time, so this drives it against a recording
-// stub DOM (the copytext.test.js trick, one size up): getElementById hands out
+// stub DOM (the md.test.js copyText trick, one size up): getElementById hands out
 // the same fake node per id, and the test reads what the viewer wrote into
 // #av-body. Everything the popup path does not touch answers through a Proxy.
 const test = require('node:test');
