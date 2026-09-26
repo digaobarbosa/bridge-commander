@@ -1,0 +1,4 @@
+#!/bin/bash
+# digest — the playground's named hook: something for the ⚡ screen and the
+# schedules to run that touches nothing outside the temp workspace.
+echo "digest: $(date -u +%H:%M:%S) — nothing to report, this is the playground"
