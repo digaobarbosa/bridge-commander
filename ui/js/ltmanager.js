@@ -14,7 +14,7 @@
 // verb is how it gets opened by accident.
 import { api } from './api.js';
 import { lieutenantColor } from './state.js';
-import { avatarHtml } from './avatars.js';
+import { avatarHtml, validAvatar } from './avatars.js';
 import { openLtSettings } from './ltswitcher.js';
 import { openArtifactFile } from './detail.js';
 
@@ -69,7 +69,7 @@ function paint() {
 // the avatar in its own colour, or a plain dot when it has none
 function face(l) {
   const el = document.createElement('span');
-  if (Number.isInteger(l.avatar) && l.avatar >= 0 && l.avatar <= 63) {
+  if (validAvatar(l.avatar) !== null) {
     el.className = 'lt-face';
     el.style.borderColor = lieutenantColor(l.id);
     el.innerHTML = avatarHtml(l.avatar);

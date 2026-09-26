@@ -2,11 +2,11 @@
 // the lieutenant's main chat or one of its card threads (a card thread's
 // interlocutor is always the owning lieutenant). Whole-window mode switch,
 // premium composer.
-import { S, card, cards, lieutenants, lieutenant, lieutenantColor, lieutenantName, lieutenantAvatar, lieutenantUnread, cardStatus, cardActivityTs, render, threadUnread, targetOwedState, targetOwedStale, USER } from './state.js';
+import { S, card, cards, lieutenants, lieutenant, lieutenantColor, lieutenantName, lieutenantAvatar, lieutenantUnread, cardStatus, cardActivityTs, render, applyBoard, applyLocalRead, threadUnread, targetOwedState, targetOwedStale, USER } from './state.js';
 import { api } from './api.js';
 import { esc, hhmm, dayLabel, cardEmoji, setHtmlIfChanged, fmtSize, isImageMime, statusBlockHtml, ctxBarHtml, owedIndHtml } from './util.js';
 import { md, mdEnhance, copyText } from './md.js';
-import { speakMessage, trackMessages } from './voice.js';
+import { speakMessage } from './voice.js';
 import { openAttachment } from './detail.js';
 import { avatarHtml } from './avatars.js';
 import { isEchoOf, addPending, pendingFor } from './pending.js';
@@ -546,16 +546,8 @@ function markRead(target, ts) {
   marked.set(target, ts);
   api.markThreadRead(target).catch(() => marked.delete(target));
   // The server persists the marker WITHOUT broadcasting (a read only moves
-  // this user's own derivation), so apply it locally: the reads map feeds
-  // threadUnread/bell, the card's server-derived status.unread feeds the
-  // board dot. The next real broadcast carries the same state.
-  const reads = S.doc.reads || (S.doc.reads = {});
-  const u = reads[USER] || (reads[USER] = { notifSeq: 0, notifSeqs: [], threads: {} });
-  const threads = u.threads || (u.threads = {});
-  if (!threads[target] || threads[target] < ts) threads[target] = ts;
-  const m = /^card:(.+)$/.exec(target);
-  const c = m && card(m[1]);
-  if (c && c.status) c.status.unread = false;
+  // this user's own derivation), so apply it locally.
+  applyLocalRead(target, ts);
   // markRead fires from inside render; repaint dots/bell on the next tick
   if (!readRepaint) readRepaint = setTimeout(() => { readRepaint = 0; render(); }, 0);
 }
@@ -838,7 +830,7 @@ async function watchEcho(target, text) {
   for (let i = 0; i < 120; i++) { // 250ms steps: refetch at 3s, hint at 10s, give up at 30s
     if (token !== echoWatch) return;
     if (seen()) { clearSyncHint(); return; }
-    if (i === 12) api.board().then((doc) => { if (token === echoWatch) { S.doc = doc; trackMessages(doc); render(); } }).catch(() => {});
+    if (i === 12) api.board().then((doc) => { if (token === echoWatch) applyBoard(doc); }).catch(() => {});
     if (i === 40) setSyncHint();
     await new Promise((r) => setTimeout(r, 250));
   }

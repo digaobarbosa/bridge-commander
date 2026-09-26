@@ -39,6 +39,9 @@ import { Panel } from './panel.js';
 import { Field } from './field.js';
 import { Target } from './hover.js';
 import * as talk from './talk.js';
+import { USER } from '../state.js';
+import { hhmm } from '../util.js';
+import { api } from '../api.js';
 
 const D = W.PANEL.distM;
 
@@ -266,7 +269,7 @@ export class ChatPanel extends Panel {
 
   // Paint the tail of a thread. `messages` is the board's own shape:
   // {author, text, ts}. Cheap-skips when nothing has changed, because this is
-  // called from the 5 s refresh and re-laying out forty MSDF paragraphs on a
+  // called on every pushed board and re-laying out forty MSDF paragraphs on a
   // Quest is not free.
   paint(messages) {
     const list = (messages || []).slice(-TAIL);
@@ -279,17 +282,17 @@ export class ChatPanel extends Panel {
       this.addText('nothing said yet', { size: W.TYPE.meta, color: COL.faint });
       return;
     }
-    for (const m of list) {
-      const mine = m.author === 'user';
-      // Who, once, small — not on every line and never as a second avatar. The
-      // colour bar down the side carries it the rest of the way.
-      this.addText(
-        (mine ? 'you' : (m.author || 'lieutenant')) + '  ' + clock(m.ts),
-        { size: W.TYPE.meta, color: COL.faint },
-      );
-      this.addText(m.text || '', { color: mine ? COL.dim : COL.text });
-    }
+    for (const m of list) this.addMessage(m);
     this.scrollToEnd();
+  }
+
+  // One message: who and when, once, small — not on every line and never as a
+  // second avatar; the colour bar down the side carries it the rest of the way.
+  // The card surface paints its thread through this too.
+  addMessage(m) {
+    const mine = m.author === USER;
+    this.addText((mine ? 'you' : (m.author || 'lieutenant')) + '  ' + hhmm(m.ts), { size: W.TYPE.meta, color: COL.faint });
+    this.addText(m.text || '', { color: mine ? COL.dim : COL.text });
   }
 
   // Newest at the bottom, and the panel opens looking at it.
@@ -324,17 +327,11 @@ export class ChatPanel extends Panel {
     // half a second later reads as a dropped keystroke.
     this.field.setValue('');
     try {
-      const r = await fetch('/api/feedback', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ target: this.target, text }),
-      });
-      if (!r.ok) throw new Error(await r.text());
-      // Shown immediately, before the next refresh brings it back from the
-      // board — a reply that takes five seconds to appear feels broken even
+      await api.feedback(this.target, text);
+      // Shown immediately, before the next pushed board brings it back — a
+      // message that takes a beat to appear feels broken even
       // when it is not.
-      this.addText('you  ' + clock(new Date().toISOString()), { size: W.TYPE.meta, color: COL.faint });
-      this.addText(text, { color: COL.dim });
+      this.addMessage({ author: USER, text, ts: new Date().toISOString() });
       this._lastPainted = '';
       this.scrollToEnd();
     } catch (e) {
@@ -352,12 +349,4 @@ export class ChatPanel extends Panel {
       this.field.take({ raise: false });
     }
   }
-}
-
-// The time, and only the time. A date on every message is noise in a
-// conversation you are having right now.
-function clock(ts) {
-  const d = new Date(ts);
-  if (!Number.isFinite(d.getTime())) return '';
-  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
 }

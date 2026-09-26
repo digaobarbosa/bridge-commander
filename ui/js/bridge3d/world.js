@@ -92,8 +92,8 @@ export const FLOOR_LOOK = 60;
 //
 // Everything interactive in this room sits on one angular lattice, and the
 // lattice pitch is the floor: a 6.06° responsive region with 1.66° of air beside
-// it. That is 7.72°, and it is the number the whole layout is built out of.
-export const PITCH = BUILD.hit + BUILD.gap;                 // 7.72°
+// it. That is 7.72° (BUILD.hit + BUILD.gap), and it is the number the whole
+// layout is built out of.
 
 // Eight spheres, one per lieutenant, in an arc over the shelves: 0° at the ends
 // rising to +5° in the middle, never higher. Fixed positions that never sort and

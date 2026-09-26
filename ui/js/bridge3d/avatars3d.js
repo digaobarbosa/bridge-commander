@@ -23,10 +23,9 @@
 // canvas is a pair of scissors rather than a drawing surface.
 
 import * as THREE from 'three';
+import { AVATAR_COLS as COLS, validAvatar } from '../avatars.js';
 
 export const SHEET = '/ui/img/avatars.png';
-export const COLS = 8;
-export const COUNT = 64;
 
 // Cut at 192 px whatever the sheet's own cell size is. The biggest an avatar is
 // ever drawn is the portrait disc — 0.155 m at 2.0 m, which is 4.4° — and at
@@ -64,7 +63,7 @@ function cut(entry) {
 // before asking for a face, and the reason nothing here ever degrades to a
 // blank square.
 export function hasAvatar(index) {
-  return !failed && Number.isInteger(index) && index >= 0 && index < COUNT;
+  return !failed && validAvatar(index) !== null;
 }
 
 // A texture for one cell. Returned immediately and filled in when the sheet

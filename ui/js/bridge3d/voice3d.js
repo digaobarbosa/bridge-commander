@@ -32,6 +32,7 @@
 
 import * as THREE from 'three';
 import { setSpeechRoute, setVoiceOn, setSilenceReport, speakingAuthor, skipSpeaking } from '../voice.js';
+import { isActor } from '../state.js';
 
 const _at = new THREE.Vector3();
 
@@ -85,14 +86,14 @@ export function installVoice(sound, agents, report) {
 // on for the visit and there is nothing in here to turn it back off — no
 // toolbar, and no keyboard on a face wearing a headset — so the lieutenant
 // himself is the control. The press keeps its old meaning as well: the chat it
-// opens is where the message he just silenced is written down. Matched by id OR
-// name, the same rule Agents.placeOf uses, because either can be the author
-// stamped on a message. It cuts THAT message and nothing else — a reply from
+// opens is where the message he just silenced is written down. Matched by
+// state.js's isActor (id OR name), because either can be the author stamped
+// on a message. It cuts THAT message and nothing else — a reply from
 // somebody on another berth is still waiting to be heard, and pressing this one
 // is not a decision about it.
 export function hush(lt) {
   const who = speakingAuthor();
-  if (!lt || !who || (who !== lt.id && who !== lt.name)) return false;
+  if (!isActor(lt, who)) return false;
   skipSpeaking();
   return true;
 }

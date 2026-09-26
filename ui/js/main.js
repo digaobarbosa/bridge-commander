@@ -1,6 +1,6 @@
 // boot: SSE, header controls, mobile tabs, render orchestration
-import { S, onRender, render, cards, lieutenants, cardUnread, lieutenantUnread, notifUnreadCount, owedTargets, clearFilters, filtersActive } from './state.js';
-import { api } from './api.js';
+import { S, onRender, render, onBoard, cards, lieutenants, cardUnread, lieutenantUnread, notifUnreadCount, owedTargets, clearFilters, filtersActive } from './state.js';
+import { startLive } from './live.js';
 import { refreshAgoLabels } from './util.js';
 import { trackMessages } from './voice.js';
 import { trackEvents, trackPermissions, renderNotifSettings } from './notifysettings.js';
@@ -324,64 +324,17 @@ onRender(() => {
 // so the board catches up in one pass (no-op if nothing pushed meanwhile).
 onArtifactClose(() => { if (renderPending) { renderPending = false; render(); } });
 
-// ---------- SSE ----------
-// A half-open connection after a server restart can sit silent forever without
-// ever firing onerror, leaving a zombie tab. Two defenses:
-//  - staleness watchdog: the server emits a named `ping` every 25s, so >STALE_MS
-//    of total silence means the stream is dead — tear it down and reconnect;
-//  - boot-id: the board payload carries the server instance id, so a restart is
-//    detected even on a fast auto-retry reconnect.
-// Every (re)open also refetches the full board: events missed while stale are
-// gone for good, and the refetch is what heals the tab.
-const STALE_MS = 40000;
-let es = null;
-let lastEventAt = Date.now();
-let serverBoot = null;
-
-function applyBoard(doc) {
-  serverBoot = doc.boot || serverBoot;
-  S.doc = doc;
-  trackMessages(S.doc);
-  trackEvents(S.doc);
-  trackPermissions(S.doc);
-  render();
-}
-function refetchBoard() {
-  api.board().then(applyBoard).catch(() => {}); // still down — the watchdog retries
-}
-function connect() {
-  if (es) es.close();
-  es = new EventSource('/api/events');
-  es.addEventListener('board', (e) => {
-    lastEventAt = Date.now();
-    const doc = JSON.parse(e.data);
-    const restarted = serverBoot && doc.boot && doc.boot !== serverBoot;
-    applyBoard(doc);
-    if (restarted) refetchBoard(); // new server instance — make sure we hold its current state
-  });
-  // An artifact was written through the board — a file screen open on it follows
-  // along by itself. Not a board payload: no re-render, nothing else reacts.
-  es.addEventListener('artifact', (e) => {
-    lastEventAt = Date.now();
-    try { artifactWritten(JSON.parse(e.data)); } catch (err) {}
-  });
-  es.addEventListener('ping', () => { lastEventAt = Date.now(); });
-  es.onopen = () => {
-    lastEventAt = Date.now();
-    S.connected = true;
-    renderStatusDot();
-    refetchBoard(); // anything pushed while we were away is unrecoverable — resync
-  };
-  es.onerror = () => { S.connected = false; renderStatusDot(); };
-}
-connect();
-setInterval(() => {
-  if (Date.now() - lastEventAt <= STALE_MS) return;
-  lastEventAt = Date.now(); // one reconnect per stale window
-  S.connected = false;
-  renderStatusDot();
-  connect();
-}, 5000);
+// ---------- live board ----------
+// The stream itself (SSE + staleness watchdog + boot id) lives in live.js,
+// shared with the 3D room; this page adds its two trackers and the status dot.
+onBoard(trackMessages);
+onBoard(trackEvents);
+onBoard(trackPermissions);
+startLive({
+  onConnection: renderStatusDot,
+  // a file screen open on the written artifact follows along by itself
+  onArtifact: artifactWritten,
+});
 renderStatusDot();
 // the minute tick: one guarded render pass — the [data-ago] labels are updated
 // in place by the refreshAgoLabels post-pass, and time-derived STATE (the

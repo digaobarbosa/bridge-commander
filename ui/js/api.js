@@ -1,9 +1,12 @@
 // server API — every captain-side write goes through here with actor "user"
-async function j(method, url, body) {
+// `timeoutMs` aborts a request that hangs, so a caller that chains requests is
+// never wedged behind one.
+async function j(method, url, body, timeoutMs) {
   const r = await fetch(url, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : {},
     body: body ? JSON.stringify(body) : undefined,
+    signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined,
   });
   if (!r.ok) {
     // The status and the parsed body ride on the error: a 409 from the artifact
@@ -118,6 +121,10 @@ export const api = {
   addSchedule: (s) => j('POST', '/api/schedules', Object.assign({ actor: 'user' }, s)),
   pauseSchedule: (name, paused) => j('PATCH', '/api/schedules/' + encodeURIComponent(name), { paused }),
   removeSchedule: (name) => j('DELETE', '/api/schedules/' + encodeURIComponent(name)),
+  // a keystroke into a live pane. `url` is the pane's own input door (pane.js
+  // builds it with the window query), bounded so a stalled key cannot wedge
+  // the ones queued behind it.
+  paneInput: (url, payload, timeoutMs) => j('POST', url, payload, timeoutMs),
   // slash commands the current chat target's harness answers (composer autocomplete)
   commands: (target) => j('GET', '/api/commands?target=' + encodeURIComponent(target)),
 };

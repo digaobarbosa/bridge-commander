@@ -22,28 +22,24 @@
 // deliberate — what "working" means is a rule about the board, and a rule about
 // the board should be arguable in a test rather than only in a headset.
 
-// Precedence matters and it is not alphabetical: a lieutenant who is both
-// running a worker AND sitting on something unread is one he needs to look at,
-// so wants-you wins. The louder state is never masked by the busier one.
-export const STATES = ['wants-you', 'working', 'idle'];
+import { USER, readMarker, unreadCount } from '../state.js';
 
 // Whether the captain has seen the last thing this lieutenant said. The read
-// markers are the board's own (`reads.<user>.threads[target]`), which is the
-// same cursor the flat board's bell uses — so the room agrees with the board
-// about what is unread rather than inventing a second opinion.
-export function unansweredReply(lt, reads, user = 'user') {
+// markers and the unread rule are the flat board's own (state.js), so the room
+// agrees with the board about what is unread rather than inventing a second
+// opinion. One deliberate addition: the room never marks a chat read, so the
+// captain having the last word counts as having read it.
+export function unansweredReply(lt, reads) {
   const chat = (lt && lt.chat) || [];
-  if (!chat.length) return false;
   const last = chat[chat.length - 1];
-  // The captain having the last word is never a thing waiting on the captain.
-  if (!last || last.author === 'user') return false;
-  const marks = (reads && reads[user] && reads[user].threads) || {};
-  const seen = Date.parse(marks['lieutenant:' + (lt.id || '')] || 0) || 0;
-  const said = Date.parse(last.ts || 0) || 0;
-  return said > seen;
+  if (!last || last.author === USER) return false;
+  return unreadCount([last], readMarker(reads, 'lieutenant:' + (lt.id || ''))) > 0;
 }
 
-// One lieutenant's state, from the whole payload.
+// One lieutenant's state, from the whole payload. Precedence matters and it is
+// not alphabetical: a lieutenant who is both running a worker AND sitting on
+// something unread is one he needs to look at, so wants-you wins. The louder
+// state is never masked by the busier one.
 export function livenessOf(lt, doc) {
   if (!lt) return 'idle';
   const cards = (doc && doc.cards) || [];

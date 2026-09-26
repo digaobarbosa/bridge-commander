@@ -101,8 +101,8 @@ export class ListPlate {
     });
   }
 
-  // Nothing to say is NOT "clear it": the room writes its status line empty on
-  // every poll, five seconds apart, and a warning wiped by the next tick of a
+  // Nothing to say is NOT "clear it": the room writes its status line empty
+  // whenever the stream reconnects, and a warning wiped by the next tick of a
   // clock is a warning he never read. A note times itself out instead.
   setNote(text) {
     // Through the same door every string the room paints goes through: the

@@ -37,7 +37,8 @@ import { Sound } from './sound.js';
 import { installVoice, askForSound, hush, silence } from './voice3d.js';
 import * as talk from './talk.js';
 import { trackMessages } from '../voice.js';
-import { S } from '../state.js';
+import { S, onBoard, onRender, lieutenants, lieutenant, cards, card, columnTitle } from '../state.js';
+import { startLive } from '../live.js';
 import { installSky, installToneMapping } from './sky.js';
 import { buildTerrace, crewInlay, setAnisotropy } from './place.js';
 import { updateRoots, sortTransparent, rootCount, COL } from './kit.js';
@@ -107,7 +108,10 @@ scene.add(crewInlay());
 
 // ---- the room's contents ---------------------------------------------------
 
-let doc = { cards: [], lieutenants: [], columns: [] };
+// The board as last pushed. state.js holds it (applyBoard, fed by live.js):
+// voice.js reads the roster from there, so the room keeps no copy of its own.
+const EMPTY = { cards: [], lieutenants: [], columns: [] };
+const board = () => S.doc || EMPTY;
 
 const agents = new Agents();
 scene.add(agents.group);
@@ -211,64 +215,55 @@ function openBoard() {
     onCard: openCard,
     onClose: (panel) => { sound.close(panel.group.position); windows.close(panel); },
   }));
-  p.paint(doc);
+  p.paint(board());
   if (fresh) sound.open(p.group.position);
   return p;
 }
 
 // A card, with its body and its thread on one surface — the deliverable and the
 // way to answer it, which are one thing.
-function openCard(card) {
-  const lts = new Map((doc.lieutenants || []).map((l) => [l.id, l]));
-  const cols = new Map((doc.columns || []).map((c) => [c.id, c.title || c.id]));
-  const lt = lts.get(card.owner);
-  const p = windows.show('card:' + card.id, () => new CardPanel({
-    card, tint: W.agentColour(lt && lt.color),
+function openCard(c) {
+  const lt = lieutenant(c.owner);
+  const p = windows.show('card:' + c.id, () => new CardPanel({
+    card: c, tint: W.agentColour(lt && lt.color),
     onClose: (panel) => { sound.close(panel.group.position); windows.close(panel); },
   }));
   p.setTint(W.agentColour(lt && lt.color));
   p.setFace(lt && lt.avatar);
-  p.paintCard(card, lt, cols.get(card.column));
+  p.paintCard(c, lt, columnTitle(c.column));
   sound.open(p.group.position);
   return p;
 }
 
 function repaint() {
-  const lts = new Map((doc.lieutenants || []).map((l) => [l.id, l]));
+  const doc = board();
   agents.paint(doc);
   agents.paintLiveness(doc);
-  // An open chat follows the board: the refresh is what makes a reply arrive
+  // An open chat follows the board: the pushed board is what makes a reply arrive
   // while he is standing there, rather than on the next time he opens it.
-  const cardsById = new Map((doc.cards || []).map((c) => [c.id, c]));
-  const colTitles = new Map((doc.columns || []).map((c) => [c.id, c.title || c.id]));
   for (const p of windows) {
     if (!p.open) continue;
     if (p.key === 'board') { p.paint(doc); continue; }
     let m = /^lieutenant:(.+)$/.exec(p.key || '');
-    if (m) { const lt = lts.get(m[1]); if (lt) p.paint(lt.chat); continue; }
+    if (m) { const lt = lieutenant(m[1]); if (lt) p.paint(lt.chat); continue; }
     m = /^card:(.+)$/.exec(p.key || '');
     if (m) {
-      const c = cardsById.get(m[1]);
-      if (c) p.paintCard(c, lts.get(c.owner), colTitles.get(c.column));
+      const c = card(m[1]);
+      if (c) p.paintCard(c, lieutenant(c.owner), columnTitle(c.column));
     }
   }
 }
 
-async function refresh() {
-  try {
-    doc = await fetch('/api/board').then((r) => r.json());
-    // voice.js reads the roster through state.js — whose voice an author gets is
-    // one rule and it lives there. The room has no SSE and no state layer of its
-    // own, so the poll IS the update.
-    S.doc = doc;
-    repaint();
-    // Whatever arrived since the last poll gets spoken. The first call is the
-    // one that seeds what has already been said, so walking in never replays the
-    // backlog — the same firstLoad the flat board has, and the same file.
-    trackMessages(doc);
-    say('');
-  } catch (e) { say('the board did not answer: ' + ((e && e.message) || e)); }
-}
+// The room is on the same SSE stream as the flat board (live.js). A pushed doc
+// marks the room dirty; the loop repaints at most every REPAINT_MS, because a
+// burst of broadcasts re-laying out a wall of MSDF text would cost Quest frames.
+const REPAINT_MS = 250;
+let dirty = false, repainted = 0;
+onRender(() => { dirty = true; });
+// Whatever arrived since the last doc gets spoken. The first call is the one
+// that seeds what has already been said, so walking in never replays the
+// backlog — the same firstLoad the flat board has, and the same file.
+onBoard(trackMessages);
 
 // ---- entering --------------------------------------------------------------
 
@@ -398,7 +393,7 @@ window.addEventListener('pointermove', (e) => {
 window.addEventListener('keydown', (e) => {
   if (routeKey(e)) return;
   if (e.key === 'b') openBoard();
-  if (e.key === 'c') { const lts = doc.lieutenants || []; if (lts[0]) openChat(lts[0]); }
+  if (e.key === 'c') { const lts = lieutenants(); if (lts[0]) openChat(lts[0]); }
   if (e.key === 'x') windows.closeFront();
 });
 
@@ -429,6 +424,7 @@ renderer.setAnimationLoop((t) => {
   }
   rays.update();
   const now = performance.now();
+  if (dirty && now - repainted >= REPAINT_MS) { dirty = false; repainted = now; repaint(); }
   agents.tick(now);
   plate.tick(now);
   windows.tick(now);
@@ -454,17 +450,15 @@ window.__bridge = {
   // Named, or else whoever has actually been talked to — a photograph of an
   // empty chat proves the frame renders and nothing about the prose in it.
   openChat: (id) => {
-    const lts = doc.lieutenants || [];
-    const lt = (id && lts.find((l) => l.id === id))
-      || lts.slice().sort((a, b) => (b.chat || []).length - (a.chat || []).length)[0];
+    const lt = (id && lieutenant(id))
+      || lieutenants().slice().sort((a, b) => (b.chat || []).length - (a.chat || []).length)[0];
     return lt ? !!openChat(lt) : false;
   },
   // Named, or else the card with the most body on it — a photograph of an empty
   // card proves the frame renders and nothing about the prose in it.
   openCard: (id) => {
-    const cards = doc.cards || [];
-    const c = (id && cards.find((x) => x.id === id))
-      || cards.slice().sort((a, b) => (b.body || '').length - (a.body || '').length)[0];
+    const c = (id && card(id))
+      || cards().slice().sort((a, b) => (b.body || '').length - (a.body || '').length)[0];
     return c ? !!openCard(c) : false;
   },
   // Hold to talk, by name. The bar answers a RAY and nothing else, and a ray is
@@ -485,7 +479,7 @@ window.__bridge = {
   wallFilter: (owner) => {
     const p = windows.find('board');
     if (!p || !p.toggleOwner) return null;
-    p.toggleOwner(owner || ((doc.cards || []).find((c) => c.owner) || {}).owner);
+    p.toggleOwner(owner || (cards().find((c) => c.owner) || {}).owner);
     return p.report();
   },
   wallScroll: () => { const p = windows.find('board'); return p && p.scrollDeepestToEnd ? p.scrollDeepestToEnd() : null; },
@@ -500,7 +494,7 @@ window.__bridge = {
   // can show.
   lit: () => targets().filter((t) => t.state !== 'idle')
     .map((t) => ({ name: t.name, state: t.state, distance: +t.distance.toFixed(2) })),
-  get doc() { return doc; },
+  get doc() { return board(); },
 };
 
 function frontChat() {
@@ -513,5 +507,9 @@ function targets() {
   return out;
 }
 
-refresh().then(() => { gate.classList.add('ready'); });
-setInterval(refresh, 5000);
+startLive({
+  onConnection: (on) => {
+    gate.classList.add('ready');
+    say(on ? '' : 'the board is not answering - reconnecting');
+  },
+});
