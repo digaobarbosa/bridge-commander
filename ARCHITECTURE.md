@@ -44,7 +44,11 @@ them drift.
   pins neither (a playbook's `keep_worktree: true` holds both for a card reworked in place;
   a worktree still holding work is never released, though its session dies anyway) — running
   the playbook's `teardown` command in the checkout first, best effort, so nothing the run
-  started outlives it. A server boot sweeps the leftovers the same way.
+  started outlives it. A server boot sweeps the leftovers the same way. The lifecycle is one
+  module, `server/workers.js`: `transition(w, event)` is the only writer of a worker's flags,
+  and `end(card, trigger)` — handoff, archive, merge, restart, sweep — the only way a worker
+  ends, its rules one table (`END_OF_LIFE`). Its side effects are injected, so it is tested
+  in-process against a stub harness and a fake clock.
 - **The clock is a board object**: schedules live in `board.json` (so they travel with the
   repo, unlike host cron) and fire a NAMED HOOK through the same `hook run` every other caller
   uses. A schedule's cursor is the due time of the last window it handled, so a restart neither
