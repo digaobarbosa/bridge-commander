@@ -23,7 +23,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { runHooks, runNamedHook, runTeardown, listAllHooks, listHooks, readRuns } = require('../server/hooks.js');
-const { startServerWithLieutenant, startServer, withOwner, runCli, sleep, LT } = require('./helper');
+const { startServerWithLieutenant, startServerWithProject, startServer, withOwner, runCli, sleep, until, makeRepo, LT } = require('./helper');
 const { lieutenantSession, workerWindow } = require('../server/names.js');
 
 // A worker's harness key: a WINDOW in its lieutenant's session — the form the
@@ -50,16 +50,6 @@ function scratchWs() { return fs.mkdtempSync(path.join(os.tmpdir(), 'bc-hooks-')
 function runsFile(ws) { return path.join(ws, '.bridge-commander', 'hookruns.jsonl'); }
 function lines(ws) {
   return fs.readFileSync(runsFile(ws), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
-}
-
-async function until(what, fn, ms = 6000) {
-  const deadline = Date.now() + ms;
-  for (;;) {
-    const v = await fn();
-    if (v) return v;
-    if (Date.now() > deadline) throw new Error('timeout waiting for: ' + what);
-    await sleep(50);
-  }
 }
 
 // ================= unit: server/hooks.js against a scratch workspace =================
@@ -407,29 +397,8 @@ test('runTeardown: output keeps the TAIL — where a teardown gives up is the en
 
 // ================= integration: through a real server =================
 
-function makeRepo(root) {
-  const repo = path.join(root, 'srcrepo');
-  fs.mkdirSync(repo, { recursive: true });
-  execFileSync('git', ['init', '-q', '-b', 'main', repo], { stdio: ['ignore', 'pipe', 'pipe'] });
-  fs.writeFileSync(path.join(repo, 'README.md'), 'hi\n');
-  execFileSync('git', ['-C', repo, 'add', '.'], { stdio: ['ignore', 'pipe', 'pipe'] });
-  execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'],
-    { stdio: ['ignore', 'pipe', 'pipe'] });
-  return repo;
-}
-
-async function bootWithProject(extraEnv = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-hooks-int-'));
-  const repo = makeRepo(root);
-  const s = await startServerWithLieutenant({
-    env: Object.assign({
-      BC_FAKE_STATE: path.join(root, 'fake'), BC_WORKTREE_TOOL: 'git',
-      BC_SUPERVISE_INTERVAL_MS: '0', BC_PRWATCH_INTERVAL_MS: '0',
-    }, extraEnv),
-  });
-  await s.api('POST', '/api/projects', { source: repo, name: 'proj' });
-  const teardown = async () => { await s.stop(); fs.rmSync(root, { recursive: true, force: true }); };
-  return { s, root, teardown };
+function bootWithProject(env = {}) {
+  return startServerWithProject({ prefix: 'bc-hooks-int-', env });
 }
 
 // ---------- lifecycle hooks fire on card events ----------

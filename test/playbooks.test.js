@@ -10,12 +10,11 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync } = require('node:child_process');
 const {
   workerBrief, render, listPlaybooks, resolvePlaybook, playbooksDir, seedPlaybooksAndDuties, parsePlaybook,
   briefVars, PACKAGED_PLAYBOOKS_DIR, PACKAGED_SKILL_DIR, FM_KEYS, PLACEHOLDERS, FRONTMATTER,
 } = require('../server/playbooks.js');
-const { startServerWithLieutenant, withOwner, runCli, LT } = require('./helper');
+const { startServerWithProject, withOwner, runCli, LT } = require('./helper');
 const { lieutenantSession, workerWindow } = require('../server/names.js');
 
 function tmpState(files) {
@@ -349,26 +348,8 @@ test('the documented frontmatter keys are exactly FM_KEYS', () => {
 function workerKey(dir, cardId) {
   return lieutenantSession(dir, LT) + ':' + workerWindow(cardId);
 }
-function makeRepo(root) {
-  const repo = path.join(root, 'srcrepo');
-  fs.mkdirSync(repo, { recursive: true });
-  execFileSync('git', ['init', '-q', '-b', 'main', repo], { stdio: ['ignore', 'pipe', 'pipe'] });
-  fs.writeFileSync(path.join(repo, 'README.md'), 'hello\n');
-  execFileSync('git', ['-C', repo, 'add', '.'], { stdio: ['ignore', 'pipe', 'pipe'] });
-  execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'],
-    { stdio: ['ignore', 'pipe', 'pipe'] });
-  return repo;
-}
 async function boot() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-cardplaybook-'));
-  const repo = makeRepo(root);
-  const fdir = path.join(root, 'fake');
-  const s = await startServerWithLieutenant({
-    env: { BC_FAKE_STATE: fdir, BC_WORKTREE_TOOL: 'git',
-      BC_SUPERVISE_INTERVAL_MS: '0', BC_PRWATCH_INTERVAL_MS: '0' },
-  });
-  assert.strictEqual((await s.api('POST', '/api/projects', { source: repo, name: 'proj' })).status, 200);
-  const teardown = async () => { await s.stop(); fs.rmSync(root, { recursive: true, force: true }); };
+  const { s, fdir, teardown } = await startServerWithProject({ prefix: 'bc-cardplaybook-' });
   // the prompt the fake harness was spawned with
   const prompt = (cardId) =>
     JSON.parse(fs.readFileSync(path.join(fdir, workerKey(s.dir, cardId) + '.json'), 'utf8')).prompt;
