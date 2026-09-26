@@ -37,6 +37,9 @@ const BUILTINS = {
   'harness-switch': { emoji: '🔀', level: 1 },
   'needs-captain': { emoji: '🚨', level: 1 },
   line: { emoji: '📞', level: 2 },
+  reset: { emoji: '🧹', level: 1 },
+  'worker-send': { emoji: '📨', level: 2 },
+  'pr-merged': { emoji: '🟣', level: 2 },
 };
 
 test('kinds set/get roundtrip: built-ins under registered, idempotent replace, validation', async () => {

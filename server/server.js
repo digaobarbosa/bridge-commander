@@ -465,6 +465,11 @@ const BUILTIN_KINDS = {
   'harness-switch': { emoji: '🔀', level: 1 },
   'needs-captain': { emoji: '🚨', level: 1 },
   line: { emoji: '📞', level: 2 },
+  // Kinds the server's own verbs emit (/reset, worker send, PR watch): without
+  // an entry here they render on the timeline with no emoji.
+  reset: { emoji: '🧹', level: 1 },
+  'worker-send': { emoji: '📨', level: 2 },
+  'pr-merged': { emoji: '🟣', level: 2 },
 };
 function validKindEntry(v) {
   return !!(v && typeof v === 'object' && typeof v.emoji === 'string' && v.emoji.trim() &&
