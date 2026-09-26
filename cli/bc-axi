@@ -437,11 +437,30 @@ async function seedGhWatchSchedule(owner) {
   }
 }
 
+// Which agent CLI is running this init, read from what each one exports to
+// the commands it runs: claude sets CLAUDECODE (and CLAUDE_SESSION_ID when it
+// has one), codex sets CODEX_THREAD_ID — the thread id `codex resume` takes.
+// --harness wins. Claude also wins a tie: a tmux server started from one agent
+// hands that agent's variables to every session in it, and claude is what
+// every init before this one recorded.
+function callerHarness() {
+  const env = process.env;
+  if (opts.harness) {
+    const resumeId = opts.harness === 'codex' ? env.CODEX_THREAD_ID : env.CLAUDE_SESSION_ID;
+    return { harness: opts.harness, resumeId: resumeId || '' };
+  }
+  if (!env.CLAUDECODE && !env.CLAUDE_SESSION_ID && env.CODEX_THREAD_ID) {
+    return { harness: 'codex', resumeId: env.CODEX_THREAD_ID };
+  }
+  return { harness: 'claude', resumeId: env.CLAUDE_SESSION_ID || '' };
+}
+
 async function cmdInit() {
   if (opts.onboard) return cmdInitOnboard();
   if (!opts.name) {
-    die('usage: bc-axi init --name <founding-lieutenant-name> [--id id] [--charter-file f|-] [--port N] [--host H]\n' +
-      '  Run from inside the tmux session that will BE the founding lieutenant.');
+    die('usage: bc-axi init --name <founding-lieutenant-name> [--id id] [--charter-file f|-] [--harness claude|codex] [--port N] [--host H]\n' +
+      '  Run from inside the tmux session that will BE the founding lieutenant.\n' +
+      '  The harness is read from the environment (claude or codex); --harness overrides it.');
   }
   // 1. teleport precondition: the caller's tmux session becomes the lieutenant's address
   // No tmux command is ever printed for a human to type — not here, not in any
@@ -470,6 +489,7 @@ async function cmdInit() {
   console.error('│  workspace : ' + WORKSPACE + (fresh ? '   (NEW)' : '   (existing)'));
   console.error('│  resolved  : ' + how);
   console.error('│  tmux      : ' + tmuxSession);
+  console.error('│  harness   : ' + callerHarness().harness);
   console.error('└─ if that workspace is wrong, stop now and re-run with --workspace <dir>');
 
   // 2. state dir + server (detached, idempotent)
@@ -478,12 +498,13 @@ async function cmdInit() {
   const { started } = await ensureServer();
   console.log('server ' + (started ? 'started' : 'already running') + ' on port ' + PORT);
 
-  // 3. founding lieutenant: the CALLER's session is its ref. resumeId is learned
-  // from the first turn-end POST (adoption); CLAUDE_SESSION_ID seeds it when the
-  // harness exports it.
+  // 3. founding lieutenant: the CALLER's session is its ref, on the harness the
+  // caller runs on (callerHarness). resumeId is learned from the first turn-end
+  // POST (adoption); the harness's own id seeds it when the environment has one.
   const id = opts.id || idFromName(opts.name);
-  const ref = { harness: 'claude', session: tmuxSession, cwd: WORKSPACE };
-  if (process.env.CLAUDE_SESSION_ID) ref.resumeId = process.env.CLAUDE_SESSION_ID;
+  const who = callerHarness();
+  const ref = { harness: who.harness, session: tmuxSession, cwd: WORKSPACE };
+  if (who.resumeId) ref.resumeId = who.resumeId;
   const body = { name: opts.name, id, ref, actor: 'user' };
   if (opts.color) body.color = opts.color;
   // Before the register, so a session launched off this record already finds it.
@@ -1768,10 +1789,11 @@ if (!commands[cmd]) {
     'Workspace: nearest .bridge-commander/ from cwd upward, or --workspace DIR. Port: workspace config.json (default 4780), or --port N.\n' +
     'Bind host: config.json "host" (default 127.0.0.1 loopback), or --host H on init/open. Never 0.0.0.0 — there is no app auth.\n' +
     '\nserver & workspace:\n' +
-    '  init --name N [--id id] [--charter-file f|-] [--port N] [--host H]\n' +
+    '  init --name N [--id id] [--charter-file f|-] [--harness claude|codex] [--port N] [--host H]\n' +
     '                                         workspace.init (the teleport): run INSIDE tmux; bootstraps\n' +
     '                                         .bridge-commander/, boots the server, registers the caller\'s tmux\n' +
-    '                                         session as the founding lieutenant, installs the turn-end hook,\n' +
+    '                                         session as the founding lieutenant (on the harness its\n' +
+    '                                         environment names; --harness overrides), installs the turn-end hook,\n' +
     '                                         scaffolds AGENTS.md + captain.md + learnings/, seeds the\n' +
     '                                         playbooks and symlinks the worker-duties skill. Idempotent\n' +
     '  init --onboard [--here] [--allow-root] [--port N] [--host H]\n' +
