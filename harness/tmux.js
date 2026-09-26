@@ -172,15 +172,6 @@ async function composerState(target) {
   return classifyComposerLine(raw);
 }
 
-// paneIsBusy(target) — do the last few non-blank lines of the pane show a
-// busy footer (agent mid-turn)?
-async function paneIsBusy(target) {
-  const tail = await tryTmux('capture-pane', '-p', '-t', target, '-S', '-40');
-  if (tail === null) return false;
-  const lines = tail.split('\n').filter((l) => l.trim() !== '').slice(-6);
-  return BUSY_RE.test(lines.join('\n'));
-}
-
 // capture(target, lines) — bounded plain-text pane capture (default 60 lines).
 async function capture(target, lines = 60) {
   const out = await tryTmux('capture-pane', '-p', '-t', target, '-S', `-${lines}`);
@@ -264,7 +255,6 @@ module.exports = {
   stripGhost,
   classifyComposerLine,
   composerState,
-  paneIsBusy,
   capture,
   captureStyled,
   sendLiteral,
