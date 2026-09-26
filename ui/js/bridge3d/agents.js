@@ -27,6 +27,7 @@ import { root, Container, Text, Image, COL, cm, fontFor, inert, safe } from './k
 import { avatarTexture, hasAvatar } from './avatars3d.js';
 import { crewLiveness, motionAt, SETTLE_S } from './liveness.js';
 import { Target } from './hover.js';
+import { isActor } from '../state.js';
 
 export class Agents {
   constructor() {
@@ -236,12 +237,10 @@ export class Agents {
 
   // Where a message's author is standing, in world coordinates — or null for
   // anybody who is not on the arc (the captain, a worker, a lieutenant past the
-  // eighth berth). `actor` is matched by id OR name because that is what the
-  // server stamps on a message and what state.js resolves by, and the two paths
-  // disagreeing about who someone is would put a voice in the wrong place.
+  // eighth berth). `actor` is matched by state.js's isActor — the same rule
+  // voice.js resolves by, so the two can never disagree about who someone is.
   placeOf(actor, out) {
-    if (!actor) return null;
-    const s = this.slots.find((x) => x.lt && (x.lt.id === actor || x.lt.name === actor));
+    const s = this.slots.find((x) => isActor(x.lt, actor));
     return s ? s.group.getWorldPosition(out || new THREE.Vector3()) : null;
   }
 

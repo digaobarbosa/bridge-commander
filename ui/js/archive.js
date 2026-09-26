@@ -5,7 +5,7 @@
 // that make sense on frozen snapshots (text/owner/label/type) apply
 // client-side to the pages loaded so far.
 import { api } from './api.js';
-import { S, cards, lieutenantName, selMatches, render } from './state.js';
+import { S, cards, cardMatches, render } from './state.js';
 
 export const PAGE = 20;
 let recs = [];        // pages loaded so far, newest first
@@ -31,18 +31,12 @@ function fetch(limit, reset) {
     .finally(() => { loading = false; render(); });
 }
 
-function haystack(c) {
-  return [c.title, c.id, c.body, c.type, c.owner, lieutenantName(c.owner), (c.labels || []).join(' ')]
-    .filter(Boolean).join(' ').toLowerCase();
-}
-// the frozen-applicable subset of cardVisible: text, types (OR within), and the
-// owner/label chips via the shared selMatches (OR within a dimension, AND
-// across). status/updated never apply to snapshots — the popup hides them here.
+// the frozen-applicable subset of cardVisible: text, types and the owner/label
+// chips, through the shared cardMatches. age/columns never apply to snapshots
+// — the popup hides them here.
 function archVisible(c) {
-  const q = S.filters.text.trim().toLowerCase();
-  if (q && !haystack(c).includes(q)) return false;
-  if (S.filters.types.length && !S.filters.types.includes(c.type)) return false;
-  return selMatches(c);
+  const f = S.filters;
+  return cardMatches(c, { text: f.text, types: f.types, sel: f.sel }, S.doc);
 }
 
 // visible frozen rows over the loaded pages: latest record per id, minus cards

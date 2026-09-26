@@ -36,7 +36,8 @@ export function setHtmlIfChanged(el, html) {
   return true;
 }
 export function hhmm(iso) {
-  try { return new Date(iso).toTimeString().slice(0, 5); } catch (e) { return ''; }
+  const d = new Date(iso);
+  return Number.isFinite(d.getTime()) ? d.toTimeString().slice(0, 5) : '';
 }
 export function dayLabel(iso) {
   const d = new Date(iso), today = new Date();

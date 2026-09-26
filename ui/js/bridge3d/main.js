@@ -37,7 +37,7 @@ import { Sound } from './sound.js';
 import { installVoice, askForSound, hush, silence } from './voice3d.js';
 import * as talk from './talk.js';
 import { trackMessages } from '../voice.js';
-import { S, onBoard, onRender, lieutenants, cards } from '../state.js';
+import { S, onBoard, onRender, lieutenants, lieutenant, cards, card, columnTitle } from '../state.js';
 import { startLive } from '../live.js';
 import { installSky, installToneMapping } from './sky.js';
 import { buildTerrace, crewInlay, setAnisotropy } from './place.js';
@@ -222,40 +222,34 @@ function openBoard() {
 
 // A card, with its body and its thread on one surface — the deliverable and the
 // way to answer it, which are one thing.
-function openCard(card) {
-  const doc = board();
-  const lts = new Map((doc.lieutenants || []).map((l) => [l.id, l]));
-  const cols = new Map((doc.columns || []).map((c) => [c.id, c.title || c.id]));
-  const lt = lts.get(card.owner);
-  const p = windows.show('card:' + card.id, () => new CardPanel({
-    card, tint: W.agentColour(lt && lt.color),
+function openCard(c) {
+  const lt = lieutenant(c.owner);
+  const p = windows.show('card:' + c.id, () => new CardPanel({
+    card: c, tint: W.agentColour(lt && lt.color),
     onClose: (panel) => { sound.close(panel.group.position); windows.close(panel); },
   }));
   p.setTint(W.agentColour(lt && lt.color));
   p.setFace(lt && lt.avatar);
-  p.paintCard(card, lt, cols.get(card.column));
+  p.paintCard(c, lt, columnTitle(c.column));
   sound.open(p.group.position);
   return p;
 }
 
 function repaint() {
   const doc = board();
-  const lts = new Map((doc.lieutenants || []).map((l) => [l.id, l]));
   agents.paint(doc);
   agents.paintLiveness(doc);
   // An open chat follows the board: the pushed board is what makes a reply arrive
   // while he is standing there, rather than on the next time he opens it.
-  const cardsById = new Map((doc.cards || []).map((c) => [c.id, c]));
-  const colTitles = new Map((doc.columns || []).map((c) => [c.id, c.title || c.id]));
   for (const p of windows) {
     if (!p.open) continue;
     if (p.key === 'board') { p.paint(doc); continue; }
     let m = /^lieutenant:(.+)$/.exec(p.key || '');
-    if (m) { const lt = lts.get(m[1]); if (lt) p.paint(lt.chat); continue; }
+    if (m) { const lt = lieutenant(m[1]); if (lt) p.paint(lt.chat); continue; }
     m = /^card:(.+)$/.exec(p.key || '');
     if (m) {
-      const c = cardsById.get(m[1]);
-      if (c) p.paintCard(c, lts.get(c.owner), colTitles.get(c.column));
+      const c = card(m[1]);
+      if (c) p.paintCard(c, lieutenant(c.owner), columnTitle(c.column));
     }
   }
 }
@@ -456,17 +450,15 @@ window.__bridge = {
   // Named, or else whoever has actually been talked to — a photograph of an
   // empty chat proves the frame renders and nothing about the prose in it.
   openChat: (id) => {
-    const lts = lieutenants();
-    const lt = (id && lts.find((l) => l.id === id))
-      || lts.slice().sort((a, b) => (b.chat || []).length - (a.chat || []).length)[0];
+    const lt = (id && lieutenant(id))
+      || lieutenants().slice().sort((a, b) => (b.chat || []).length - (a.chat || []).length)[0];
     return lt ? !!openChat(lt) : false;
   },
   // Named, or else the card with the most body on it — a photograph of an empty
   // card proves the frame renders and nothing about the prose in it.
   openCard: (id) => {
-    const all = cards();
-    const c = (id && all.find((x) => x.id === id))
-      || all.slice().sort((a, b) => (b.body || '').length - (a.body || '').length)[0];
+    const c = (id && card(id))
+      || cards().slice().sort((a, b) => (b.body || '').length - (a.body || '').length)[0];
     return c ? !!openCard(c) : false;
   },
   // Hold to talk, by name. The bar answers a RAY and nothing else, and a ray is
