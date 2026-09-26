@@ -1,98 +1,33 @@
 #!/usr/bin/env node
 'use strict';
-// codex-notify.js — the codex turn-end relay (analog of turnend-hook.js).
-//
-// Wired at launch by codex-tmux.js via
+// codex-notify.js — codex's notify entry point. codex-tmux.js wires it at launch:
 //   -c notify='["node","<this script>","<stateDir>","<key>","<url>"]'
-// codex invokes the program at every turn boundary with its payload JSON
-// APPENDED AS THE FINAL ARGV (not stdin):
+// and codex runs it at every turn boundary with the payload JSON APPENDED AS
+// THE LAST ARGV (not stdin):
 //   { "type": "agent-turn-complete", "thread-id": "<uuid>", "turn-id": "...",
 //     "cwd": "/abs/worktree", "input-messages": [...], "last-assistant-message": "..." }
-//
-// It normalizes that payload into the EXACT event shape the claude Stop-hook
-// relay emits, so the server's /api/turn-end and the harness onTurnEnd() tail
-// consume codex turn boundaries unchanged:
-//   { ts, session: <key>, event: 'turn-end', session_id: <thread-id>, cwd, tmux_session, text? }
-//
-// It does three things, all best-effort and always exiting 0 fast so it can
-// never wedge the agent:
-//   1. records the codex thread-id at <stateDir>/<key>.session-id
-//      (ground truth for harness.resume, refreshed on every turn)
-//   2. appends one JSON line to <stateDir>/<key>.turnend.jsonl —
-//      the marker file harness.onTurnEnd() watches
-//   3. optionally POSTs the event to a callback URL so a server can learn
-//      turn boundaries without polling
+// Launch lines of live codex sessions name THIS path, so it stays; the work is
+// turnend-relay.js.
 //
 // Usage (as the notify program): node codex-notify.js <stateDir> <key> [url] <payloadJSON>
 
-const fs = require('node:fs');
-const path = require('node:path');
-const { execFileSync } = require('node:child_process');
-
-// The relay runs inside the agent's own pane, so its tmux session identifies
-// the session exactly (the server attributes lieutenant turn-ends by it).
-// Empty when not under tmux; never fails the relay when tmux is absent.
-function tmuxSession() {
-  if (!process.env.TMUX) return '';
-  try {
-    return execFileSync('tmux', ['display-message', '-p', '#S'], { encoding: 'utf8' }).trim();
-  } catch {
-    return '';
-  }
-}
+const { relay } = require('./turnend-relay.js');
 
 async function main() {
   const argv = process.argv;
   const stateDir = argv[2];
   const key = argv[3];
-  // codex appends the payload as the LAST argv; with a url wired the argv is
-  // [node, script, stateDir, key, url, payload], without it one shorter.
+  // With a url wired the argv is [node, script, stateDir, key, url, payload],
+  // without it one shorter.
   if (!stateDir || !key || argv.length < 5) return;
   const url = (argv.length >= 6 ? argv[4] : '') || process.env.BC_TURNEND_URL || '';
-
-  let payload = {};
+  let raw;
   try {
-    payload = JSON.parse(argv[argv.length - 1]);
+    raw = JSON.parse(argv[argv.length - 1]);
   } catch {
     return; // junk payload: nothing to relay
   }
-  if (!payload || payload.type !== 'agent-turn-complete') return; // other notify kinds are not turn boundaries
-
-  const event = {
-    ts: new Date().toISOString(),
-    session: key,
-    event: 'turn-end',
-    session_id: payload['thread-id'] || null,
-    cwd: payload.cwd || null,
-    tmux_session: tmuxSession(),
-  };
-  // What the agent last said, same rule as the claude relay: the server's
-  // worker-stall alert quotes it, and without it a codex worker stalls silently.
-  const said = payload['last-assistant-message'];
-  if (typeof said === 'string' && said.trim()) event.text = said.trim().slice(0, 300);
-
-  try {
-    fs.mkdirSync(stateDir, { recursive: true });
-    if (event.session_id) {
-      fs.writeFileSync(path.join(stateDir, `${key}.session-id`), event.session_id + '\n');
-    }
-    fs.appendFileSync(path.join(stateDir, `${key}.turnend.jsonl`), JSON.stringify(event) + '\n');
-  } catch {
-    // never fail the relay
-  }
-
-  if (url) {
-    try {
-      await fetch(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(event),
-        signal: AbortSignal.timeout(3000),
-      });
-    } catch {
-      // callback is best-effort; the marker file is the reliable channel
-    }
-  }
+  await relay({ harness: 'codex', stateDir, key, url, raw });
 }
 
 main().then(() => process.exit(0), () => process.exit(0));
