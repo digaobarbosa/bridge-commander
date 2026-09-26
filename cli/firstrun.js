@@ -3,9 +3,9 @@
 // anything: is this directory a workspace, an empty folder, or somebody's code?
 // and is the machine able to run a board at all?
 //
-// It lives here rather than in the CLI because the answers are testable facts,
-// and a refusal a stranger will read is the last place to improvise: the order
-// of the checks IS the contract.
+// It lives beside the CLI rather than inside it because the answers are
+// testable facts, and a refusal a stranger will read is the last place to
+// improvise: the order of the checks IS the contract.
 //
 //   1. `.bridge-commander/` present  -> an existing workspace. Continue.
 //      This check comes FIRST because a workspace is itself a git repo with a
@@ -19,7 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const net = require('net');
 const { execFileSync } = require('child_process');
-const { STATE_DIR_NAME, LEGACY_STATE_DIR_NAME } = require(path.join(__dirname, 'layout.js'));
+const { STATE_DIR_NAME, LEGACY_STATE_DIR_NAME } = require(path.join(__dirname, '..', 'server', 'layout.js'));
 
 // Entries that say nothing about what a folder is for. A stranger's "empty
 // folder" has usually already been opened by an agent, and the agent left its
@@ -350,13 +350,8 @@ function portFree(port, host) {
   });
 }
 
-// ---------- onboarding state ----------
-// The steps the board remembers, in order. A re-run reads the step and resumes
-// from it instead of starting the conversation over.
-const ONBOARDING_STEPS = ['board-up', 'tools', 'project', 'checklist', 'done'];
-
 module.exports = {
-  IGNORABLE, MANIFESTS, SOURCE_DIRS, SOURCE_EXT, ONBOARDING_STEPS,
+  IGNORABLE, MANIFESTS, SOURCE_DIRS, SOURCE_EXT,
   isWorkspaceDir, inspectTarget, listPhrase, refusalText,
   hasBin, isRoot, installCommand, tmuxMissingText, gitIdentity, gitIdentityText, portFree,
   rootBlockText, agentMissingText, agentAtHome, handRunLine, diagnoseSpawn,

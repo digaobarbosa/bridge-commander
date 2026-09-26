@@ -76,10 +76,9 @@ const { workerBrief, listPlaybooks, resolvePlaybook, playbooksDir, PACKAGED_PLAY
 // layout.js: where things live in a workspace — the state dir, the charter,
 // and the session names (still read as `names.<fn>` below).
 const names = require(path.join(__dirname, 'layout.js'));
-const { STATE_DIR_NAME, migrateStateDir, migrateHomeStateDir, isId } = require(path.join(__dirname, 'layout.js'));
+const { STATE_DIR_NAME, migrateStateDir, migrateHomeStateDir, isId, ONBOARDING_STEPS,
+  charterPath, readCharter, writeCharter } = require(path.join(__dirname, 'layout.js'));
 const gitrev = require(path.join(__dirname, 'gitrev.js'));
-const { charterPath, readCharter, writeCharter } = require(path.join(__dirname, 'layout.js'));
-const { ONBOARDING_STEPS } = require(path.join(__dirname, 'firstrun.js'));
 const { makeProxy, engineUrl } = require(path.join(__dirname, 'proxy.js'));
 const { execFile, execFileSync } = require('child_process');
 

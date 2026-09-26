@@ -81,6 +81,12 @@ function migrateHomeStateDir(home) {
   return nu;
 }
 
+// ---------- onboarding ----------
+// The steps the board remembers, in order. A re-run reads the step and resumes
+// from it instead of starting the conversation over. The server validates a
+// step against this list and the CLI walks it, so it lives here, between them.
+const ONBOARDING_STEPS = ['board-up', 'tools', 'project', 'checklist', 'done'];
+
 // ---------- the charter ----------
 // The charter is the one thing on a lieutenant the board stored but never used:
 // prose an agent reads at launch. So it lives where the agent already looks —
@@ -153,6 +159,7 @@ module.exports = {
   ID_RE, isId,
   STATE_DIR_NAME, LEGACY_STATE_DIR_NAME,
   migrateStateDir, resolveStateDir, migrateHomeStateDir, isWorkspace,
+  ONBOARDING_STEPS,
   charterPath, readCharter, writeCharter,
   workspaceDisc, lieutenantSession, workerWindow, LIEUTENANT_WINDOW,
 };

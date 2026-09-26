@@ -20,7 +20,8 @@ const SELF_DIR = path.dirname(fs.realpathSync(process.argv[1]));
 // BC_SERVER_JS is a test-only seam: it lets tests point auto-boot at a
 // deliberately-crashing script to exercise the boot-failure path.
 const SERVER_JS = process.env.BC_SERVER_JS || path.join(SELF_DIR, '..', 'server', 'server.js');
-const { STATE_DIR_NAME, LEGACY_STATE_DIR_NAME, migrateStateDir, resolveStateDir, migrateHomeStateDir, isWorkspace, isId } =
+const { STATE_DIR_NAME, LEGACY_STATE_DIR_NAME, migrateStateDir, resolveStateDir, migrateHomeStateDir, isWorkspace, isId,
+  ONBOARDING_STEPS } =
   require(path.join(SELF_DIR, '..', 'server', 'layout.js'));
 const gitrev = require(path.join(SELF_DIR, '..', 'server', 'gitrev.js'));
 // The playbooks a workspace is seeded with, and the worker-duties skill that
@@ -600,7 +601,7 @@ async function settleOnboardPort(fr) {
 }
 
 async function cmdInitOnboard() {
-  const fr = require(path.join(SELF_DIR, '..', 'server', 'firstrun.js'));
+  const fr = require(path.join(SELF_DIR, 'firstrun.js'));
 
   // 1. What IS this directory? Decided before one byte is written, in the one
   //    order that works: workspace, then empty, then refuse and name what it found.
@@ -778,7 +779,7 @@ async function cmdOnboarding() {
   if (sub !== 'set') die('usage: bc-axi onboarding [--json] | bc-axi onboarding set <step> [--note "..."]');
   const step = positional[1];
   if (!step) die('usage: bc-axi onboarding set <step> [--note "..."]  (steps: '
-    + require(path.join(SELF_DIR, '..', 'server', 'firstrun.js')).ONBOARDING_STEPS.join(' | ') + ')');
+    + ONBOARDING_STEPS.join(' | ') + ')');
   const body = { step };
   if (opts.note != null) body.note = opts.note;
   let r;
