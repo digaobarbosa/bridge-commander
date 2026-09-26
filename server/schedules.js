@@ -13,8 +13,9 @@
 // itself. `hook run` is the one door, and the clock gets no private one.
 //
 // This module is the PURE half — when a window is due, and what a `when` string
-// means. It holds no state, reads no disk and starts no timers; the tick, the
-// firing and the persistence live in server.js, which is where the board is.
+// means. It holds no state, reads no disk and starts no timers; the tick and
+// the firing live in clock.js, and the persistence in server.js, which is
+// where the board is.
 //
 //   when      a cron expression (5 fields, LOCAL time) or an interval (`5m`)
 //   overlap   skip (default) | queue | restart — the policy over `hook run`'s
