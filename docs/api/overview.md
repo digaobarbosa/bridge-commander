@@ -372,3 +372,17 @@ request ahead of provisioning and a spawn. `BC_TEARDOWN_TIMEOUT_MS` overrides bo
 
 The workspace `AGENTS.md` is the lieutenants' shared memory; its first instruction loads the
 skill, and the skill loads `captain.md` + learnings.
+
+## Plugins (proposed — not implemented)
+
+[docs/rfc/plugins.md](../rfc/plugins.md) proposes a plugin system around this kernel. None
+of it is in the DNA until it ships. What it would add at this altitude:
+
+- **A harness is an adapter family + a profile.** Adapter families (`tmux`, `acp`, `fake`)
+  are kernel; plugins contribute profiles, and a derived profile is JSON (`extends` a
+  built-in, adds `env` by `${VAR}` reference only). Options (model, effort) are best-effort —
+  an unsupported one is dropped with a timeline warning; verbs still throw.
+- **Commands** are the one unit of behaviour a plugin adds to a card; a tracked command run
+  is an **activity**, traced like a hook run and owed to the card's owner on failure.
+- **Events** stay observe-only: the rule above that hooks never block the lifecycle outcome
+  holds for plugins too, unless deliberately changed here.
