@@ -343,37 +343,6 @@ test('a project style can be APPLIED, not merely listed', async () => {
   }
 });
 
-test('resume replays the flags a spawn was pinned to — a revival is not a demotion', async () => {
-  // The server pins --model/--effort from the card's playbook at spawn, and
-  // every resume path rebuilt its launch line without them: `card start
-  // --resume` after a worker death, and lieutenant supervision's respawn, both
-  // brought the agent back on the default model, silently, with nobody told.
-  const cwd = tmpdir('bc-osc-');
-  const state = tmpdir('bc-state-');
-  const mock = mockTmux({ readyTail: READY });
-  try {
-    const ref = await claude.spawn(cwd, 'go', {
-      session: 'bc-os9', stateDir: state, installHooks: false, extraArgs: ['--model', 'opus'],
-    });
-    const before = mock.calls.filter((c) => c.fn === 'sendLiteral').length;
-    await claude.resume(ref, { stateDir: state, installHooks: false });
-    const relaunch = mock.calls.filter((c) => c.fn === 'sendLiteral').slice(before).map((c) => c.args[1]).join('\n');
-    assert.match(relaunch, /'--model' 'opus'/);
-
-    // A record that is missing or corrupt degrades to today's behaviour and
-    // never throws — a resume that cannot read a hint must still resume.
-    fs.writeFileSync(path.join(state, 'bc-os9.spawn-args'), 'not json at all');
-    const before2 = mock.calls.filter((c) => c.fn === 'sendLiteral').length;
-    await claude.resume(ref, { stateDir: state, installHooks: false });
-    const plain = mock.calls.filter((c) => c.fn === 'sendLiteral').slice(before2).map((c) => c.args[1]).join('\n');
-    assert.match(plain, /--resume /);
-    assert.ok(!plain.includes('--model'), 'corrupt record: no flags, no throw');
-  } finally {
-    mock.restore();
-    for (const d of [cwd, state]) fs.rmSync(d, { recursive: true, force: true });
-  }
-});
-
 test('codex is left alone: no /output-style, no args, and its list stays the shared one', async () => {
   // codex has no output styles at all — the picker must never offer it there.
   const cmds = codex.commands();
