@@ -2014,5 +2014,6 @@ if (!commands[cmd]) {
   // here. A down server, an unknown commit, or a match all print nothing extra.
   driftNote().then((n) => die(usage + (n ? '\n\n⚠ ' + n : '')), () => die(usage));
 } else {
-  commands[cmd]().catch((e) => die(e.message));
+  // A refusal prints the server's own sentence, not the raw JSON envelope.
+  commands[cmd]().catch((e) => die(e.body && e.body.error ? e.body.error + ' (HTTP ' + e.status + ')' : e.message));
 }
