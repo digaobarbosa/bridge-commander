@@ -142,6 +142,59 @@ test('card owner change: applies when no worker bound, timeline event; unknown l
   }
 });
 
+// The owner check passes and the playbook check fails: a half-applied patch
+// would sit in memory until some unrelated save wrote it to disk.
+test('card patch is all-or-nothing: a bad playbook leaves the owner change unapplied, on disk too', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    await s.api('POST', '/api/lieutenants', { name: 'Grace', id: 'grace' });
+    await s.api('POST', '/api/cards', withOwner({ title: 'Held' }));
+    const before = (await s.api('GET', '/api/cards/held')).body;
+
+    const r = await s.api('PATCH', '/api/cards/held', { owner: 'grace', playbook: 'no-such-playbook', title: 'Renamed' });
+    assert.strictEqual(r.status, 400);
+    assert.match(r.body.error, /unknown playbook/);
+
+    // an unrelated mutation saves the board
+    assert.strictEqual((await s.api('POST', '/api/cards', withOwner({ title: 'Other' }))).status, 200);
+
+    const card = (await s.api('GET', '/api/cards/held')).body;
+    assert.strictEqual(card.owner, LT);
+    assert.strictEqual(card.title, 'Held');
+    assert.strictEqual(card.events.length, before.events.length, 'no phantom owner event');
+    const stored = JSON.parse(fs.readFileSync(path.join(s.dir, '.bridge-commander', 'board.json'), 'utf8'))
+      .cards.find((c) => c.id === 'held');
+    assert.strictEqual(stored.owner, LT);
+    assert.ok(!stored.events.some((e) => /^owner:/.test(e.text)), 'nothing phantom persisted');
+  } finally {
+    await s.stop();
+  }
+});
+
+// A bad body is the caller's fault (400); a failed board write is the server's (500).
+test('router errors: malformed JSON is a 400, a saveBoard disk failure is a 500', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    await s.api('POST', '/api/cards', withOwner({ title: 'Held' }));
+    let res = await fetch(s.base + '/api/cards/held', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: '{not json',
+    });
+    assert.strictEqual(res.status, 400);
+    assert.ok((await res.json()).error);
+
+    // a directory where saveBoard writes its temp file makes the write throw
+    const tmp = path.join(s.dir, '.bridge-commander', 'board.json.tmp');
+    fs.mkdirSync(tmp);
+    try {
+      const r = await s.api('PATCH', '/api/cards/held', { title: 'Renamed' });
+      assert.strictEqual(r.status, 500, JSON.stringify(r.body));
+      assert.match(r.body.error, /EISDIR|directory/);
+    } finally { fs.rmdirSync(tmp); }
+  } finally {
+    await s.stop();
+  }
+});
+
 test('card move: lieutenant handoff to review only; captain moves elsewhere apply', async () => {
   const s = await startServerWithLieutenant();
   try {
