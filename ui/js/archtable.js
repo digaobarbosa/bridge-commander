@@ -5,8 +5,9 @@
 // opens the same card detail as live cards — body, timeline, frozen thread,
 // read-only — where unarchive lives as the card's one action. Label/owner
 // clicks keep feeding the shared filter popup.
-import { S, lieutenant, lieutenantColor, render, toggleFilter, filterSelected } from './state.js';
-import { esc, agoSpanHtml, cardEmoji, cardPrs, prChipHtml, setHtmlIfChanged } from './util.js';
+import { S, lieutenantColor, render, toggleFilter, filterSelected } from './state.js';
+import { esc, agoSpanHtml, cardPrs, prChipHtml, setHtmlIfChanged } from './util.js';
+import { cardFacts, archiveReasonHtml } from './cardview.js';
 import { labelChipHtml } from './labels.js';
 import { openArchivedDetail } from './detail.js';
 import { ensureArchive, archivedRows, archiveStats, loadMore, PAGE } from './archive.js';
@@ -15,15 +16,13 @@ const archEl = document.getElementById('archive');
 
 function rowHtml(row) {
   const c = row.c;
-  const l = lieutenant(c.owner);
-  const r = row.arch.reason === 'merged' ? 'merged' : 'killed';
+  const f = cardFacts(c, S.doc, Date.now(), row.arch); // frozen: nothing live, nothing editable
   return '<tr class="arch" data-id="' + esc(c.id) + '">' +
-    '<td class="c-title"><span class="tv-emoji">' + esc(cardEmoji(c)) + '</span>' +
+    '<td class="c-title"><span class="tv-emoji">' + esc(f.emoji) + '</span>' +
     '<span class="tv-title">' + esc(c.title || c.id) + '</span></td>' +
-    '<td class="c-status"><span class="tv-rsn tv-rsn-' + r + '"' + (row.arch.note ? ' title="' + esc(row.arch.note) + '"' : '') + '>' +
-    (r === 'merged' ? '🏁 merged' : '🪦 killed') + '</span></td>' +
+    '<td class="c-status">' + archiveReasonHtml(f) + '</td>' +
     '<td class="c-owner' + (filterSelected('owner', c.owner) ? ' active' : '') + '" data-owner="' + esc(c.owner) + '" title="click: filter by lieutenant · alt-click: exclude">' +
-    '<span class="dot" style="background:' + esc(lieutenantColor(c.owner)) + '"></span>' + esc((l && l.name) || c.owner) + '</td>' +
+    '<span class="dot" style="background:' + esc(lieutenantColor(c.owner)) + '"></span>' + esc(f.ownerName) + '</td>' +
     '<td class="c-labels hide-m">' + (c.labels || []).map((n) => labelChipHtml(n, filterSelected('label', n))).join('') + '</td>' +
     '<td class="c-prs hide-m">' + cardPrs(c).map((pr) => prChipHtml(pr)).join('') + '</td>' +
     '<td class="c-act">' + agoSpanHtml(row.arch.ts, 'tv-ago') + '</td>' +

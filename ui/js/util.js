@@ -219,11 +219,18 @@ export function ctxBarHtml(st) {
 // owed-reply indicator (chat header trigger + switcher rows): same tri-state
 // visual language as the tile corner and the chat typing bubble — animated dots
 // (owed, seen), static ⏳ (queued, not picked up), static amber ⚠ (stale).
-export function owedIndHtml(state, stale) {
+// `titles` rewords the tooltips for a surface (the card tile names "the
+// lieutenant"); the markup itself is the one shape everywhere.
+const OWED_TITLES = {
+  stale: 'no response yet — the lieutenant may be stuck',
+  queued: 'delivered — not picked up yet',
+  seen: 'owes you a reply',
+};
+export function owedIndHtml(state, stale, titles = OWED_TITLES) {
   if (!state) return '';
-  if (stale) return '<span class="t-typing stale" title="no response yet — the lieutenant may be stuck">⚠</span>';
-  if (state === 'queued') return '<span class="t-typing queued" title="delivered — not picked up yet">⏳</span>';
-  return '<span class="t-typing" title="owes you a reply"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></span>';
+  if (stale) return '<span class="t-typing stale" title="' + esc(titles.stale) + '">⚠</span>';
+  if (state === 'queued') return '<span class="t-typing queued" title="' + esc(titles.queued) + '">⏳</span>';
+  return '<span class="t-typing" title="' + esc(titles.seen) + '"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></span>';
 }
 
 // green → yellow (≥60%) → red (≥80%) — the shared context-bar thresholds

@@ -188,16 +188,21 @@ export function targetOwedState(target) {
     return l.chatQueued ? 'queued' : 'seen';
   }
   const c = card((target || '').slice(5));
-  const st = c && cardStatus(c);
-  if (!st || !st.owed) return null;
+  return c ? cardOwedState(c) : null;
+}
+/** A card's owed tri-state from its server-derived status: null | 'queued' | 'seen'. Pure. */
+export function cardOwedState(c) {
+  const st = cardStatus(c);
+  if (!st.owed) return null;
   return st.owedState || 'seen'; // older server payload: owed only — assume seen
 }
 export function targetOwed(target) { return !!targetOwedState(target); }
 // "may be stuck": owed with no lieutenant reply for longer than the stale
 // threshold. Purely client-derived from thread timestamps; the periodic
 // re-render refreshes it.
-const OWED_STALE_MS = 180000;
-function owedSinceTs(msgs) {
+export const OWED_STALE_MS = 180000;
+/** When the captain's unanswered run of messages began (ts), or null when nothing is owed. */
+export function owedSinceTs(msgs) {
   let since = null;
   for (const m of msgs || []) {
     if (m.author === USER) { if (since == null) since = m.ts; }
@@ -211,9 +216,12 @@ export function targetMsgs(target) {
   return (card((target || '').slice(5)) || {}).thread || [];
 }
 export function targetOwedStale(target) {
-  if (!targetOwed(target)) return false;
-  const since = owedSinceTs(targetMsgs(target));
-  return !!since && Date.now() - new Date(since).getTime() >= OWED_STALE_MS;
+  return targetOwed(target) && owedStale(targetMsgs(target), Date.now());
+}
+/** Whether the captain's unanswered run in `msgs` is older than the stale threshold at `nowMs`. */
+export function owedStale(msgs, nowMs) {
+  const since = owedSinceTs(msgs);
+  return !!since && nowMs - new Date(since).getTime() >= OWED_STALE_MS;
 }
 export function owedTargets() {
   const out = [];

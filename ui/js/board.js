@@ -1,68 +1,49 @@
 // board: dense card tiles, drag&drop, long-press move menu, new-card /
 // new-lieutenant modals. (Lieutenant switching lives in the chat header —
 // ltswitcher.js — not on the board.)
-import { S, columns, cards, lieutenants, lieutenant, lieutenantColor, cardVisible, cardStatus, cardRecency, targetOwedState, targetOwedStale, toggleFilter, filterSelected, workerFor, render } from './state.js';
+import { S, columns, cards, lieutenants, lieutenant, lieutenantColor, cardVisible, cardRecency, byRecency, toggleFilter, filterSelected, render } from './state.js';
 import { api } from './api.js';
-import { esc, agoSpanHtml, cardEmoji, cardNumHtml, cardPrs, prChipHtml, ctxBarHtml } from './util.js';
+import { esc, agoSpanHtml, cardNumHtml, cardPrs, prChipHtml, ctxBarHtml } from './util.js';
+import { cardFacts, cornerHtml, orderHtml, WORKER_LABEL } from './cardview.js';
 import { labelChipHtml } from './labels.js';
 import { openDetail } from './detail.js';
 import { openLieutenantChat } from './chat.js';
 import { openCardPane } from './pane.js';
 import { avatarGridHtml, wireAvatarGrid } from './avatars.js';
 import { selectionOn, isSelected, enterSelection, pick } from './selection.js';
-import { cardPermissions } from './perms.js';
 import { openPopover } from './popover.js';
 
 const boardEl = document.getElementById('board');
 
-function byRecency(a, b) {
-  return (new Date(cardRecency(b) || 0).getTime() || 0) - (new Date(cardRecency(a) || 0).getTime() || 0);
-}
-
 // ---------- tiles ----------
+// Every fact on a tile comes from cardFacts (cardview.js), the same model the
+// table row and the detail panel draw from, so the surfaces cannot drift.
 function tileHtml(c) {
+  const f = cardFacts(c, S.doc, Date.now());
   const at = c.attributes || {};
   const repo = at.repo || '';
-  const msgs = (c.thread || []).length;
-  const st = cardStatus(c);
-  // "the lieutenant owes you a reply" balloon: SAME source as the chat typing
-  // bubble (card.status.owedState, server-derived), so tile and chat can never
-  // drift. Takes priority over the unread dot — one unambiguous corner indicator.
-  // stale-owed mirrors the chat's "may be stuck" state: static amber ⚠, no dots.
-  // queued mirrors the chat's "delivered, not picked up": static hourglass, no dots.
-  const owed = targetOwedState('card:' + c.id);
-  const staleW = owed && targetOwedStale('card:' + c.id);
-  const cornerInd = staleW
-    ? '<span class="t-typing stale" title="no response yet — the lieutenant may be stuck">⚠</span>'
-    : owed === 'queued'
-    ? '<span class="t-typing queued" title="delivered — the lieutenant hasn\'t picked it up yet">⏳</span>'
-    : owed
-    ? '<span class="t-typing" title="the lieutenant owes you a reply here"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></span>'
-    : (st.unread ? '<span class="t-unread" title="unread activity"></span>' : '');
+  const msgs = f.messageCount;
+  // the corner: owed (the chat typing bubble's source) beats the unread dot
+  const cornerInd = cornerHtml(f);
   const hasLink = Object.entries(at).some(([k, v]) => /^https?:\/\//.test(String(v)));
   const labels = (c.labels || []).map((n) => labelChipHtml(n, filterSelected('label', n))).join('');
   // PR chips: attributes.prs [{url, state}] — one state-colored chip per entry
   const prs = cardPrs(c).map((pr) => prChipHtml(pr)).join('');
-  // a captain drag-order awaiting the lieutenant: subtle pending marker
   // a worker on this card is blocked on a permission prompt: the loudest chip,
   // first in the row, because nothing moves on the card until the captain answers
-  const nPerm = cardPermissions(S.doc, c.id).length;
+  const nPerm = f.needsApproval;
   const perm = nPerm
     ? '<span class="t-perm" title="' + nPerm + ' permission request' + (nPerm > 1 ? 's' : '') + ' waiting for you">🔐 needs approval' + (nPerm > 1 ? ' ×' + nPerm : '') + '</span>'
     : '';
-  const order = c.pendingOrder
-    ? '<span class="t-order" title="' + esc(c.pendingOrder.kind) + ' sent to ' + esc(c.owner) + ' — the card moves when the lieutenant acts">⏳ ordered</span>'
-    : '';
+  const order = orderHtml(f, 'chip', c.owner);
   // worker-state stripe on the tile's RIGHT edge — a PERSISTENT status signal,
   // deliberately separate from the transient top-right corner (the LEFT edge is
-  // the owner's color). Driven by card.status.worker (the lease); only the known
-  // states get a stripe (whitelist, so no server value ever reaches the class
-  // name — XSS-safe). working=green pulsing, needs-you=amber, idle=gray.
-  const WORKER_STATES = { working: 'Working', 'needs-you': 'Needs you', idle: 'Idle' };
-  const worker = st.worker && WORKER_STATES[st.worker.state] ? st.worker.state : '';
-  const workerCls = worker ? ' worker worker-' + worker : ''; // worker value is whitelisted above
+  // the owner's color). workerState is whitelisted in cardview, so no server
+  // value reaches the class name. working=green pulsing, needs-you=amber, idle=gray.
+  const worker = f.workerState === 'absent' ? '' : f.workerState;
+  const workerCls = worker ? ' worker worker-' + worker : '';
   const workerTitle = worker
-    ? ' title="worker: ' + esc(WORKER_STATES[worker]) + (st.worker.id ? ' — ' + esc(st.worker.id) : '') + '"'
+    ? ' title="worker: ' + esc(WORKER_LABEL[worker]) + (f.workerId ? ' — ' + esc(f.workerId) : '') + '"'
     : '';
   // owner color stripe on the LEFT edge: every card belongs to exactly one lieutenant
   const stripe = '<span class="t-stripe" style="background:' + esc(lieutenantColor(c.owner)) + '"></span>';
@@ -75,21 +56,20 @@ function tileHtml(c) {
   return '<div class="tile' + (c.id === S.openCardId ? ' open' : '') + (sel && isSelected(c.id) ? ' sel' : '') + workerCls + (nPerm ? ' needs-perm' : '') +
     '" draggable="' + (sel ? 'false' : 'true') + '" data-id="' + esc(c.id) + '"' + workerTitle + '>' +
     stripe +
-    '<div class="t-row1">' + box + '<span class="t-emoji">' + esc(cardEmoji(c)) + '</span>' +
+    '<div class="t-row1">' + box + '<span class="t-emoji">' + esc(f.emoji) + '</span>' +
     '<span class="t-title">' + esc(c.title || c.id) + '</span>' +
     cardNumHtml(c.id) + cornerInd + '</div>' +
     (perm || labels || prs || order ? '<div class="t-chips">' + perm + order + labels + prs + '</div>' : '') +
     '<div class="t-foot">' +
     '<span class="t-owner' + (filterSelected('owner', c.owner) ? ' active' : '') + '" data-owner="' + esc(c.owner) +
-      '" title="click: filter by lieutenant · alt-click: exclude"><span class="dot" style="background:' + esc(lieutenantColor(c.owner)) + '"></span>' + esc((lieutenant(c.owner) || {}).name || c.owner) + '</span>' +
+      '" title="click: filter by lieutenant · alt-click: exclude"><span class="dot" style="background:' + esc(lieutenantColor(c.owner)) + '"></span>' + esc(f.ownerName) + '</span>' +
     (repo ? '<span class="t-repo" title="repo">' + esc(repo) + '</span>' : '') +
     '<span class="grow"></span>' +
     (hasLink ? '<span class="t-ind" title="has link">📎</span>' : '') +
     (msgs ? '<span class="t-ind" title="' + msgs + ' messages">💬' + msgs + '</span>' : '') +
-    // Working tiles carry the worker's context bar (agentStatus, turn-end fed)
-    (c.column === 'working' ? ctxBarHtml((workerFor(c.id) || {}).agentStatus) : '') +
-    // 👁 peek: every Working card can be watched live (its worker's terminal)
-    (c.column === 'working' ? '<button class="t-peek" title="watch this worker\'s terminal live">👁</button>' : '') +
+    // Working tiles carry the worker's context bar and the 👁 peek (its terminal)
+    (f.inWorking ? ctxBarHtml(f.agentStatus) : '') +
+    (f.inWorking ? '<button class="t-peek" title="watch this worker\'s terminal live">👁</button>' : '') +
     agoSpanHtml(cardRecency(c), 't-ago') +
     '</div></div>';
 }
@@ -225,9 +205,21 @@ export function openMoveMenu(cardId, x, y) {
     // The way INTO selection mode, on both the board and the table — nothing has
     // to sit on screen the rest of the time for this to be reachable.
     { label: '☑ select cards', onClick: () => { enterSelection(cardId); render(); } },
-    { label: '✕ archive', danger: true,
-      onClick: async () => { try { await api.archiveCard(cardId); } catch (e) { alert(e.message); } } },
+    archiveItem(c),
   ], { id: 'move-menu' });
+}
+// The same refusal the bulk bar applies (cardFacts.canArchive): archiving kills
+// a live worker's session, so a refused card shows why and cannot be pressed.
+// Asked again on click, since a board push may have bound a worker meanwhile.
+function archiveItem(c) {
+  const verdict = cardFacts(c, S.doc, Date.now()).canArchive;
+  if (!verdict.ok) return { label: '✕ archive — ' + verdict.reason, danger: true, title: 'not archivable: ' + verdict.reason };
+  return { label: '✕ archive', danger: true, onClick: async () => {
+    const now = cards().find((k) => k.id === c.id);
+    const v = now ? cardFacts(now, S.doc, Date.now()).canArchive : verdict;
+    if (!v.ok) { alert('Not archived: ' + v.reason); return; }
+    try { await api.archiveCard(c.id); } catch (e) { alert(e.message); }
+  } };
 }
 
 // ---------- new card modal ----------

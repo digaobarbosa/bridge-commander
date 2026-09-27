@@ -1848,3 +1848,46 @@ table.tv { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 8
   /* menu rows sized for a thumb */
   .popover button { font-size: 13px; padding: 8px 12px; }
 }
+
+/* ---- plugin slots & forms ---- */
+/* The table row now draws the tile's corner (cardview.cornerHtml), so it needs
+   the stale ⚠ and queued ⏳ variants the tile already had. */
+.tv .t-typing.stale { color: var(--warn); font-size: 11px; line-height: 1; }
+.tv .t-typing.queued { color: var(--dim); font-size: 11px; line-height: 1; }
+
+/* a plugin's data badge (slots.badgeHtml): the tile chip shape, tone-coloured */
+.bc-badge {
+  display: inline-flex; align-items: center; font-size: 10.5px; line-height: 1.6;
+  padding: 1px 7px; border: 1px solid var(--line2); border-radius: 999px;
+  color: var(--dim); white-space: nowrap; max-width: 16em; overflow: hidden; text-overflow: ellipsis;
+}
+.bc-badge-info { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.bc-badge-ok { color: var(--ok); border-color: var(--ok); background: var(--ok-soft); }
+.bc-badge-warn { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
+.bc-badge-danger { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); }
+.bc-badge-muted { color: var(--faint); }
+
+/* a failed contribution stays in its own slot, quiet but visible */
+.bc-failed {
+  display: inline-flex; align-items: center; font-size: 10.5px; line-height: 1.6;
+  padding: 1px 7px; border: 1px dashed var(--danger); border-radius: 999px;
+  color: var(--danger); white-space: nowrap; opacity: .85;
+}
+
+/* command and config forms (form.formHtml): one labelled control per row */
+.bc-form { display: flex; flex-direction: column; gap: 10px; }
+.bc-field { display: flex; flex-direction: column; gap: 4px; }
+.bc-field > label { font-size: 12px; color: var(--dim); }
+.bc-field .bc-req { color: var(--danger); }
+.bc-field .bc-desc { font-size: 11px; color: var(--faint); }
+.bc-field input[type="text"], .bc-field input[type="number"], .bc-field textarea, .bc-field select {
+  font: inherit; font-size: 13px; color: var(--text); background: var(--panel2);
+  border: 1px solid var(--line2); border-radius: 6px; padding: 6px 8px; min-width: 0;
+}
+.bc-field textarea { font-family: var(--mono); resize: vertical; }
+.bc-field input:focus, .bc-field textarea:focus, .bc-field select:focus { outline: none; border-color: var(--accent); }
+/* a checkbox sits beside its label, not under it */
+.bc-field-boolean { flex-direction: row; align-items: center; flex-wrap: wrap; }
+.bc-field-boolean > label { order: 2; color: var(--text); }
+.bc-field-boolean > input { order: 1; margin: 0; }
+.bc-field-boolean > .bc-desc { order: 3; flex-basis: 100%; }
