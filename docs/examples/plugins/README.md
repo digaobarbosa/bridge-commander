@@ -10,6 +10,7 @@ This guide uses real plugins as worked examples:
 | `local-git` | [plugins/local-git](../../../plugins/local-git/plugin.json) | a form, a tracked activity, a refusal with exit 1 |
 | `github` | [plugins/github](../../../plugins/github) | a link command, a `server.js` (a watcher), a `ui.js` (a detail section) |
 | `rfslot` | [docs/examples/plugins/rfslot](rfslot) | `prepare: "server"`: a form that opens pre-filled |
+| `repo-link` | [docs/examples/plugins/repo-link](repo-link/plugin.json) | a card-less link: a header button and a palette command |
 | `deepseek` | [plugins/deepseek](../../../plugins/deepseek/plugin.json) | an agent profile derived from `claude` |
 | `core-checks` | [plugins/core-checks](../../../plugins/core-checks/plugin.json) | startup checks |
 
@@ -152,12 +153,49 @@ A template can only read the card context, so a plugin cannot name a script in i
 | `card.menu/v1` | the card's menu on the board |
 | `card.actions/v1` | the buttons on a card tile |
 | `detail.actions/v1` | the header of the card detail |
-| `palette/v1` | the command palette |
+| `palette/v1` | the command palette (⌘K / Ctrl+K, or the ⌘ in the header) |
+| `topbar/v1` | a button in the header, before the status dot |
 
 - A lower `rank` comes first. The default is 1000.
+- One plugin shows at most 4 buttons in `topbar/v1`.
 - Slot ids carry a version. A slot that changes shape gets a new id, so a plugin written for `v1` never half-renders.
 - One plugin shows at most 8 entries per slot.
 - Before a run, the server checks the `when` of the command's menu entries again. If no entry matches the card, it refuses with 403.
+
+### A button in the header: card-less commands
+
+`topbar/v1` and `palette/v1` can run a command with **no card**. A header button never has one. The palette has one only while a card is open in the detail panel.
+
+`repo-link` is a whole plugin in one manifest. It puts "Open the repo on GitHub" in the header and in the palette:
+
+```json
+{
+  "id": "repo-link",
+  "name": "Repo link",
+  "contributes": {
+    "commands": [{ "id": "repo-link.open", "title": "Open the repo on GitHub", "icon": "🐙",
+                   "run": { "open": "https://github.com/<org>/<repo>" } }],
+    "menus": {
+      "topbar/v1":  [{ "command": "repo-link.open" }],
+      "palette/v1": [{ "command": "repo-link.open" }]
+    }
+  }
+}
+```
+
+To use it, copy the folder and put your repository in the url:
+
+```sh
+cp -R docs/examples/plugins/repo-link <ws>/.bridge-commander/plugins/repo-link
+```
+
+The header shows the icon and the title. On a phone it shows the icon only, and the title stays as the tooltip.
+
+Without a card, the context is empty: `{card: null, project: null, worker: null, harness: null}`.
+
+- An `exec` command runs in the workspace. `${workspace.name}` and `${workspace.path}` work; `${card.id}` refuses the run as missing (422).
+- A `"server"` handler gets `req.card = null`.
+- The server runs a card-less command only if a `topbar/v1` or `palette/v1` entry of it matches the empty context, or has no `when`. A command placed only on cards, or a palette entry with `"when": {"card.column": "review"}`, refuses with 403 when no card is sent.
 
 ### `when`: the card context
 
@@ -279,6 +317,19 @@ A workspace copy of `github` gets no `ctx.internal`, so it logs and does nothing
 
 A plugin that contributes `views` or `sections` needs a `ui` module. The board serves it at `/plugins/<id>/<file>` and loads it the first time it is needed.
 
+| Manifest entry | Where it shows | `render` |
+|---|---|---|
+| `views[]`, `"slot": "main/v1"` (the default) | a view in the board's switcher | `render(el, state)` |
+| `views[]`, `"slot": "sidebar/v1"` | the left pane, in the chat's place, when the overlay turns `sidebar:chat` off | `render(el, state)` |
+| `sections[]`, `"slot": "detail.sections/v1"` | a box in the card detail | `render(el, card, state)` |
+| `sections[]`, `"slot": "settings.sections/v1"` | a tab in the config screen, after "plugins" | `render(el, null, state)` |
+
+The sidebar is a single slot. The chat fills it until the overlay says otherwise:
+
+```json
+{ "contributions": { "sidebar:chat": { "enabled": false } } }
+```
+
 ```json
 "sections": [{ "id": "prs", "slot": "detail.sections/v1", "title": "GitHub",
                "when": { "card.attributes.prs": { "$exists": true } } }]
@@ -299,8 +350,8 @@ export function activate(ui) {
 | Member | Use |
 |---|---|
 | `ui.plugin` | `{ id, config }` |
-| `ui.views.register({ id, render(el, state), dispose? })` | a `main/v1` view |
-| `ui.sections.register({ id, render(el, card, state), dispose? })` | a `detail.sections/v1` or `settings.sections/v1` section |
+| `ui.views.register({ id, render(el, state), dispose? })` | a `main/v1` or `sidebar/v1` view |
+| `ui.sections.register({ id, render(el, card, state), dispose? })` | a `detail.sections/v1` or `settings.sections/v1` section (`card` is `null` in settings) |
 | `ui.state()` | `{ doc, context(card) }`: the live board and the card context |
 | `ui.openCard(id)`, `ui.openActivity(id)`, `ui.toast(text)` | shell actions |
 | `ui.api(method, path, body)` | a same-origin fetch that returns JSON |
@@ -382,7 +433,7 @@ Command templates have no secret root. An exec line that needs a token reads the
 }
 ```
 
-A contribution key is `<kind>:<id>`: `command:…`, `section:…`, `badge:…`, `view:…`, `check:…`, `profile:<name>`. A menu entry is `menu:<slot>:<command id>`. Built-in contributions use the same keys, so the overlay can turn them off too.
+A contribution key is `<kind>:<id>`: `command:…`, `section:…`, `badge:…`, `view:…`, `check:…`, `profile:<name>`. A menu entry is `menu:<slot>:<command id>`. Built-in contributions use the same keys, so the overlay can turn them off too. The chat is `sidebar:chat`.
 
 ## Test your plugin
 

@@ -2044,3 +2044,65 @@ button.tb-act:hover { border-color: var(--accent2); color: var(--text); }
   #taskbar { padding: 5px 10px; }
   .tile .t-cmd { opacity: .8; font-size: 14px; padding: 2px 4px; }
 }
+
+/* ---- topbar/v1: plugin command buttons (topbar.js) + the palette's ⌘ ---- */
+#topbar-cmds { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+#topbar-cmds[hidden] { display: none; }
+.tb-cmd, #palette-btn {
+  display: inline-flex; align-items: center; gap: 5px; flex: none; border: 1px solid var(--line); border-radius: 8px;
+  color: var(--dim); padding: 4px 9px; font-size: 12.5px; line-height: 1.3; white-space: nowrap;
+  transition: border-color .15s, color .15s;
+}
+.tb-cmd:hover, #palette-btn:hover { color: var(--accent); border-color: var(--accent2); }
+.tb-cmd.busy { opacity: .55; cursor: progress; }
+.tb-cmd .tb-icon { font-size: 13px; }
+.tb-cmd .tb-label { max-width: 14em; overflow: hidden; text-overflow: ellipsis; }
+#palette-btn { font-size: 14px; padding: 4px 9px; }
+
+/* ---- the command palette (palette.js): a modal pinned near the top ---- */
+.bc-modal-overlay:has(> .bc-palette) { align-items: flex-start; padding-top: 12vh; }
+.bc-palette { width: min(560px, calc(100vw - 28px)); max-height: 70vh; gap: 10px; padding: 12px; }
+.bc-palette .bc-modal-title { font-size: 12.5px; color: var(--dim); font-weight: 600; }
+.bc-pal-input {
+  width: 100%; background: var(--panel); border: 1px solid var(--line2); border-radius: 9px;
+  font-size: 14px; padding: 9px 12px; outline: none;
+}
+.bc-pal-input:focus { border-color: var(--accent2); }
+.bc-pal-list { display: flex; flex-direction: column; gap: 1px; overflow-y: auto; min-height: 0; max-height: 52vh; }
+.bc-pal-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; padding: 7px 10px;
+  border-radius: 7px; font-size: 13px; color: var(--text);
+}
+.bc-pal-item:hover { background: var(--panel2); }
+.bc-pal-item.on { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+.bc-pal-item.off { color: var(--faint); cursor: default; }
+.bc-pal-icon { flex: none; width: 1.4em; text-align: center; }
+.bc-pal-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bc-pal-title b { color: var(--accent); font-weight: 700; }
+.bc-pal-why { color: var(--faint); }
+.bc-pal-hint { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font-size: 11px; font-family: var(--mono); }
+.bc-pal-empty { color: var(--faint); font-size: 12.5px; padding: 10px; }
+
+/* ---- sidebar/v1: a plugin sidebar in the chat's place (sidebar.js) ---- */
+.bc-sidebar {
+  flex: none; width: var(--chat-w, 390px); min-width: 0; min-height: 0; display: flex; flex-direction: column;
+  overflow: auto; border-right: 1px solid var(--line); background: var(--bg2); padding: 12px;
+}
+
+/* ---- settings.sections/v1: a plugin tab in the config screen ---- */
+.ss-psec-body { font-size: 13px; }
+
+@media (max-width: 760px) {
+  /* icons only: the row has to hold at 390px */
+  .tb-cmd { padding: 4px 7px; font-size: 13px; }
+  .tb-cmd .tb-label { display: none; }
+  #topbar-cmds { gap: 4px; }
+  #palette-btn { padding: 4px 8px; font-size: 13px; }
+  #topbar.searching #topbar-cmds, #topbar.searching #palette-btn { display: none; }
+  /* the plugin sidebar is the Chat tab's content, as the chat is */
+  .bc-sidebar { width: 100%; flex: 1; border-right: none; display: none; }
+  body[data-view="chat"] .bc-sidebar { display: flex; }
+  .bc-modal-overlay:has(> .bc-palette) { padding-top: 0; }
+  .bc-palette { max-height: none; }
+  .bc-pal-list { max-height: none; flex: 1; }
+}

@@ -172,8 +172,8 @@ All new routes live under `/api/plugins` and `/api/activities`, plus plugin rout
 |---|---|
 | `GET /api/plugins` | → `{ plugins: [{id, name, description, version, source, enabled, error, active, config, configSchema, ui: '/plugins/<id>/<ui>'?}], contributions: { commands, menus, badges, views, sections, checks }, harnesses: listHarnesses(), disabled: [contribution keys] }`. The server-side `run.exec` and `env` are stripped from commands. The UI receives `{id, title, icon, description, form, prepare, tracked, open?}`, where `open` is the unexpanded template for link commands |
 | `PUT /api/plugins/overlay` | `{ plugins?, contributions? }` → writes the overlay, `reload()`s, broadcasts |
-| `POST /api/commands/:id/prepare` | `{ card }` → `{ values }`: the form defaults, merged with the plugin's `prepare` |
-| `POST /api/commands/:id/run` | `{ card, input }` → `{ ok, activity?, url?, message? }`. It re-checks every `when` of the command's menu entries against the card context and refuses with 403 when none matches |
+| `POST /api/commands/:id/prepare` | `{ card? }` → `{ values }`: the form defaults, merged with the plugin's `prepare`. With no `card`, see [Card-less commands](#card-less-commands) |
+| `POST /api/commands/:id/run` | `{ card?, input }` → `{ ok, activity?, url?, message? }`. It re-checks every `when` of the command's menu entries against the card context and refuses with 403 when none matches. With no `card`, see [Card-less commands](#card-less-commands) |
 | `GET /api/activities?card=` | → `{ activities }` |
 | `GET /api/activities/:id/log?from=` | → `{ text, size, done }` |
 | `GET /api/activities/:id/stream` | SSE: a `chunk` event per piece of output, then `end` |
@@ -222,8 +222,8 @@ A plugin's `ui` file is an ES module served at `/plugins/<id>/<file>`. It is loa
 export function activate(ui) { … }   // called once
 ui = {
   plugin: { id, config },
-  views:    { register({ id, render(el, state), dispose?(el) }) → dispose },       // id = the manifest's views[].id
-  sections: { register({ id, render(el, card, state), dispose?(el) }) → dispose }, // id = the manifest's sections[].id
+  views:    { register({ id, render(el, state), dispose?(el) }) → dispose },       // id = the manifest's views[].id (main/v1 or sidebar/v1)
+  sections: { register({ id, render(el, card, state), dispose?(el) }) → dispose }, // id = the manifest's sections[].id; card is null in settings.sections/v1
   state()      → { doc, context(card) },   // the live board doc; cardContext
   openCard(id), openActivity(id), toast(text),
   api(method, path, body) → Promise<json>, // same-origin fetch helper
@@ -232,3 +232,30 @@ ui = {
 ```
 
 - `render` is called again on every board push, only while the view or section is visible. It must be idempotent and cheap. The shell wraps every call in the slot error boundary.
+
+## Wave E1: the remaining UI slots
+
+| Slot | Manifest | Where | Context |
+|---|---|---|---|
+| `topbar/v1` | `menus["topbar/v1"]` | buttons in the header, before the status dot: the icon, the title as the label and the tooltip. The label hides below 760px. At most 4 per plugin, by rank | always the empty context |
+| `palette/v1` | `menus["palette/v1"]` | the command palette: ⌘K / Ctrl+K, or the ⌘ button in the header | the card open in the detail panel, else the empty context |
+| `settings.sections/v1` | `sections[]` with `"slot": "settings.sections/v1"` | one tab each in the config screen, after "plugins" | the empty context; `render(el, null, state)` |
+| `sidebar/v1` | `views[]` with `"slot": "sidebar/v1"` | the pane at the board's left, in the chat's place | `render(el, state)`, as a main view |
+
+- **The empty context** is `EMPTY_CONTEXT` in `ui/js/cardview.js`: `{card: null, project: null, worker: null, harness: null}`. A `when` that asks about a card fails on it. A template that needs a card field reads as missing.
+- **Topbar.** A link command (`open`) opens its url from the empty context. Any other command runs through `commandui.js` with no card: its form modal, or a straight run, and a tracked run opens its activity.
+- **Palette.** It fuzzy-filters its items (`ui/js/palette.js`): the `palette/v1` entries whose `when` matches the context, then, with a card open, that card's own commands (its moves, the built-in card actions, and its `card.menu/v1`, `card.actions/v1` and `detail.actions/v1` commands; a command in two slots is listed once). Items run against the open card, or card-less with none. A refused built-in shows its reason and does not run. Arrow keys move, Enter runs, Escape closes. The palette is a `modal.js` modal, so Escape reaches it through `main.js`'s chain.
+- **Settings sections.** `ui/js/settingstabs.js` makes a tab button and a section box per entry. The plugin's `ui` module loads the first time its tab shows, and `render` runs on every repaint of the tab, inside the slot error boundary. A tab whose plugin goes away lands the screen on "plugins".
+- **Sidebar.** A single slot, in `ui/js/sidebar.js`: `registerSidebar({ id, title, icon?, render(el), mount?(el), dispose?(el), plugin?, key = 'sidebar:<id>', rank = 1000, el? }) → dispose`. The first enabled entry, by rank, is on screen; the others are hidden with an inline `display: none`.
+  - The chat is the built-in filler: `sidebar:chat`, rank 100, with its own `#chat` element. The registry only hides and shows it, so its DOM is never rebuilt.
+  - A plugin sidebar view gets a `.bc-sidebar` element next to the chat, keeps it across catalog reloads, and loses it when the view goes.
+  - `PUT /api/plugins/overlay {"contributions": {"sidebar:chat": {"enabled": false}}}` lets a plugin sidebar through. Setting the entry back to `null` restores the chat. On a phone, the Chat tab shows the sidebar and carries its name.
+
+### Card-less commands
+
+`POST /api/commands/:id/prepare` and `…/run` accept a body without `card` (absent, `null` or `""`).
+
+- The context is `EMPTY_CONTEXT`. The plugin's `prepare(req)` and `run(req)` get `req.card = null`. An exec runs in the workspace (no worktree, no project). Its run records `card: ''`, so a failure queues nothing to a card owner.
+- **The `when` rule.** A card-less call is allowed only when the command has an entry in a card-less slot (`manifests.CARDLESS_SLOTS`: `topbar/v1`, `palette/v1`) whose `when` matches the empty context, or that has no `when`. Otherwise it is 403, for `prepare` and for `run`. A command placed only on cards never runs without one.
+- A template that needs a card field fails with the usual 422 and its `missing` list.
+- With a `card`, nothing changes: every menu entry of the command counts, and a command no menu places fits any card.

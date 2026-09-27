@@ -176,6 +176,18 @@ test('github.open-pr plans a link to the first PR; the GitHub section escapes ev
   assert.match(prsHtml({ attributes: {} }, esc), /No pull requests/);
 });
 
+test('repo-link: a card-less link in the topbar and the palette, shown with no card', async () => {
+  const dir = path.join(EXAMPLES, 'repo-link');
+  const { EMPTY_CONTEXT } = await import(pathToFileURL(path.join(ROOT, 'ui', 'js', 'cardview.js')).href);
+  const plan = await planRun(commandOf(dir, 'repo-link.open'), { context: EMPTY_CONTEXT, workspace: '/ws' });
+  assert.strictEqual(plan.kind, 'open');
+  assert.match(plan.url, /^https:\/\/github\.com\/[^/]+\/[^/]+$/);
+  const { matches } = await loadPure();
+  const menus = manifestOf(dir).contributes.menus;
+  assert.deepStrictEqual(Object.keys(menus).sort(), ['palette/v1', 'topbar/v1']);
+  for (const e of Object.values(menus).flat()) assert.strictEqual(matches(e.when, EMPTY_CONTEXT), true);
+});
+
 // ---------- exec commands: every substitution is one quoted word ----------
 
 test('planRun of every exec command quotes the card values; a hostile branch and path stay literal', async () => {

@@ -49,8 +49,23 @@ test('typos and bad shapes are refused loudly, naming the problem', () => {
     [{ id: 'x', contributes: { commands: [{ id: 'x.run', title: 'T', run: 'server' }] } }, /needs a "server" module/],
     [{ id: 'x', server: '../escape.js' }, /inside the plugin folder/],
     [{ id: 'x', contributes: { checks: [{ id: 'c' }] } }, /bin or exec required/],
+    [{ id: 'x', contributes: { menus: { 'topbar/v2': [] } } }, /unknown slot "topbar\/v2"/],
+    [{ id: 'x', ui: 'ui.js', contributes: { views: [{ id: 'v', title: 'V', slot: 'sidebar/v2' }] } }, /slot must be main\/v1\|sidebar\/v1/],
   ];
   for (const [man, re] of bad) assert.throws(() => m.validateManifest(man, 'x'), re, JSON.stringify(man));
+});
+
+test('the card-less slots: topbar/v1 and palette/v1 menus, a sidebar/v1 view, a settings section', () => {
+  const man = m.validateManifest({ id: 'x', ui: 'ui.js', contributes: {
+    commands: [{ id: 'x.repo', title: 'Repo', icon: '↗', run: { open: 'https://github.com/o/r' } }],
+    menus: { 'topbar/v1': [{ command: 'x.repo' }], 'palette/v1': [{ command: 'x.repo', rank: 5 }] },
+    views: [{ id: 'side', title: 'Side', slot: 'sidebar/v1' }, { id: 'main', title: 'Main' }],
+    sections: [{ id: 'prefs', title: 'Prefs', slot: 'settings.sections/v1' }],
+  } }, 'x');
+  assert.deepStrictEqual(man.contributes.menus['topbar/v1'], [{ command: 'x.repo', rank: 1000 }]);
+  assert.deepStrictEqual(man.contributes.views.map((v) => v.slot), ['sidebar/v1', 'main/v1']);
+  assert.deepStrictEqual(m.CARDLESS_SLOTS, ['topbar/v1', 'palette/v1']);
+  assert.ok(m.CARDLESS_SLOTS.every((slot) => m.MENU_SLOTS.includes(slot)));
 });
 
 test('discover: a workspace plugin replaces the shipped one with the same id, a broken one is recorded not fatal', () => {

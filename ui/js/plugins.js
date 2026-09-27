@@ -5,7 +5,8 @@
 // any of that — it is all manifest data.
 //
 // A plugin's `ui` module is imported only when something needs it: its view is
-// shown, or one of its detail sections is rendered. It gets the `ui` object of
+// shown (main/v1 or sidebar/v1), or one of its sections (detail or settings)
+// is rendered. It gets the `ui` object of
 // docs/rfc/plugins-contracts.md ("Plugin UI modules"), and every call into it
 // runs inside the slot error boundary, so a broken plugin fails in its own
 // slot and nowhere else.
@@ -14,7 +15,8 @@
 // when a view registers, in the host main.js hands over (configurePlugins).
 import { S, render } from './state.js';
 import { contribute, setDisabled, boundary, failedHtml } from './slots.js';
-import { registerView, setDisabledViews, current } from './views.js';
+import { registerView, setDisabledViews } from './views.js';
+import { registerSidebar, setDisabledSidebars, sidebarEl } from './sidebar.js';
 import { cardContext } from './cardview.js';
 import { esc } from './util.js';
 
@@ -61,7 +63,8 @@ function changed() {
 
 /**
  * Map a GET /api/plugins answer onto what the registries take.
- * -> { slots: [{slot, entry}], views: [view], commands: Map(id -> command) }
+ * -> { slots: [{slot, entry}], views: [view], sidebars: [view], commands: Map(id -> command) }
+ * A view's `slot` picks its registry: main/v1 (the default) or sidebar/v1.
  * A menu entry takes its title and icon from the command it names; one that
  * names a command nobody provides is dropped (it could not run anyway).
  */
@@ -93,11 +96,13 @@ export function mapContributions(payload) {
       key: s.key || 'section:' + s.id, plugin: s.plugin, rank: rank(s), when: s.when, id: s.id, title: s.title || s.id, icon: s.icon || '',
     } });
   }
-  const views = (c.views || []).filter((v) => v && v.id).map((v) => ({
-    id: v.id, key: v.key || 'view:' + v.id, plugin: v.plugin, rank: rank(v),
+  const all = (c.views || []).filter((v) => v && v.id).map((v) => ({
+    id: v.id, key: v.key || 'view:' + v.id, plugin: v.plugin, rank: rank(v), slot: v.slot || 'main/v1',
     title: v.title || v.id, icon: v.icon || '', tip: v.description || v.title || v.id,
   }));
-  return { slots, views, commands: cmds };
+  const views = all.filter((v) => v.slot === 'main/v1');
+  const sidebars = all.filter((v) => v.slot === 'sidebar/v1');
+  return { slots, views, sidebars, commands: cmds };
 }
 
 // ---------- reads ----------
@@ -202,6 +207,13 @@ function apply(payload) {
       render: () => renderPluginView(v, el),
     }));
   }
+  // A sidebar view's element is made and kept by sidebar.js, next to the chat.
+  for (const v of m.sidebars) {
+    next.push(registerSidebar({
+      id: v.id, key: v.key, title: v.title, icon: v.icon, rank: v.rank, plugin: v.plugin,
+      render: (el) => renderPluginView(v, el),
+    }));
+  }
   for (const d of disposers) d();
   disposers = next;
   for (const [id, el] of viewEls) {
@@ -211,6 +223,7 @@ function apply(payload) {
   }
   setDisabled(P.payload.disabled || []);
   setDisabledViews(P.payload.disabled || []);
+  setDisabledSidebars(P.payload.disabled || []);
   // a plugin switched off or gone takes its activated module with it
   for (const id of [...modules.keys()]) {
     const p = plugin(id);
@@ -308,7 +321,7 @@ function disposeModule(id) {
   if (!mod) return;
   modules.delete(id);
   for (const [vid, spec] of mod.views) {
-    if (spec.dispose) try { spec.dispose(viewEls.get(vid)); } catch (e) {}
+    if (spec.dispose) try { spec.dispose(viewEls.get(vid) || sidebarEl(vid)); } catch (e) {}
   }
   for (const d of mod.disposers) try { d(); } catch (e) {}
 }
@@ -328,7 +341,7 @@ export function renderPluginView(v, el) {
   const entry = { plugin: v.plugin, key: v.key };
   const mod = modules.get(v.plugin);
   if (!mod || !mod.active) {
-    if (!mod) ensureModule(v.plugin).then(() => { if (current() === v.id) render(); });
+    if (!mod) ensureModule(v.plugin); // it renders once the module is active
     const html = '<div class="bc-slot-loading">loading ' + esc(v.title) + '…</div>';
     if (el.__bcHtml !== html) { el.__bcHtml = html; el.innerHTML = html; }
     return;
@@ -342,7 +355,8 @@ export function renderPluginView(v, el) {
 }
 
 /**
- * Paint detail section `entry` for `card` into `el` (same rules as a view).
+ * Paint section `entry` for `card` into `el` (same rules as a view). A
+ * settings.sections/v1 section has no card: `card` is null.
  * Returns the renderer's dispose(el), when it has one, for the caller to run
  * when the section leaves the panel.
  */

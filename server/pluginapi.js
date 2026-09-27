@@ -13,6 +13,8 @@
 // A command run re-checks the card against the command's menu `when`s. The UI
 // hides what does not apply, but the UI is not the auth boundary: a stale page
 // or a curl must not run "Deploy" on a card the plugin said it never fits.
+// A run with no card is allowed only where a plugin placed the command in a
+// card-less slot (topbar/v1, palette/v1) with a `when` the empty context meets.
 //
 // Node built-ins only.
 const fs = require('fs');
@@ -204,9 +206,15 @@ function createPluginApi(deps) {
   // ---------- commands ----------
   function commandOf(id) { return contributions().commands.find((c) => c.id === id) || null; }
 
+  // No `card` in the body = a card-less call (a topbar button, the palette with
+  // no card open): the empty context, and the card-less `when` rule below.
   async function cardFor(body) {
-    const id = String(body.card || '').trim();
-    if (!id) return { error: 'card required', code: 400 };
+    if (body.card === undefined || body.card === null || body.card === '') {
+      const { EMPTY_CONTEXT } = await loadCardview();
+      return { card: null, ctx: EMPTY_CONTEXT };
+    }
+    const id = String(body.card).trim();
+    if (!id) return { error: 'card must be a card id', code: 400 };
     const card = deps.findCard(id);
     if (!card) return { error: 'unknown card: ' + id, code: 404 };
     return { card, ctx: await context(card) };
@@ -215,7 +223,15 @@ function createPluginApi(deps) {
   // A plugin sees a copy: its handler cannot write into the board by accident.
   function reqFor(card, ctx, input, command) {
     const p = pluginEntry(command.plugin);
-    return { card: structuredClone(deps.publicCard(card)), context: ctx, input, config: Object.assign({}, (p && p.config) || {}) };
+    return { card: card ? structuredClone(deps.publicCard(card)) : null, context: ctx, input, config: Object.assign({}, (p && p.config) || {}) };
+  }
+
+  // 403 unless the command may run here; null when it may.
+  async function refusal(id, c) {
+    if (await allowed(id, c.ctx, !c.card)) return null;
+    return c.card
+      ? 'command ' + id + ' does not apply to card ' + c.card.id + ' (no menu entry of it matches the card)'
+      : 'command ' + id + ' needs a card (no ' + manifests.CARDLESS_SLOTS.join(' or ') + ' entry of it matches without one)';
   }
 
   async function prepare(id, req, res) {
@@ -225,6 +241,12 @@ function createPluginApi(deps) {
     if (body.__bad) return sendJson(res, 400, { error: body.__bad });
     const c = await cardFor(body);
     if (c.error) return sendJson(res, c.code, { error: c.error });
+    // A card-bound prepare is not gated (the run is); a card-less one is,
+    // because a plugin's prepare written for cards would meet card: null.
+    if (!c.card) {
+      const no = await refusal(id, c);
+      if (no) return sendJson(res, 403, { error: no });
+    }
     const { defaultsFor } = await loadPure();
     let values = defaultsFor(command.form || {});
     if (command.prepare === 'server') {
@@ -242,12 +264,17 @@ function createPluginApi(deps) {
     return sendJson(res, 200, { values });
   }
 
-  // Every menu entry that places this command; none = a palette-only command,
-  // which asked for no card shape and so fits any card.
-  async function allowed(id, ctx) {
+  // On a card: every menu entry that places this command; none = a command no
+  // menu places, which asked for no card shape and so fits any card.
+  // Card-less: only the entries of a card-less slot (topbar, palette) count,
+  // and one must match the empty context — a command placed only on cards,
+  // or whose palette `when` asks about a card, never runs without one.
+  async function allowed(id, ctx, cardless) {
     const { matches } = await loadPure();
-    const entries = Object.values(contributions().menus).flat().filter((e) => e.command === id);
-    if (!entries.length) return true;
+    const menus = contributions().menus;
+    const slots = cardless ? manifests.CARDLESS_SLOTS : Object.keys(menus);
+    const entries = slots.flatMap((slot) => menus[slot] || []).filter((e) => e.command === id);
+    if (!entries.length) return !cardless;
     return entries.some((e) => { try { return matches(e.when, ctx); } catch (err) { return false; } });
   }
 
@@ -258,9 +285,8 @@ function createPluginApi(deps) {
     if (body.__bad) return sendJson(res, 400, { error: body.__bad });
     const c = await cardFor(body);
     if (c.error) return sendJson(res, c.code, { error: c.error });
-    if (!(await allowed(id, c.ctx))) {
-      return sendJson(res, 403, { error: 'command ' + id + ' does not apply to card ' + c.card.id + ' (no menu entry of it matches the card)' });
-    }
+    const no = await refusal(id, c);
+    if (no) return sendJson(res, 403, { error: no });
     const p = pluginEntry(command.plugin);
     const plan = await planRun(command, { context: c.ctx, input: body.input, config: (p && p.config) || {}, workspace: deps.workspace, pluginDir: p && p.dir });
     if (plan.error) {
@@ -286,7 +312,7 @@ function createPluginApi(deps) {
     let started;
     try {
       started = runs.start({
-        plugin: command.plugin, command: id, title: command.title, card: c.card.id, owner: c.card.owner,
+        plugin: command.plugin, command: id, title: command.title, card: c.card ? c.card.id : '', owner: c.card ? c.card.owner : '',
         shell: plan.shell, cwd: plan.cwd, env: plan.env, timeoutMs: plan.timeoutMs, tracked: plan.tracked,
       });
     } catch (e) { return sendJson(res, 500, { error: errText(e) }); }
