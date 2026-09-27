@@ -12,7 +12,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { startServer, startServerWithLieutenant, withOwner, sleep } = require('./helper');
-const { summarize, permissionMode } = require('../server/permissions.js');
+const { summarize, permissionMode, permissionModes } = require('../server/permissions.js');
 
 const PRELOAD = path.join(__dirname, 'recording-harness.js');
 const QUIET = { BC_SUPERVISE_INTERVAL_MS: '0', BC_PRWATCH_INTERVAL_MS: '0' };
@@ -81,15 +81,20 @@ const waitPending = (s, n) => until(n + ' pending permission(s)', async () => {
   return p.length === n ? p : null;
 });
 
+// The tool names and the modes are the claude PROFILE's (harness/claude-tmux.js);
+// permissions.js only frames what it is handed.
 test('summary: the risky field per tool, else trimmed JSON; unknown modes read as auto', () => {
-  assert.strictEqual(summarize('Bash', { command: 'rm -rf  /tmp/x\n&& ls' }), 'rm -rf /tmp/x && ls');
-  assert.strictEqual(summarize('Edit', { file_path: '/a/b.js', old_string: 'x' }), '/a/b.js');
-  assert.strictEqual(summarize('WebFetch', { url: 'https://x.dev', prompt: 'p' }), 'https://x.dev');
-  assert.strictEqual(summarize('mcp__x__y', { a: 1 }), '{"a":1}');
-  assert.strictEqual(summarize('Glob', { pattern: 'x'.repeat(400) }).length, 200);
-  assert.strictEqual(permissionMode(undefined), 'auto');
-  assert.strictEqual(permissionMode('yolo'), 'auto');
-  assert.strictEqual(permissionMode('acceptEdits'), 'acceptEdits');
+  const { describe, modes } = require('../harness/claude-tmux.js').profile.permissions;
+  assert.strictEqual(summarize('Bash', { command: 'rm -rf  /tmp/x\n&& ls' }, describe), 'rm -rf /tmp/x && ls');
+  assert.strictEqual(summarize('Edit', { file_path: '/a/b.js', old_string: 'x' }, describe), '/a/b.js');
+  assert.strictEqual(summarize('WebFetch', { url: 'https://x.dev', prompt: 'p' }, describe), 'https://x.dev');
+  assert.strictEqual(summarize('mcp__x__y', { a: 1 }, describe), '{"a":1}');
+  assert.strictEqual(summarize('Glob', { pattern: 'x'.repeat(400) }, describe).length, 200);
+  assert.strictEqual(summarize('Bash', { command: 'ls' }), '{"command":"ls"}', 'no describe, the input itself');
+  assert.strictEqual(permissionMode(undefined, modes), 'auto');
+  assert.strictEqual(permissionMode('yolo', modes), 'auto');
+  assert.strictEqual(permissionMode('acceptEdits', modes), 'acceptEdits');
+  assert.deepStrictEqual(permissionModes([['a', 'b'], [], ['b', 'c']]), ['a', 'b', 'c'], 'the union, first list first');
 });
 
 test('an unattributed ask is held, shown on the board and the SSE stream, and allow answers the hook', async () => {

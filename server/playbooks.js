@@ -279,24 +279,44 @@ function workerBrief(b) {
   return render(b.template, briefVars(b));
 }
 
-// seedPlaybooksAndDuties(stateDir, home) — the two halves of "how we ask for work",
-// installed together at workspace.init because they are one thing split by
-// ownership:
+// seedPlaybooksAndDuties(stateDir, skillsDirs) — the two halves of "how we ask
+// for work", installed together at workspace.init because they are one thing
+// split by ownership:
 //
 //   playbooks/  COPIES of the packaged playbooks, and only the ones missing.
 //               They are the USER's to edit, so an upgrade must never
 //               overwrite one.
-//   skill       a SYMLINK to the packaged bridge-commander-worker skill. The
-//               duties are OURS, so upgrading bridge-commander upgrades them
-//               with no copy going stale in someone's skills dir.
+//   skill       a SYMLINK to the packaged bridge-commander-worker skill, in
+//               every skills dir given. Where an agent CLI looks for skills is
+//               its profile's business (profile.skillsDir(home)); the caller
+//               asks the harnesses. The duties are OURS, so upgrading
+//               bridge-commander upgrades them with no copy going stale.
 //
-// Returns what it did, for init to print. Never throws: a workspace whose
-// playbooks/ is unwritable still runs off the packaged playbooks, and a skills dir
-// we may not write is the user's business, not a reason to fail init.
+// Returns what it did, for init to print: `skill` is the first link made,
+// `skills` all of them. Never throws: a workspace whose playbooks/ is
+// unwritable still runs off the packaged playbooks, and a skills dir we may
+// not write is the user's business, not a reason to fail init.
 const PACKAGED_SKILL_DIR = path.join(__dirname, '..', 'skills', 'bridge-commander-worker');
 
-function seedPlaybooksAndDuties(stateDir, home) {
-  const out = { playbooks: [], skill: '' };
+function linkSkill(skillsDir) {
+  const skillDst = path.join(skillsDir, 'bridge-commander-worker');
+  try {
+    fs.mkdirSync(skillsDir, { recursive: true });
+    let cur = null;
+    try { cur = fs.lstatSync(skillDst); } catch (e) { cur = null; }
+    if (cur && cur.isSymbolicLink()) {
+      if (fs.readlinkSync(skillDst) === PACKAGED_SKILL_DIR) return ''; // already ours, pointing right
+      fs.unlinkSync(skillDst); // a link left by an older checkout is ours to repoint
+    } else if (cur) {
+      return ''; // a real directory someone installed by hand — leave it alone
+    }
+    fs.symlinkSync(PACKAGED_SKILL_DIR, skillDst, 'dir');
+    return skillDst;
+  } catch (e) { return ''; /* no skills dir we may write — the playbook says to load it, the user installs it */ }
+}
+
+function seedPlaybooksAndDuties(stateDir, skillsDirs) {
+  const out = { playbooks: [], skill: '', skills: [] };
   const dst = playbooksDir(stateDir);
   try {
     fs.mkdirSync(dst, { recursive: true });
@@ -307,20 +327,11 @@ function seedPlaybooksAndDuties(stateDir, home) {
     }
   } catch (e) { /* unwritable playbooks dir — the packaged playbooks still resolve */ }
 
-  const skillDst = path.join(home || require('os').homedir(), '.claude', 'skills', 'bridge-commander-worker');
-  try {
-    fs.mkdirSync(path.dirname(skillDst), { recursive: true });
-    let cur = null;
-    try { cur = fs.lstatSync(skillDst); } catch (e) { cur = null; }
-    if (cur && cur.isSymbolicLink()) {
-      if (fs.readlinkSync(skillDst) === PACKAGED_SKILL_DIR) return out; // already ours, pointing right
-      fs.unlinkSync(skillDst); // a link left by an older checkout is ours to repoint
-    } else if (cur) {
-      return out; // a real directory someone installed by hand — leave it alone
-    }
-    fs.symlinkSync(PACKAGED_SKILL_DIR, skillDst, 'dir');
-    out.skill = skillDst;
-  } catch (e) { /* no skills dir we may write — the playbook says to load it, the user installs it */ }
+  for (const dir of [...new Set(skillsDirs || [])]) {
+    const linked = linkSkill(dir);
+    if (linked) out.skills.push(linked);
+  }
+  out.skill = out.skills[0] || '';
   return out;
 }
 

@@ -88,7 +88,7 @@ const { makeProxy, engineUrl } = require(path.join(__dirname, 'proxy.js'));
 const { createFileGate } = require(path.join(__dirname, 'filegate.js'));
 const { createClock } = require(path.join(__dirname, 'clock.js'));
 const { createConversation, parseTarget, CAPTAIN } = require(path.join(__dirname, 'conversation.js'));
-const { permissionMode, summarize, createPermissions } = require(path.join(__dirname, 'permissions.js'));
+const { permissionModes, permissionMode, summarize, createPermissions } = require(path.join(__dirname, 'permissions.js'));
 const { readJsonl, sealJsonl } = require(path.join(__dirname, 'jsonl.js'));
 const { createDelivery } = require(path.join(__dirname, 'delivery.js'));
 const feedtext = require(path.join(__dirname, 'feedtext.js'));
@@ -192,16 +192,27 @@ function readConfig() {
   return {};
 }
 // The launch mode every agent gets, read at launch time so an edit to
-// config.json takes effect on the next spawn. An unknown value launches as
-// auto — said once per value, not on every launch.
+// config.json takes effect on the next spawn. An unknown value launches in the
+// default mode — said once per value, not on every launch.
 const warnedModes = new Set();
+// The modes the harnesses accept (profile data), the default harness's first:
+// its first mode is what an unknown value launches as.
+function harnessModes(c) {
+  const first = (c || readConfig()).harness || port.defaultHarness();
+  const lists = [first].concat(port.listHarnesses().map((h) => h.name)).map((n) => {
+    try { const info = port.profileInfo(n); return (info && info.permissionModes) || []; } catch (e) { return []; }
+  });
+  return permissionModes(lists);
+}
 function configPermissionMode(c) {
-  const raw = (c || readConfig()).permissionMode;
-  const mode = permissionMode(raw);
+  const cfg = c || readConfig();
+  const raw = cfg.permissionMode;
+  const modes = harnessModes(cfg);
+  const mode = permissionMode(raw, modes);
   if (raw !== undefined && raw !== mode && !warnedModes.has(String(raw))) {
     warnedModes.add(String(raw));
     console.warn(now() + ' config.json permissionMode ' + JSON.stringify(raw)
-      + ' is not one of auto|default|acceptEdits|bypass — using auto');
+      + ' is not one of ' + modes.join('|') + ' — using ' + mode);
   }
   return mode;
 }
@@ -267,6 +278,19 @@ const TURNEND_URL = 'http://127.0.0.1:' + PORT + '/api/turn-end';
 const HARNESS_ENV = Object.freeze({ stateDir: HARNESS_STATE_DIR, callbackUrl: TURNEND_URL });
 function harnessFor(ref) { return port.harnessFor(ref, HARNESS_ENV); }
 function getHarness(name) { return port.getHarness(name, HARNESS_ENV); }
+// The harnesses plugins contribute as profiles (plugins/*/plugin.json and the
+// workspace's own), registered once, before anything asks for one by name.
+// A bad profile is logged and skipped; it never stops the boot.
+{
+  const manifests = require(path.join(__dirname, 'manifests.js'));
+  const log = (m) => console.error(now() + ' ' + m);
+  const catalog = manifests.resolveCatalog({ workspaceDir: path.join(STATE_DIR, 'plugins'), stateDir: STATE_DIR, log });
+  require(path.join(__dirname, '..', 'harness', 'profiles.js')).loadProfiles({
+    profiles: manifests.contributions(catalog).profiles,
+    stateDir: STATE_DIR, // where secrets.env lives
+    log,
+  });
+}
 
 // The commit this process is RUNNING, decided once here at boot and never
 // re-read: a merge into the checkout below moves the files, not this record,
@@ -754,16 +778,29 @@ function respawnPrompt(lt) {
 }
 
 // The launch options every lieutenant spawn and resume goes out with. The model
-// rides in `extraArgs` exactly the way card.start pins a worker's, so the flag
-// is recorded with the spawn and replayed by a resume — a lieutenant pinned to
-// a model comes back on it, respawn after respawn.
-function ltLaunchOpts(lt, extra) {
+// is the TYPED `model` option, the way card.start pins a worker's: the harness
+// turns it into its own flag and records it with the spawn, so a resume
+// replays it — a lieutenant pinned to a model comes back on it, respawn after
+// respawn. A harness that cannot take a model starts without it, and the
+// board says so once per lieutenant and harness, not on every respawn.
+const ignoredLtOptions = new Set();
+function ltLaunchOpts(lt, extra, harness) {
   const opts = Object.assign(
     { installHooks: false, permissionMode: configPermissionMode() },
     extra || {}
   );
-  const model = lt && validModel(lt.model);
-  if (model) opts.extraArgs = ['--model', model];
+  const name = harness || (lt && lt.ref && lt.ref.harness) || readConfig().harness || port.defaultHarness();
+  let impl = null;
+  try { impl = getHarness(name); } catch (e) { return opts; } // the spawn names the unknown harness itself
+  const { opts: typed, ignored } = port.splitOptions(impl, { model: lt && validModel(lt.model) });
+  Object.assign(opts, typed);
+  for (const opt of ignored) {
+    const once = (lt && (lt.id || lt.name)) + '|' + name + '|' + opt;
+    if (ignoredLtOptions.has(once)) continue;
+    ignoredLtOptions.add(once);
+    store.boardEvent({ text: 'lieutenant ' + ((lt && (lt.name || lt.id)) || '?') + ': ' + name + ' does not support '
+      + opt + '; started without it', actor: 'server' }, { kind: 'option-ignored' });
+  }
   return opts;
 }
 
@@ -788,7 +825,7 @@ async function respawnFresh(lt, harness) {
   const window = lt.ref.window || names.LIEUTENANT_WINDOW;
   try { await harnessFor(lt.ref).kill({ ...lt.ref, window }); }
   catch (e) { console.error(now() + ' kill failed relaunching ' + lt.id + ': ' + String((e && e.message) || e)); }
-  return impl.spawn(lt.ref.cwd, respawnPrompt(lt), ltLaunchOpts(lt, { session, window }));
+  return impl.spawn(lt.ref.cwd, respawnPrompt(lt), ltLaunchOpts(lt, { session, window }, harness || lt.ref.harness));
 }
 
 async function spawnLieutenant(body) {
@@ -806,7 +843,7 @@ async function spawnLieutenant(body) {
   if (existing && (await sessionState(existing)) === 'live') {
     return { lieutenant: existing, spawned: false };
   }
-  const harnessName = String(body.harness || readConfig().harness || 'claude');
+  const harnessName = String(body.harness || readConfig().harness || port.defaultHarness());
   let impl;
   try { impl = getHarness(harnessName); } catch (e) { return { error: String(e.message || e), code: 400 }; }
   if (body.model !== undefined && body.model !== null && body.model !== '' && !validModel(body.model)) {
@@ -823,13 +860,13 @@ async function spawnLieutenant(body) {
   const session = names.lieutenantSession(WORKSPACE, id);
   let ref;
   try {
-    ref = await impl.spawn(WORKSPACE, lieutenantPrompt(name, id), ltLaunchOpts({ model }, {
+    ref = await impl.spawn(WORKSPACE, lieutenantPrompt(name, id), ltLaunchOpts({ id, name, model }, {
       session,
       window: names.LIEUTENANT_WINDOW, // its own window in its own session — see layout.js
       // Only the first run sends this, and only when the person said so out
-      // loud: the harness decides what it means (for claude, IS_SANDBOX=1).
+      // loud: the harness decides what it means.
       allowRoot: !!body.allowRoot,
-    }));
+    }, harnessName));
   } catch (e) {
     return { error: 'spawn failed: ' + String((e && e.message) || e), code: 502 };
   }
@@ -1167,7 +1204,15 @@ function permissionFields(body, lt, w) {
   const tool = String(body.tool_name || 'unknown').slice(0, 200);
   const input = body.tool_input && typeof body.tool_input === 'object' && !Array.isArray(body.tool_input)
     ? body.tool_input : {};
-  const out = { ts: now(), tool_name: tool, tool_input: input, summary: summarize(tool, input),
+  // The asking agent's harness knows which field of its tool input carries the
+  // risk; one that does not say (a test double, an unattributed ask) gets the
+  // default harness's reading.
+  const askRef = (w && w.ref) || (lt && lt.ref) || null;
+  const describeOf = (name) => {
+    try { const p = port.profileOf(name); return p && p.permissions && p.permissions.describe; } catch (e) { return null; }
+  };
+  const describe = (askRef && describeOf(askRef.harness)) || describeOf(readConfig().harness || port.defaultHarness());
+  const out = { ts: now(), tool_name: tool, tool_input: input, summary: summarize(tool, input, describe),
     lieutenant: null, card: null, worker: null, agentLabel: '' };
   if (w) {
     const card = findCard(w.card);
@@ -2387,6 +2432,7 @@ const BOARD_OWNED_ATTRS = new Set(['prs', 'artifacts']);
  * flags, keep_worktree/teardown, and the brief renderer. Refuses BEFORE
  * anything is provisioned (a missing `requires` attribute, an unknown harness).
  * @returns {{impl, branch, extraArgs, keepWorktree, teardown, brief: (wtPath) => string}|{error, code}}
+ * `impl` carries the typed model/effort into its spawn.
  */
 function planStart(card, body, project) {
   const playbookId = String(card.playbook || '').trim();
@@ -2439,7 +2485,7 @@ function planStart(card, body, project) {
   }
   // Harness and model: explicit flag, then the playbook's frontmatter, then config.
   const harnessFromPlaybook = !body.harness && !!meta.harness;
-  const harnessName = String(body.harness || meta.harness || readConfig().harness || 'claude');
+  const harnessName = String(body.harness || meta.harness || readConfig().harness || port.defaultHarness());
   let impl;
   // A name the playbook asked for names the playbook back.
   try { impl = getHarness(harnessName); }
@@ -2447,10 +2493,23 @@ function planStart(card, body, project) {
     return { error: String((e && e.message) || e)
       + (harnessFromPlaybook ? ' (from playbook ' + playbookFile + ')' : ''), code: 400 };
   }
-  const extraArgs = [];
+  // model and effort are TYPED options: the harness spells its own flags, and
+  // one it does not honor is dropped with a note on the card (best-effort;
+  // verbs still throw). The start never fails over an option.
   const modelHint = body.model || meta.model;
-  if (modelHint) extraArgs.push('--model', String(modelHint));
-  if (body.effort) extraArgs.push('--effort', String(body.effort));
+  const { opts: typed, ignored } = port.splitOptions(impl, {
+    model: modelHint ? String(modelHint) : undefined,
+    effort: body.effort ? String(body.effort) : undefined,
+  });
+  for (const opt of ignored) {
+    store.cardEvent(card, { text: harnessName + ' does not support ' + opt + '; started without it', actor: 'server' },
+      { kind: 'option-ignored' });
+  }
+  const extraArgs = [];
+  if (Object.keys(typed).length) {
+    const raw = impl;
+    impl = Object.assign({}, raw, { spawn: (cwd, prompt, o) => raw.spawn(cwd, prompt, Object.assign({}, o, typed)) });
+  }
   // A branch is the playbook's delivery contract; without the key the card type decides.
   const cuts = typeof meta.branch === 'boolean' ? meta.branch : card.type !== 'investigation';
   const branch = cuts ? 'bc/' + card.id : null;

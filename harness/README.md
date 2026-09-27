@@ -14,11 +14,92 @@ Seven verbs, nothing else:
 | `onTurnEnd` | `(ref, hook, opts?) → unsubscribe()` | turn-boundary detection, push not poll |
 
 `opts` is ONE bag across `spawn`, `resumable`, `resume`, `onTurnEnd` and
-`runCommand`/`status`/`brief`: `stateDir`, `callbackUrl`, `extraArgs`, `allowRoot`,
-`permissionMode`, `installHooks`, `session`, `window`. All verbs may be async. Zero dependencies —
+`runCommand`/`status`/`brief`: `stateDir`, `callbackUrl`, `extraArgs`, `model`, `effort`,
+`allowRoot`, `permissionMode`, `installHooks`, `session`, `window`. `model` and `effort`
+are TYPED options (see "Typed options" below). All verbs may be async. Zero dependencies —
 plain Node (>= 18; uses `node:test`, `fetch`). Beyond the seven, a harness MAY
 expose **optional capability verbs** — see below. This README is the one place
 their contract is written down; `port.js` points here.
+
+## Adapter family, profile, derived profile
+
+A harness is an **adapter family** plus a **profile**.
+
+- An **adapter family** implements the verbs once for one kind of backend. The
+  families are kernel and few: `tmux` (`tmux-adapter.js`, a TUI in a tmux pane),
+  `acp` (an Agent Client Protocol session, `acp-adapter.js`) and `fake` (tests).
+- A **profile** is the facts about ONE CLI: its launch lines, the screens a
+  launch walks through, its typed-option flags, its permission modes, what it
+  needs on the machine, how it is installed, how its first-run screens are
+  diagnosed. `claude-tmux.js` and `codex-tmux.js` are JS profiles of the tmux
+  family, and each exports its `profile` object.
+- A **derived profile** is JSON a plugin contributes (`plugins/<id>/plugin.json`,
+  `contributes.profiles`). It `extends` a JS profile and overlays only DATA:
+  `env`, `contextWindows`, `requirements`, `installHint`. Behaviour stays in JS.
+  `plugins/deepseek/plugin.json` points claude's TUI at DeepSeek's
+  Anthropic-compatible API:
+
+  ```json
+  { "name": "deepseek", "extends": "claude",
+    "env": { "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+             "ANTHROPIC_AUTH_TOKEN": "${DEEPSEEK_API_KEY}", "ANTHROPIC_MODEL": "deepseek-chat" },
+    "contextWindows": { "deepseek": 128000 } }
+  ```
+
+  `{"adapter": "acp", "command": …, "args": […], "env": {…}}` builds an acp
+  harness instead; no `extends` needed.
+
+`profiles.js` does the work: `resolveProfile(json, bases)` merges one (an
+unknown `extends`, an unknown field or a literal secret throws);
+`loadProfiles({profiles, stateDir, log})` takes `contributions(catalog).profiles`
+(`server/manifests.js`), registers each through `registerHarness`, and records a
+failure (`[{name, plugin, ok, error?}]`) instead of throwing. A shipped plugin
+declares a built-in as `{"name": "claude", "builtin": true}`, so it is listed
+with its plugin. The server calls `loadProfiles` once at boot; `bc-axi` calls it
+the first time a verb needs a harness.
+
+The port lists what is registered: `listHarnesses() → [{name, adapter, plugin?}]`
+(sorted; the fake only under `BC_FAKE_STATE` or `BC_LIST_FAKE`), and
+`defaultHarness()` is the one place the default's name lives (a workspace's
+`config.json` `harness` overrides it). The core reads a profile's data through
+the optional verb `profileInfo()` and reaches its behaviour through
+`port.profileOf(name)`: `handRunLine(mode, {root})`, `setupScreens(mode)`,
+`rootBlock()`, `diagnose(text, ctx)`, `detectSelf(env)`, `skillsDir(home)`,
+`installWorkspace(ws, env)`, `refreshWorkspace(ws)` and
+`permissions.describe(request)`. Nothing in `server/` or `cli/` names a CLI
+(`test/no-cli-names.test.js`).
+
+### Env and secrets
+
+A profile's `env` value is either exactly `${NAME}` (a reference) or a literal
+without `${`. A key whose name ends in `KEY`, `TOKEN`, `SECRET` or `PASSWORD`
+must be a reference — a manifest may be committed, a secret may not. At every
+launch (spawn AND resume) the tmux adapter expands the references from the
+server's environment, then `<ws>/.bridge-commander/secrets.env` (`KEY=value`
+lines), writes the values to `<stateDir>/<key>.env` with mode `0600`, and launches
+
+```sh
+( set -a; . '<stateDir>/<key>.env'; set +a; exec env <launch line> )
+```
+
+The subshell keeps the values out of the pane's own shell; `exec env` keeps the
+CLI the pane's foreground command, so `alive` still reads it. A missing
+reference fails the spawn before any pane exists, naming the variable. The value
+never rides argv, the launch line typed into tmux, or `<key>.spawn-args`, which
+records only the `${NAME}` templates; a resume re-expands them, so a rotated key
+lands on the next launch. A profile without `env` launches bare and removes a
+stale env file.
+
+### Typed options
+
+`opts.model` and `opts.effort` go to `profile.modelArgs({model, effort}) → argv`:
+claude spells `--model` / `--effort`, codex `-m <model>` / `-c model_reasoning_effort=<effort>`.
+`profileInfo().options` lists the ones a profile honors. The CALLER (the server)
+passes only those — `port.splitOptions(impl, wanted) → {opts, ignored}` — and lands a
+card or board timeline warning for the rest: `"<harness> does not support
+<opt>; started without it"`. Options are best-effort; a VERB a harness cannot
+honor still throws. Both are recorded in `<key>.spawn-args`, so a resume
+replays them.
 
 ## Binding: the plumbing is bound once
 
@@ -148,11 +229,15 @@ focus, so an agent with siblings must always carry its window.
 
 ## Files
 
-- `port.js` — the contract: `getHarness(name, env?)`, `registerHarness(name, impl)`, `harnessFor(ref, env?)`,
-  `isHarnessRef(ref)`, `keyOf(ref)`, `isSpawnableSession(name)`
+- `port.js` — the contract: `getHarness(name, env?)`, `registerHarness(name, impl, meta?)`, `harnessFor(ref, env?)`,
+  `isHarnessRef(ref)`, `keyOf(ref)`, `isSpawnableSession(name)`, `listHarnesses()`, `defaultHarness()`,
+  `profileInfo(name)`, `profileOf(name)`, `splitOptions(impl, wanted)`
+- `profiles.js` — derived profiles: `resolveProfile`, `loadProfiles`, `expandEnv`
 - `tmux-adapter.js` — `tmuxAdapter(profile)`: the ONE implementation of every verb over tmux
 - `claude-tmux.js` — the claude profile (launch line, permission modes, screens,
-  hooks, `/output-style`)
+  hooks, `/output-style`, typed options, context windows)
+- `claude-onboard.js` — what the claude profile tells a stranger on the first run
+  (hand-run line, install hint, root block, pane diagnosis); `cli/firstrun.js` frames it
 - `codex-tmux.js` — the OpenAI Codex CLI profile (launch flags, screens)
 - `tmux-session.js` — session/window/pane plumbing under the adapter
   (pane lifecycle, naming, launch-and-settle, turn-end tail, pane viewing)
@@ -180,7 +265,8 @@ focus, so an agent with siblings must always carry its window.
   POST its turn ends to `opts.callbackUrl`, like a real relay
 - `smoke.js` — real end-to-end smoke, `node harness/smoke.js [claude|codex] [--resume]`
 - `test/` — unit tests (`node --test harness/test/*.test.js`); `conformance.test.js`
-  runs one suite against every profile and the fake
+  runs one suite against every tmux harness `listHarnesses()` names (a JSON-derived
+  one included) and the fake; `profiles.test.js` pins the merge and the secret rule
 
 ## The tmux adapter
 
@@ -195,6 +281,10 @@ about its CLI:
 | `prepare(cwd, key, ctx)` | install the Stop and PermissionRequest hooks | — (the relay rides the launch line) |
 | `status(ref, ctx)` | transcript / statusline sidecar | rollout log |
 | extra commands | `/autocompact` (pass-through), `/output-style` (emulated) | — |
+| `modelArgs` | `--model`, `--effort` | `-m`, `-c model_reasoning_effort=…` |
+| `permissions.modes` | `auto` `default` `acceptEdits` `bypass` | none (keeps its bypass flags) |
+| `requirements` | `claude` on PATH, tmux, root refuses bypass | `codex` on PATH, tmux |
+| `contextWindows` | `fable` 1M, `opus`/`sonnet`/`haiku` 200k | — (the rollout carries the window) |
 
 Both `spawn` and `resume` end with `verifyLive`: returning is a claim that a
 session is there, and a settle can match a modal's own wording.
@@ -304,8 +394,10 @@ workspace's `.bridge-commander/harness/` and the CLI installs its hooks against
 the same dir (`server/layout.js` `harnessStateDir`; `BC_HARNESS_STATE` overrides; the
 global `~/.bridge-commander/harness/` is a last-resort for bare embedders only):
 `<session>.prompt`, `<session>.session-id`, `<session>.turnend.jsonl`,
+`<session>.env` (a profile's expanded env, mode 0600, only when it has one),
 `<session>.spawn-args` (the launch facts a spawn was given — `opts.extraArgs`,
-`opts.permissionMode` and `opts.allowRoot` — recorded by the shared `tmux-session.js` so a RESUME
+`opts.model`, `opts.effort`, `opts.permissionMode`, `opts.allowRoot` and the env
+TEMPLATES — recorded by the shared `tmux-session.js` so a RESUME
 replays them: a worker pinned to a `--model` by its playbook must not come back
 on the default one. A missing or corrupt record reads as "nothing extra" and
 never throws — a resume that cannot read a hint must still resume).
@@ -334,9 +426,9 @@ against codex 0.144.1; the fatal screens against the 0.155.1 binary.
     TAIL — the accepted trust prompt lingers in scrollback.
   - `opts.permissionMode` is accepted and ignored: codex has no
     board-relayed approval hook, so it keeps its bypass flags.
-  - `--model <m>` is accepted, so the server's existing `extraArgs` model
-    plumbing works unchanged; the default model comes from
-    `~/.codex/config.toml`.
+  - the typed options become `-m <model>` and `-c model_reasoning_effort=<effort>`
+    (pinned against the 0.157.1 binary's strings; its `--help` hangs off a
+    terminal); the default model comes from `~/.codex/config.toml`.
 - **turn ends + resume id** — one mechanism gives both: `-c notify=[...]`
   makes codex run `codex-notify.js` at every turn boundary with its payload
   JSON appended as the LAST argv (`type: "agent-turn-complete"`, `thread-id`,
@@ -375,15 +467,19 @@ pending queue). The ref is rewritten whole and comes back WITHOUT a `resumeId`:
 a claude session id means nothing to codex, and a stale one would have
 supervision try to resume a thread that never existed. The conversation is lost
 in the move; the delivery queue is not, so the new session drains everything the
-old one never acked. A `model` on the lieutenant rides `opts.extraArgs` as
-`--model` on every spawn AND resume of it — recorded in `<key>.spawn-args` like a
-worker's, so a later respawn comes back on the same model instead of the
-harness's default.
+old one never acked. A `model` on the lieutenant rides the typed `opts.model` on
+every spawn AND resume of it — recorded in `<key>.spawn-args` like a worker's, so
+a later respawn comes back on the same model instead of the harness's default. A
+harness that does not honor it starts without it, and the board says so once.
 
 ## Adding a new harness
 
-Implement the seven verbs in one module and register it (claude and codex are
-already builtins — `getHarness('codex')` just works):
+The cheapest route is JSON: a plugin whose `plugin.json` contributes a derived
+profile over an existing one (see "Adapter family, profile, derived profile").
+It joins `listHarnesses()` and `conformance.test.js` with no code.
+
+For a new CLI, implement the seven verbs in one module and register it (claude
+and codex are already builtins — `getHarness('codex')` just works):
 
 ```js
 const { registerHarness } = require('./port.js');

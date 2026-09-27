@@ -30,9 +30,9 @@ const { seedPlaybooksAndDuties } = require(path.join(SELF_DIR, '..', 'server', '
 // The packaged hooks (this repo's hooks/) are installed into a fresh workspace
 // the way the packaged playbooks are — copies, and only the missing ones.
 const { seedHooks } = require(path.join(SELF_DIR, '..', 'server', 'hooks.js'));
-// The workspace's .claude/settings.local.json (Stop hook, statusLine) has ONE
-// writer, shared with the claude harness — see harness/claude-settings.js.
-const claudeSettings = require(path.join(SELF_DIR, '..', 'harness', 'claude-settings.js'));
+// Everything about one agent CLI (how it is detected, installed, wired into a
+// workspace) is its harness profile's, reached through the port.
+const port = require(path.join(SELF_DIR, '..', 'harness', 'port.js'));
 const { excludeFromGit } = require(path.join(SELF_DIR, '..', 'harness', 'util.js'));
 // --charter-file writes the lieutenant's memory file, not a board field — the
 // charter is prose the agent reads at launch (see server/layout.js).
@@ -190,6 +190,38 @@ const CONFIG_FILE = path.join(STATE_DIR, 'config.json');
 const PID_FILE = path.join(STATE_DIR, 'server.pid');
 const LOG_FILE = path.join(STATE_DIR, 'server.log');
 
+// The harnesses plugins contribute as profiles, loaded on first need (most
+// verbs never ask) — the same catalog the server loads at boot, so
+// `init --harness <derived>` works before any server is up.
+let profilesLoaded = false;
+function harnesses() {
+  if (!profilesLoaded) {
+    profilesLoaded = true;
+    const manifests = require(path.join(SELF_DIR, '..', 'server', 'manifests.js'));
+    const log = (m) => console.error('[bridge-commander] ' + m);
+    require(path.join(SELF_DIR, '..', 'harness', 'profiles.js')).loadProfiles({
+      profiles: manifests.contributions(manifests.resolveCatalog({
+        workspaceDir: path.join(STATE_DIR, 'plugins'), stateDir: STATE_DIR, log })).profiles,
+      stateDir: STATE_DIR, log,
+    });
+  }
+  return port;
+}
+// profile(name) -> the harness's profile, or null for one that has none.
+function profile(name) {
+  try { return harnesses().profileOf(name); } catch (e) { return null; }
+}
+// profileHooks(field) -> each DISTINCT function the listed profiles offer under
+// `field`: a derived profile shares its base's, and the workspace needs it once.
+function profileHooks(field) {
+  const out = [];
+  for (const h of harnesses().listHarnesses()) {
+    const p = profile(h.name);
+    if (p && typeof p[field] === 'function' && !out.includes(p[field])) out.push(p[field]);
+  }
+  return out;
+}
+
 function readConfig() {
   try {
     const c = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
@@ -345,7 +377,8 @@ async function cmdOpen() {
   await rebindIfAsked();
   if (opts.host) writeConfigKeys({ host: opts.host }); // a bind that does not survive a restart is not a bind
   const { st, started } = await ensureServer();
-  await claudeSettings.installStatusLine(WORKSPACE); // self-heal the statusLine wiring on every open
+  // self-heal each harness's workspace wiring (claude's statusLine) on every open
+  for (const refresh of profileHooks('refreshWorkspace')) await refresh(WORKSPACE);
   console.log(boardUrl(st.host));
   console.log((started ? 'started' : 'already running') + ' workspace=' + st.workspace + ' cards=' + st.cards);
 }
@@ -410,29 +443,33 @@ async function seedGhWatchSchedule(owner) {
 }
 
 // Which agent CLI is running this init, read from what each one exports to
-// the commands it runs: claude sets CLAUDECODE (and CLAUDE_SESSION_ID when it
-// has one), codex sets CODEX_THREAD_ID — the thread id `codex resume` takes.
-// --harness wins. Claude also wins a tie: a tmux server started from one agent
-// hands that agent's variables to every session in it, and claude is what
-// every init before this one recorded.
+// the commands it runs (profile.detectSelf(env) -> {resumeId} | null).
+// --harness wins. The default harness is asked first, so it wins a tie: a tmux
+// server started from one agent hands that agent's variables to every session
+// in it, and the default is what every init before this one recorded.
 function callerHarness() {
   const env = process.env;
-  if (opts.harness) {
-    const resumeId = opts.harness === 'codex' ? env.CODEX_THREAD_ID : env.CLAUDE_SESSION_ID;
-    return { harness: opts.harness, resumeId: resumeId || '' };
+  const self = (name) => {
+    const p = profile(name);
+    return p && typeof p.detectSelf === 'function' ? p.detectSelf(env) : null;
+  };
+  if (opts.harness) return { harness: opts.harness, resumeId: (self(opts.harness) || {}).resumeId || '' };
+  const first = harnesses().defaultHarness();
+  const order = [first].concat(harnesses().listHarnesses().map((h) => h.name).filter((n) => n !== first));
+  for (const name of order) {
+    const hit = self(name);
+    if (hit) return { harness: name, resumeId: hit.resumeId || '' };
   }
-  if (!env.CLAUDECODE && !env.CLAUDE_SESSION_ID && env.CODEX_THREAD_ID) {
-    return { harness: 'codex', resumeId: env.CODEX_THREAD_ID };
-  }
-  return { harness: 'claude', resumeId: env.CLAUDE_SESSION_ID || '' };
+  return { harness: first, resumeId: '' };
 }
 
 async function cmdInit() {
   if (opts.onboard) return cmdInitOnboard();
   if (!opts.name) {
-    die('usage: bc-axi init --name <founding-lieutenant-name> [--id id] [--charter-file f|-] [--harness claude|codex] [--port N] [--host H]\n' +
+    die('usage: bc-axi init --name <founding-lieutenant-name> [--id id] [--charter-file f|-] [--harness h] [--port N] [--host H]\n' +
       '  Run from inside the tmux session that will BE the founding lieutenant.\n' +
-      '  The harness is read from the environment (claude or codex); --harness overrides it.');
+      '  The harness is read from the environment (' + harnesses().listHarnesses().map((h) => h.name).join(', ')
+      + '); --harness overrides it.');
   }
   // 1. teleport precondition: the caller's tmux session becomes the lieutenant's address
   // No tmux command is ever printed for a human to type — not here, not in any
@@ -497,17 +534,33 @@ async function cmdInit() {
   console.log('\nboard: ' + boardUrl(opts.host));
 }
 
-// The workspace-level turn-end Stop hook -> POST /api/turn-end, and the
-// PermissionRequest hook -> POST /api/permission. Session-agnostic
-// pseudo-name "ws": it fires for every claude in this cwd and the server
-// dedupes by session_id. NOTE: claude captures hooks at startup, so the
-// founding session's own turn-ends start flowing on its next restart.
+// Each harness's workspace-level wiring (profile.installWorkspace): for claude,
+// the turn-end Stop hook -> POST /api/turn-end, the PermissionRequest hook ->
+// POST /api/permission and the statusLine, under the session-agnostic
+// pseudo-name "ws" (the server dedupes by session_id). A CLI captures hooks
+// at startup, so the founding session's own turn-ends flow from its next restart.
 async function installTurnEndHook() {
   // The same workspace-scoped harness state dir the server binds (layout.js).
-  await claudeSettings.installHooks(WORKSPACE, 'ws', harnessStateDir(STATE_DIR), 'http://127.0.0.1:' + PORT + '/api/turn-end');
-  console.log('turn-end + permission hooks installed (.claude/settings.local.json -> /api/turn-end, /api/permission)');
-  await claudeSettings.installStatusLine(WORKSPACE);
-  console.log('statusLine installed (.claude/settings.local.json -> real context window sidecar)');
+  const env = { stateDir: harnessStateDir(STATE_DIR), callbackUrl: 'http://127.0.0.1:' + PORT + '/api/turn-end' };
+  for (const install of profileHooks('installWorkspace')) {
+    for (const line of (await install(WORKSPACE, env)) || []) console.log(line);
+  }
+}
+
+// Where the worker-duties skill is linked: every harness's skills dir
+// (profile.skillsDir), but only the default one's is created from nothing —
+// a CLI never run here has no dir of its own to add to.
+function skillsDirs() {
+  const home = os.homedir();
+  const first = harnesses().defaultHarness();
+  const out = [];
+  for (const h of harnesses().listHarnesses()) {
+    const p = profile(h.name);
+    if (!p || typeof p.skillsDir !== 'function') continue;
+    const dir = p.skillsDir(home);
+    if (h.name === first || fs.existsSync(path.dirname(dir))) out.push(dir);
+  }
+  return out;
 }
 
 // The shared memory scaffold (never overwrites what exists), plus the playbooks
@@ -540,9 +593,9 @@ function scaffoldWorkspace() {
   }
   // playbooks + the worker-duties skill. Playbooks are copies (yours to edit,
   // never overwritten); the skill is a symlink (ours, upgraded with the tool).
-  const seeded = seedPlaybooksAndDuties(STATE_DIR);
+  const seeded = seedPlaybooksAndDuties(STATE_DIR, skillsDirs());
   if (seeded.playbooks.length) console.log('seeded playbooks: ' + seeded.playbooks.join(', '));
-  if (seeded.skill) console.log('worker duties symlinked (' + seeded.skill + ' -> the packaged skill)');
+  for (const dir of seeded.skills) console.log('worker duties symlinked (' + dir + ' -> the packaged skill)');
 
   // the packaged hooks. The gh-watch SCHEDULE that fires one of them is seeded
   // by each init path once its founding lieutenant exists — a schedule needs an
@@ -621,22 +674,24 @@ async function cmdInitOnboard() {
 
   // 2. Can this machine run a board at all? Nothing here installs anything —
   //    each answer is written for the agent that will relay it and ASK.
-  const harness = opts.harness || 'claude';
-  const tmuxBacked = harness === 'claude' || harness === 'codex';
-  if (tmuxBacked && !fr.hasBin('tmux')) {
+  const harness = opts.harness || readConfig().harness || harnesses().defaultHarness();
+  let info;
+  try { info = harnesses().profileInfo(harness); } catch (e) { die('bc-axi: ' + e.message); }
+  const req = (info && info.requirements) || { bins: [], tmux: false, rootBypass: false };
+  if (req.tmux && !fr.hasBin('tmux')) {
     die('bc-axi: first run blocked (tmux-missing)\n\n' + fr.tmuxMissingText());
   }
-  // Root is checked HERE, not discovered from a dead pane 45 seconds later: as
-  // root claude exits on sight of --dangerously-skip-permissions, so the board
-  // would come up with nobody on it and a message that guessed wrong about why.
-  // Only the bypass launch carries that flag; the server spawns her with the
-  // same config permissionMode read here.
+  // Root is checked HERE, not discovered from a dead pane 45 seconds later: a
+  // CLI whose bypass launch refuses uid 0 (requirements.rootBypass) exits on
+  // sight of it, so the board would come up with nobody on it and a message
+  // that guessed wrong about why. Only the bypass launch carries that flag; the
+  // server spawns her with the same config permissionMode read here.
   const mode = fr.permissionModeOf(readConfig());
   const bypass = mode === 'bypass';
-  if (harness === 'claude' && bypass && fr.isRoot() && !opts.allowRoot) {
-    die('bc-axi: first run blocked (root)\n\n' + fr.rootBlockText());
+  if (req.rootBypass && bypass && fr.isRoot() && !opts.allowRoot) {
+    die('bc-axi: first run blocked (root)\n\n' + fr.rootBlockText(harness));
   }
-  if (bypass && opts.allowRoot && fr.isRoot()) {
+  if (req.rootBypass && bypass && opts.allowRoot && fr.isRoot()) {
     console.error('\n⚠ --allow-root: Bridget will be launched with IS_SANDBOX=1, skipping the guard that\n'
       + '  stops a permissions-skipping agent from running as root. Throwaway machines only.\n');
   }
@@ -658,7 +713,8 @@ async function cmdInitOnboard() {
   console.error('│  workspace : ' + WORKSPACE + (resuming ? '   (existing)' : '   (NEW)'));
   console.error('│  board     : ' + boardUrl(opts.host));
   console.error('│  lieutenant: ' + BRIDGET.name);
-  console.error('└─ permissions: ' + mode + (harness === 'claude' ? '' : ' (ignored by ' + harness + ')'));
+  const honorsMode = !!(info && (info.permissionModes || []).includes(mode));
+  console.error('└─ permissions: ' + mode + (honorsMode ? '' : ' (ignored by ' + harness + ')'));
 
   // 3. The workspace itself.
   fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -727,7 +783,8 @@ async function cmdInitOnboard() {
   // 7. Her session. The one step that needs an authenticated agent CLI, and the
   //    one step whose failure must NOT take the board down with it.
   let live = true;
-  if (tmuxBacked && !fr.hasBin(harness)) {
+  const missingBin = (req.bins || []).find((b) => !fr.hasBin(b));
+  if (missingBin) {
     // Certain, and cheap to know: there is no point spawning into a binary that
     // is not there, and no point making anyone read a pane to find that out.
     live = false;
@@ -748,7 +805,7 @@ async function cmdInitOnboard() {
       // own session; that tail is printed verbatim and the cause is named FROM
       // it, with a guess only where the pane said nothing — and labelled as one.
       const why = (e.body && e.body.error) || e.message;
-      const d = fr.diagnoseSpawn(why, WORKSPACE, { mode });
+      const d = fr.diagnoseSpawn(why, WORKSPACE, { mode, harness });
       console.log('\n⚠ ' + name + '\'s session did not start (' + d.cause + ').');
       // ALWAYS, even when there is nothing in it: a message that says "read the
       // pane above" over an empty space is worse than one that says the pane
@@ -840,11 +897,11 @@ async function cmdLtCreate() {
 }
 
 const LT_PATCH_USAGE = 'usage: bc-axi lieutenant patch <id> [--avatar N|none] [--color #rrggbb] [--prefix ABC]'
-  + ' [--harness claude|codex] [--model m|none]\n'
+  + ' [--harness h] [--model m|none]\n'
   + '  --harness KILLS the current session and respawns the lieutenant on the other harness with\n'
   + '  charter + owned cards + pending queue as its prompt; the conversation does not survive.\n'
   + '  --model is stored and rides --model on every later spawn/resume; `none` clears it back to\n'
-  + '  the harness default (~/.codex/config.toml for codex).';
+  + '  the harness default.';
 async function cmdLtPatch() {
   const id = positional[0];
   if (!id) die(LT_PATCH_USAGE);
@@ -873,7 +930,7 @@ async function cmdLtPatch() {
       : 'already on ' + body.harness + ' — session left alone');
   } else if (body.model !== undefined) {
     console.log('the model applies to the NEXT spawn or resume of this lieutenant'
-      + ' (bc-axi lieutenant patch ' + id + ' --harness ' + (lt.ref ? lt.ref.harness : 'codex') + ' respawns it now)');
+      + (lt.ref ? ' (bc-axi lieutenant patch ' + id + ' --harness <another> respawns it now)' : ''));
   }
 }
 
@@ -1250,7 +1307,8 @@ async function cmdStart() {
       '  --brief-file adds/overrides the task text (default: the card body).\n' +
       '  --resume reincarnates the card\'s recorded (dead) worker in the same worktree.\n' +
       '  --model overrides the spawned worker\'s model (e.g. claude-fable-5); ignored with --resume.\n' +
-      '  --effort sets reasoning effort (low|medium|high|xhigh|max) for a claude worker; ignored with --resume.');
+      '  --effort sets reasoning effort (low|medium|high|xhigh|max) where the harness takes it; ignored with --resume.\n' +
+      '  An option the harness cannot take is dropped with a note on the card; the start goes ahead.');
   }
   if (opts.resume && opts.briefFile) {
     die('--resume does not deliver briefs: the reincarnated worker keeps its own context and the\n' +
@@ -1759,7 +1817,7 @@ if (!commands[cmd]) {
     'Workspace: nearest .bridge-commander/ from cwd upward, or --workspace DIR. Port: workspace config.json (default 4780), or --port N.\n' +
     'Bind host: config.json "host" (default 127.0.0.1 loopback), or --host H on init/open. Never 0.0.0.0 — there is no app auth.\n' +
     '\nserver & workspace:\n' +
-    '  init --name N [--id id] [--charter-file f|-] [--harness claude|codex] [--port N] [--host H]\n' +
+    '  init --name N [--id id] [--charter-file f|-] [--harness h] [--port N] [--host H]\n' +
     '                                         workspace.init (the teleport): run INSIDE tmux; bootstraps\n' +
     '                                         .bridge-commander/, boots the server, registers the caller\'s tmux\n' +
     '                                         session as the founding lieutenant (on the harness its\n' +
@@ -1800,7 +1858,7 @@ if (!commands[cmd]) {
     '                                         the agent is launched on — --charter-file creates it when\n' +
     '                                         absent and never replaces one)\n' +
     '  lieutenant patch <id> [--avatar N|none] [--color #rrggbb] [--prefix ABC]\n' +
-    '                        [--harness claude|codex] [--model m|none]\n' +
+    '                        [--harness h] [--model m|none]\n' +
     '                                         lieutenant.update: cosmetics + the card-id prefix (refused\n' +
     '                                         when another lieutenant holds it) — name/id stay immutable.\n' +
     '                                         --harness MOVES a living lieutenant: kills its session and\n' +

@@ -312,3 +312,25 @@ test('outside bypass, the hand-run line is the spawn\'s own --permission-mode, w
   const setup = fr.diagnoseSpawn(tail('Choose the text style that looks best'), '/ws');
   assert.match(setup.fix, /cd \/ws && claude --permission-mode auto/);
 });
+
+// The hand-run line is the PROFILE's: codex used to be handed claude's
+// --dangerously-skip-permissions, a flag codex does not have.
+test('codex gets its own hand-run line, install route and diagnosis — never claude\'s', () => {
+  const line = fr.handRunLine('codex', '/ws', { root: true, mode: 'bypass' });
+  assert.strictEqual(line, '  cd /ws && codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust');
+  assert.doesNotMatch(line, /skip-permissions|IS_SANDBOX/);
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-home-'));
+  const oldHome = process.env.HOME;
+  let t;
+  try { process.env.HOME = home; t = fr.agentMissingText('codex', '/ws'); } finally {
+    process.env.HOME = oldHome; fs.rmSync(home, { recursive: true, force: true });
+  }
+  assert.match(t, /npm i -g @openai\/codex/);
+  assert.doesNotMatch(t, /claude/);
+  const tail = (x) => 'spawn failed; pane tail:\n' + x;
+  assert.strictEqual(fr.diagnoseSpawn(tail('Sign in with ChatGPT to use Codex'), '/ws', { harness: 'codex' }).cause, 'auth');
+  assert.strictEqual(fr.diagnoseSpawn(tail('zsh: command not found: codex'), '/ws', { harness: 'codex' }).cause, 'missing');
+  const unknown = fr.diagnoseSpawn(tail('something new'), '/ws', { harness: 'codex' });
+  assert.strictEqual(unknown.cause, 'unknown');
+  assert.match(unknown.fix, /cd \/ws && codex/);
+});
