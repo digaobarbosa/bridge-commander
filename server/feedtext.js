@@ -103,6 +103,11 @@ const KINDS = {
     hint: 'an outside process (a workflow, a cron, a CI hook) put this on the timeline and woke you: read the text and act',
   }),
   'card-moved': (it, { bit }) => ({ head: 'captain moved ' + bit(it.card) + ': ' + it.from + ' -> ' + it.to }),
+  'activity-failed': (it, { bit }) => ({
+    head: 'ACTIVITY FAILED — ' + bit(it.card),
+    hint: 'a plugin command run on this card did not come back clean: read the whole log (bc-axi activity log '
+      + (it.activity || '<id>') + '), then fix what it needs and run it again, or tell the captain why it cannot run',
+  }),
 };
 
 function sessionOf(card) {

@@ -76,6 +76,7 @@ const opts = {
   playbook: null, briefFile: null, resume: false, outcome: null, model: null, effort: null, park: false,
   uri: null, file: null, version: null,
   card: null, trigger: null, key: null, source: null, limit: 0,
+  inputs: [], follow: false, phase: null,
   onboard: false, here: false, allowRoot: false,
   hook: null, when: null, overlap: null, catchup: null,
 };
@@ -130,6 +131,9 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--key') opts.key = argv[++i];
   else if (a === '--source') opts.source = argv[++i];
   else if (a === '--limit') opts.limit = parseInt(argv[++i], 10);
+  else if (a === '--input') opts.inputs.push(argv[++i]);
+  else if (a === '--follow') opts.follow = true;
+  else if (a === '--phase') opts.phase = argv[++i];
   else if (a === '--hook') opts.hook = argv[++i];
   else if (a === '--when') opts.when = argv[++i];
   else if (a === '--overlap') opts.overlap = argv[++i];
@@ -146,7 +150,8 @@ for (let i = 0; i < argv.length; i++) {
 }
 let cmd = positional.shift();
 // Two-word verbs mirror the DNA operation names: `card create`, `lieutenant list`, …
-if ((cmd === 'card' || cmd === 'lieutenant' || cmd === 'project' || cmd === 'worker' || cmd === 'artifact' || cmd === 'line' || cmd === 'playbook' || cmd === 'hook' || cmd === 'schedule') && positional.length) cmd = cmd + ' ' + positional.shift();
+if ((cmd === 'card' || cmd === 'lieutenant' || cmd === 'project' || cmd === 'worker' || cmd === 'artifact' || cmd === 'line' || cmd === 'playbook' || cmd === 'hook' || cmd === 'schedule'
+  || cmd === 'plugins' || cmd === 'command' || cmd === 'activity') && positional.length) cmd = cmd + ' ' + positional.shift();
 // Three-word verb: `card artifact add|rm`.
 if (cmd === 'card artifact' && positional.length) cmd = cmd + ' ' + positional.shift();
 
@@ -500,6 +505,8 @@ async function cmdInit() {
   console.error('│  tmux      : ' + tmuxSession);
   console.error('│  harness   : ' + callerHarness().harness);
   console.error('└─ if that workspace is wrong, stop now and re-run with --workspace <dir>');
+  // Inside tmux is proof of tmux; everything else the plugins ask is asked here.
+  await runInitChecks((c) => c.bin === 'tmux', (id) => 'bc-axi init: blocked (' + id + ')');
 
   // 2. state dir + server (detached, idempotent)
   fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -700,6 +707,11 @@ async function cmdInitOnboard() {
   // stranger and a running board.
   const git = fr.gitIdentity();
   if (!git.ok) console.error('\n⚠ ' + fr.gitIdentityText(git) + '\n');
+  // The plugins' init checks, minus the ones answered above: the profile's
+  // requirements and the identity check already had their say, in their words.
+  const asked = new Set((req.bins || []).concat(req.tmux ? ['tmux'] : []));
+  await runInitChecks((c) => asked.has(c.bin) || (c.plugin === 'core-checks' && c.id === 'git-identity'),
+    (id) => 'bc-axi: first run blocked (' + id + ')');
 
   const port = await settleOnboardPort(fr);
   if (!port) {
@@ -1787,6 +1799,123 @@ async function cmdConfig() {
   die('usage: bc-axi config <show | voices "<name,name,...>">');
 }
 
+// ---------- plugins, commands, activities, checks ----------
+async function cmdPlugins() {
+  const r = await request('GET', '/api/plugins');
+  if (opts.json) return console.log(JSON.stringify(r.plugins, null, 2));
+  if (!r.plugins.length) return console.log('no plugins');
+  const w = Math.max(...r.plugins.map((p) => p.id.length));
+  for (const p of r.plugins) {
+    console.log((p.id.padEnd(w) + '  ' + p.source.padEnd(9) + '  ' + (p.enabled ? 'enabled ' : 'disabled') + '  '
+      + (p.active ? 'active' : 'idle  ') + (p.error ? '  error: ' + p.error : '')).trimEnd());
+  }
+}
+
+// Through the overlay, the one switch the board also flips: a plugin id the
+// catalog does not know is refused rather than written as a dead entry.
+async function pluginsToggle(enabled) {
+  const id = positional[0];
+  if (!id) die('usage: bc-axi plugins ' + (enabled ? 'enable' : 'disable') + ' <plugin-id>');
+  const cat = await request('GET', '/api/plugins');
+  if (!cat.plugins.some((p) => p.id === id)) {
+    die('no plugin "' + id + '" (known: ' + cat.plugins.map((p) => p.id).join(', ') + ')');
+  }
+  const r = await request('PUT', '/api/plugins/overlay', { plugins: { [id]: { enabled } } });
+  console.log('plugin ' + id + ' ' + (enabled ? 'enabled' : 'disabled'));
+  if (r.restartNeeded) console.log('it contributes an agent profile: restart the server to apply that (bc-axi stop, then bc-axi open)');
+}
+function cmdPluginsEnable() { return pluginsToggle(true); }
+function cmdPluginsDisable() { return pluginsToggle(false); }
+
+async function cmdCommandRun() {
+  const [id, card] = positional;
+  if (!id || !card) die('usage: bc-axi command run <command-id> <card-id> [--input k=v]...');
+  const input = {};
+  for (const kv of opts.inputs) {
+    const i = kv.indexOf('=');
+    if (i <= 0) die('bad --input (want key=value): ' + kv);
+    input[kv.slice(0, i)] = kv.slice(i + 1);
+  }
+  const r = await request('POST', '/api/commands/' + encodeURIComponent(id) + '/run', { card, input });
+  if (opts.json) return console.log(JSON.stringify(r, null, 2));
+  if (r.activity) return console.log('activity ' + r.activity.id + ' started — bc-axi activity log ' + r.activity.id + ' --follow');
+  if (r.url) return console.log(r.url);
+  if (r.run) return console.log('run ' + r.run.id + ' started (untracked)');
+  console.log(r.message || (r.ok ? 'ok' : 'failed'));
+  if (r.ok === false) process.exit(1);
+}
+
+async function cmdActivities() {
+  const q = new URLSearchParams();
+  if (opts.card) q.set('card', opts.card);
+  if (opts.limit > 0) q.set('limit', String(opts.limit));
+  const r = await request('GET', '/api/activities' + (q.toString() ? '?' + q : ''));
+  if (opts.json) return console.log(JSON.stringify(r.activities, null, 2));
+  if (!r.activities.length) return console.log('no activities');
+  for (const a of r.activities) {
+    console.log(a.id + '  ' + a.status.padEnd(8) + '  ' + hhmm(a.startedAt) + '  ' + (a.card || '-') + '  '
+      + a.command + (a.title && a.title !== a.command ? ' — ' + a.title : '') + (a.error ? '  (' + a.error + ')' : ''));
+  }
+}
+
+// --follow polls the log route: the next `from` is the size the last read
+// ended at, so nothing is printed twice. It exits with the run's own success.
+async function cmdActivityLog() {
+  const id = positional[0];
+  if (!id) die('usage: bc-axi activity log <activity-id> [--follow]');
+  const at = (from) => '/api/activities/' + encodeURIComponent(id) + '/log?from=' + from;
+  let r = await request('GET', at(0));
+  process.stdout.write(r.text);
+  if (!opts.follow) return;
+  while (!r.done) {
+    await sleep(500);
+    r = await request('GET', at(r.size));
+    process.stdout.write(r.text);
+  }
+  const a = ((await request('GET', '/api/activities?limit=500')).activities || []).find((x) => x.id === id);
+  if (a && a.status !== 'ok') {
+    console.error('[activity ' + id + ' ' + a.status + (a.error ? ': ' + a.error : '') + ']');
+    process.exit(1);
+  }
+}
+
+// One line per check, the way init words its own: only failures are news.
+function checkLine(c) {
+  return (c.ok ? '✓ ' : c.severity === 'error' ? '✗ ' : '⚠ ') + c.title
+    + (c.ok ? '' : ': ' + c.message + (c.fix ? '\n    fix: ' + c.fix : '')) + '   [' + c.plugin + '/' + c.id + ']';
+}
+async function cmdChecks() {
+  const phase = opts.phase || '';
+  const r = await request('GET', '/api/checks' + (phase ? '?phase=' + encodeURIComponent(phase) : ''));
+  if (opts.json) return console.log(JSON.stringify(r.checks, null, 2));
+  if (!r.checks.length) return console.log('no checks' + (phase ? ' for phase ' + phase : ''));
+  for (const c of r.checks) console.log(checkLine(c));
+  if (r.checks.some((c) => !c.ok && c.severity === 'error')) process.exit(1);
+}
+
+// The `init` checks the enabled plugins declare (plugins/core-checks: tmux,
+// git, a git identity), run HERE: init may be the thing that boots the server.
+// `skip(check)` names what init already asks on its own, so nothing prints
+// twice. An error-severity failure stops init; a warning is printed and init
+// goes on. No plugins, no checks: init is exactly what it was.
+async function runInitChecks(skip, blocked) {
+  const manifests = require(path.join(SELF_DIR, '..', 'server', 'manifests.js'));
+  const { createChecks } = require(path.join(SELF_DIR, '..', 'server', 'checks.js'));
+  const log = (m) => console.error('[bridge-commander] ' + m);
+  const catalog = manifests.resolveCatalog({ workspaceDir: path.join(STATE_DIR, 'plugins'), stateDir: STATE_DIR });
+  const checks = createChecks({ log });
+  for (const c of manifests.contributions(catalog).checks) {
+    if (c.phase !== 'init' || skip(c)) continue;
+    const p = catalog.plugins.find((x) => x.id === c.plugin);
+    try { checks.register(checks.fromManifest(c, { plugin: c.plugin, dir: p && p.dir })); }
+    catch (e) { log('check ' + c.plugin + '/' + c.id + ' skipped: ' + e.message); }
+  }
+  const failed = (await checks.run('init')).filter((r) => !r.ok);
+  const error = failed.find((r) => r.severity === 'error');
+  if (error) die(blocked(error.plugin + '/' + error.id) + '\n\n' + error.title + ': ' + error.message + (error.fix ? '\nfix: ' + error.fix : ''));
+  for (const r of failed) console.error('\n⚠ ' + r.title + ': ' + r.message + (r.fix ? ' — ' + r.fix : '') + '\n');
+}
+
 const commands = {
   init: cmdInit,
   open: cmdOpen, stop: cmdStop, status: cmdStatus, config: cmdConfig,
@@ -1811,6 +1940,8 @@ const commands = {
   event: cmdEvent, notify: cmdNotify,
   say: cmdSay, drain: cmdDrain, ack: cmdAck,
   line: cmdLine, 'line pass': cmdLinePass,
+  plugins: cmdPlugins, 'plugins enable': cmdPluginsEnable, 'plugins disable': cmdPluginsDisable,
+  'command run': cmdCommandRun, activities: cmdActivities, 'activity log': cmdActivityLog, checks: cmdChecks,
 };
 if (!commands[cmd]) {
   const usage = ('bc-axi — agent CLI for the bridge-commander board.\n' +
@@ -2032,6 +2163,25 @@ if (!commands[cmd]) {
     '                                         status.set: link worker + state (absent|idle|working|needs-you)\n' +
     '                                         as a lease; past the TTL (default 600s) working/needs-you\n' +
     '                                         decays to idle; "status <card-id> absent" unlinks\n' +
+    '\nplugins (plugins/<id>/ shipped, .bridge-commander/plugins/<id>/ the workspace\'s own):\n' +
+    '  plugins [--json]                       id, where it comes from, enabled, active (its server\n' +
+    '                                         module running), and the error that disabled it\n' +
+    '  plugins enable|disable <plugin-id>     flip it in .bridge-commander/plugins.json (the overlay)\n' +
+    '                                         — the same switch as the board\'s Plugins settings. A\n' +
+    '                                         plugin that contributes an agent profile says when the\n' +
+    '                                         server must restart for it\n' +
+    '  command run <command-id> <card-id> [--input k=v]... [--json]\n' +
+    '                                         run a plugin command on a card: prints the activity id\n' +
+    '                                         (a tracked run), the URL (a link) or the plugin\'s message.\n' +
+    '                                         Refused when the card is not one the command is placed on\n' +
+    '  activities [--card <id>] [--limit N] [--json]\n' +
+    '                                         tracked command runs, running first, then newest\n' +
+    '  activity log <activity-id> [--follow]  the run\'s whole output; --follow tails it until it\n' +
+    '                                         ends and exits with the run\'s own success. A failed\n' +
+    '                                         run also wakes the card\'s owner (activity-failed)\n' +
+    '  checks [--phase init|boot|card-start] [--json]\n' +
+    '                                         what the plugins ask of this machine; exits 1 when an\n' +
+    '                                         error-severity check fails. init runs the init ones\n' +
     '\nconfig:\n' +
     '  config show | config voices "a,b"      TTS voice filter for the UI\n' +
     '\nText/body/charter always via --text-file/--body-file/--charter-file or stdin ("-"), never shell-interpolated.\n' +

@@ -140,6 +140,25 @@ actor strings are honor-system. The network boundary is the auth boundary.
 | `hook.runs` | `hook?, limit? → [run]` | ⚓ · 🤠 | the trace, newest first, read from the TAIL of `hookruns.jsonl` |
 | `hook.edit` | — | 🤠 · ⚓ | a hook is a FILE, so editing one is `card.artifact.write` and the file screen: the same 💾, the same version check, the same 409. The gate widens by exactly one shape — an executable file under `.bridge-commander/hooks/`, one level deep or two, no symlink, the path built server-side and compared for equality. A hook nobody has written yet reads as the empty document at version `""` (see `card.artifact.write`), so `bc-axi artifact read` then `write --version ""` is how a lieutenant writes one with nothing but the CLI. A hook created there is born executable, and `hooks/` itself is created on the first write (a fixed name the board owns, like a lieutenant's memory folder) so a workspace with no hooks yet is not the one place a lieutenant cannot write the first one. An EVENT directory is never created: a directory invented from a typo is a hook that silently never fires, so a write into a missing one is refused with the event named and the ones the board fires listed — a legal path whose tree is missing gets that answer, not "unknown artifact" |
 
+### plugin
+
+A plugin is a folder the workspace (or Bridge Commander itself) ships: a manifest of what it
+adds, and optionally code that runs on the server. What it adds to a card is a **command**,
+placed in the card's menus by a predicate over the card; a **tracked** command's run is an
+**activity**. Which plugins are on is the workspace's **overlay**, and every built-in that is a
+plugin (the PR watch, the startup checks, the agent profiles) is switched off the same way.
+
+| Operation | Signature | Who | When |
+|---|---|---|---|
+| `plugin.list` | `() → [plugin + contributions]` | 🤠 (settings) · ⚓ | what is installed, where it came from, whether it is on and running, and the error that turned it off. A broken manifest never stops the board: it is listed, off, with its reason |
+| `plugin.toggle` | `plugin \| contribution, enabled, config? → ()` | 🤠 (settings) · ⚓ (CLI) | turn a plugin, or one thing it contributes, on or off, or change its config. Takes effect at once; an agent profile only registers at the next server start, and the answer says so |
+| `command.prepare` | `command, card → values` | 🤠 (the command's form) | the form's defaults for THIS card, filled in by the plugin when it asks to |
+| `command.run` | `command, card, input → activity \| url \| message` | 🤠 (a card menu, the palette) · ⚓ (CLI) | do the thing: run the command's shell line, open its link, or ask the plugin. The card is checked against the command's placement again — a command the plugin put only on some cards is REFUSED on any other, whoever asks. Input is validated against the form. Every card value reaches a shell line as one quoted word, never as shell syntax |
+| `activity.list` | `card? → [activity]` | 🤠 (the taskbar, the card) · ⚓ | tracked runs, running first, then newest. They survive a restart; one still running when the server stopped is closed as failed, "server restarted" |
+| `activity.log` | `activity, from? → text \| stream` | 🤠 · ⚓ (`activity log --follow`) | the run's WHOLE output, read back or followed live — not a capped tail |
+| `activity.cancel` | `activity → ()` | 🤠 · ⚓ | stop a run: its whole process tree is killed |
+| `checks.run` | `phase → [check result]` | ⚙️ (at boot: failures logged) · 🙋/⚓ (`init` runs the `init` ones itself) · 🤠 | "is this machine ready?" — each answer `{ok, message, fix}`. At init an `error` failure stops the init and a `warn` is said once; at boot nothing is ever stopped |
+
 ### schedule
 
 | Operation | Signature | Who | When |
@@ -227,6 +246,8 @@ session status, window adoption, the brief file, pane pids):
 | worker done + lieutenant review | lieutenant rewrites body, moves → Your review — the level-1 handoff |
 | PR merged (server watch) | card archived (`merged`), worktree released (the archive rules below — usually already released at the handoff; a refusal rides the archive note as well as the timeline), lingering worker session killed, level-1 event, `pr-merged` QueueItem to the owner |
 | PR closed unmerged (server watch) | `pr-closed` QueueItem to the owner — a decision, not an archive |
+| a tracked command run (activity) fails or times out | level-1 `activity-failed` event on the card and an `activity-failed` QueueItem to its owner, naming the activity and carrying the end of its output — the way a failed hook is owed. A canceled run is nobody's failure and says nothing |
+| lifecycle (card created, moved, archived; worker started, done, died; activity ended) | the running plugins are told — observe-only: nothing waits for them and a plugin that fails affects only itself |
 | card leaves Working (`card.move`) | the worker DIES — its window is killed and its registry record dropped — and its worktree is released; the handoff is the end of the work (`keep_worktree: true` and a worker that never reported done are the exceptions to BOTH; a worktree still holding work is kept on its own account, and the kill goes ahead anyway). The card keeps `session` and `resumeId` so the run stays readable afterwards. The kill is VERIFIED — the record is dropped only once the pane is provably gone; a pane that survives it keeps its record and lands a level-1 event on the card, never a silent leak. That bell rings ONCE per record, not once per attempt, and a kill that later succeeds makes the next failure news again. A release that refused, or that could not run at all, keeps the record too (the window is dead either way — only a release that positively landed drops it, and a worker that had no worktree to begin with has nothing to hold): that entry is the last handle on the work still standing on that checkout, archive is where it gets its next turn, and `card.start --resume` still works against it on purpose — the only copy of the work may be in there. A playbook's `teardown` runs in the worktree immediately before the release, best effort, 5 min; a level-2 event names the path, and names the reason when the release is refused. A released worktree drops the card's `worktree` attribute — no reader is left pointed at a directory that is gone |
 | card archived (any reason) | any worker session still bound to the card is killed — verified the same way, and the record dropped only once the pane is gone (an archived card has neither Working nor worker); usually there is none left, the handoff having killed it already; the worktree is released after the `card-archived` hooks — always, `keep_worktree` included, since nothing is left to rework. Already released at the handoff = a no-op, and the playbook's `teardown` does not run again either — it had its turn there. A handoff release that was REFUSED leaves the checkout standing, and that is the case where this release point gets a second attempt at a `teardown` that failed |
 | rework restart (`card.start` over a finished, dead worker) | the previous worker's worktree is released before the new one is cut, and the PREVIOUS run's recorded `teardown` runs in it first (60s, awaited) — the restart is the moment that checkout is actually destroyed, so it is where a `keep_worktree` playbook's container is finally stopped. The teardown's outcome never steers the release: a refusal still 409s the start, exactly as it did before. It is the same release as the handoff's and archive's — the same level-2 event, the pointer cleared when the ground goes — and a release that cannot run at all 409s too: a card never holds two worker records |
@@ -377,16 +398,19 @@ request ahead of provisioning and a spawn. `BC_TEARDOWN_TIMEOUT_MS` overrides bo
 The workspace `AGENTS.md` is the lieutenants' shared memory; its first instruction loads the
 skill, and the skill loads `captain.md` + learnings.
 
-## Plugins (proposed — not implemented)
+## Plugins
 
-[docs/rfc/plugins.md](../rfc/plugins.md) proposes a plugin system around this kernel. None
-of it is in the DNA until it ships. What it would add at this altitude:
+The operations are above (`plugin`, `command`, `activity`, `checks`); the RFC is
+[docs/rfc/plugins.md](../rfc/plugins.md). At this altitude:
 
 - **A harness is an adapter family + a profile.** Adapter families (`tmux`, `acp`, `fake`)
   are kernel; plugins contribute profiles, and a derived profile is JSON (`extends` a
   built-in, adds `env` by `${VAR}` reference only). Options (model, effort) are best-effort —
   an unsupported one is dropped with a timeline warning; verbs still throw.
 - **Commands** are the one unit of behaviour a plugin adds to a card; a tracked command run
-  is an **activity**, traced like a hook run and owed to the card's owner on failure.
+  is an **activity**, logged whole and owed to the card's owner on failure (`activity-failed`).
+- **Built-ins are plugins.** The PR watch belongs to the shipped `github` plugin and the
+  startup checks to `core-checks`; turning the plugin off turns the behaviour off. A board
+  without the `github` plugin at all keeps its PR watch — only an explicit "off" stops it.
 - **Events** stay observe-only: the rule above that hooks never block the lifecycle outcome
   holds for plugins too, unless deliberately changed here.

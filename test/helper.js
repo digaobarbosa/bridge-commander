@@ -262,6 +262,7 @@ async function startServerWithProject(opts = {}) {
   const repo = makeRepo(root);
   const fdir = path.join(root, 'fake');
   const s = await startServerWithLieutenant({
+    seed: opts.seed,
     env: Object.assign({
       BC_FAKE_STATE: fdir, BC_WORKTREE_TOOL: 'git',
       BC_SUPERVISE_INTERVAL_MS: '0', BC_PRWATCH_INTERVAL_MS: '0',
