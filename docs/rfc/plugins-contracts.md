@@ -194,3 +194,41 @@ All new routes live under `/api/plugins` and `/api/activities`, plus plugin rout
   - `ui/js/cardactions.js` holds the built-in card commands (move, archive, peek, talk, select). The tile, the move menu (`card.menu/v1`), the detail header (`detail.actions/v1`) and the table all read it.
   - A taskbar shows activities, and a click opens the log.
   - A "Plugins" settings section lists plugins and enables or disables them through the overlay.
+
+## As built in wave A (read this before wave B)
+
+- `server/plugins.js` `createPluginHost({catalog, log, now, api, internal, watchers, load?})`.
+  - Async: `reload`, `activate`, `deactivate`, `bootActivate`, `handler`, `route`.
+  - Sync: `emit`, `decorations`, `status`, `catalog`.
+  - **Use `contributions(host.catalog())`**. A plugin with a bad `when` is rewritten there as `enabled:false` with an error.
+  - Lazy activation happens only through `handler()` and `route()`. Decorators and event listeners need `activation: "boot"`.
+- `server/runs.js`: sync. `subscribe(id, fn, end?)`. `readLog` returns `size` = the next `from`.
+- `server/commands.js`: async. `planRun(command, {context, input, config, workspace})`, and the exec env carries `BC_CARD`, `BC_WORKTREE`, `BC_BRANCH`, `BC_REPO`, `BC_COMMAND`, `BC_PLUGIN`, `BC_WORKSPACE`, `BC_INPUT_<NAME>`, `BC_RUN`.
+- `server/watchers.js` `createWatchers` has a module-level `watchers` const in `server.js`. `server/checks.js` has `createChecks`. `server/prwatch.js` has `createPrWatch`.
+- `harness/port.js` has `listHarnesses()`, `defaultHarness()` and `profileOf(name)`. Impls expose `profileInfo()`.
+- `ui/js/cardview.js` has `cardContext` and `cardFacts`. `ui/js/slots.js`, `ui/js/form.js`.
+
+## Internal tier: the PR watch belongs to the `github` plugin
+
+- `server.js` stops registering the PR watch itself. It passes `internal = { prWatch: <createPrWatch instance {tick}>, prWatchIntervalMs: <parsed BC_PRWATCH_INTERVAL_MS, default 120000> }` to the host.
+- The shipped `plugins/github` has `activation: "boot"`. It registers `ctx.watchers.register({id: 'prwatch', intervalMs: ctx.internal.prWatchIntervalMs, tick: ctx.internal.prWatch.tick})`.
+- **Disabling the github plugin disables the PR watch.** That is the point of "built-ins are plugins".
+
+## Plugin UI modules (browser)
+
+A plugin's `ui` file is an ES module served at `/plugins/<id>/<file>`. It is loaded lazily: the first time one of its views is shown, one of its sections is rendered, or it is needed.
+
+```js
+export function activate(ui) { … }   // called once
+ui = {
+  plugin: { id, config },
+  views:    { register({ id, render(el, state), dispose?(el) }) → dispose },       // id = the manifest's views[].id
+  sections: { register({ id, render(el, card, state), dispose?(el) }) → dispose }, // id = the manifest's sections[].id
+  state()      → { doc, context(card) },   // the live board doc; cardContext
+  openCard(id), openActivity(id), toast(text),
+  api(method, path, body) → Promise<json>, // same-origin fetch helper
+  html: { esc },                           // escaping helper
+}
+```
+
+- `render` is called again on every board push, only while the view or section is visible. It must be idempotent and cheap. The shell wraps every call in the slot error boundary.
