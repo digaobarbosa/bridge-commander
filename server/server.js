@@ -1370,6 +1370,11 @@ function paneStream(req, res, ref, reason) {
       });
   }
   hub.clients.add(res);
+  // What the viewer may do with it: an event-log pane (the acp family) can be
+  // watched but not typed into, and the drawer must not invite a keystroke.
+  let attach = true;
+  try { attach = !(typeof impl.profileInfo === 'function' && impl.profileInfo().adapter === 'acp'); } catch (e) { /* assume tmux */ }
+  paneWrite(res, 'caps', { input: typeof impl.paneInput === 'function', attach });
   // Immediate paint: late joiners get the hub's last frame; the first
   // subscriber gets a one-shot snapshot when the harness offers one and the
   // live feed hasn't delivered yet (a real frame arriving first wins).

@@ -325,14 +325,15 @@
              aria-label="card title" autocomplete="off" spellcheck="false" hidden />
       <div class="dt-sub" id="dt-sub"></div>
     </div>
-    <!-- plugin buttons (detail.actions/v1), painted by detail.js -->
-    <span id="dt-pactions"></span>
     <button id="dt-talk" title="talk in this card's thread">💬 talk</button>
     <button id="dt-menu-btn" title="move / archive">⋯</button>
     <!-- archived snapshots only: the one action a frozen card offers -->
     <button id="dt-unarch" class="tv-unarch" hidden>🧟 unarchive</button>
     <button id="dt-close" title="close">✕</button>
   </div>
+  <!-- plugin buttons (detail.actions/v1), painted by detail.js: a row of their
+       own, so any number of them wraps instead of squeezing the title -->
+  <div id="dt-pactions"></div>
   <!-- the collapsed line: PR state and the tail of the timeline, one row, no wrap.
        Clicking it opens #dt-fold below, which holds the full attribute list,
        the labels and the whole timeline. -->

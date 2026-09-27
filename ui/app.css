@@ -1985,7 +1985,7 @@ button.tb-act:hover { border-color: var(--accent2); color: var(--text); }
 .t-activity .spin { width: 8px; height: 8px; border-width: 1.5px; }
 
 /* ---- detail: plugin buttons in the header, plugin sections at the end ---- */
-#dt-pactions { display: inline-flex; gap: 6px; flex: none; }
+#dt-pactions { flex: none; display: flex; flex-wrap: wrap; gap: 6px; padding: 0 16px 10px; }
 #dt-pactions:empty { display: none; }
 .dt-cmd {
   display: inline-flex; align-items: center; gap: 5px; color: var(--dim); border: 1px solid var(--line);
@@ -2042,6 +2042,5 @@ button.tb-act:hover { border-color: var(--accent2); color: var(--text); }
   .bc-modal { width: 100vw; max-height: none; height: 100dvh; border-radius: 0; border: none; }
   .bc-modal-overlay { align-items: stretch; }
   #taskbar { padding: 5px 10px; }
-  #dt-pactions .dt-cmd span { display: none; } /* icon only: the header is narrow */
   .tile .t-cmd { opacity: .8; font-size: 14px; padding: 2px 4px; }
 }

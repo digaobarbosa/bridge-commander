@@ -154,6 +154,13 @@ function open(url, title, inputAt) {
     if (stick) preEl.scrollTop = preEl.scrollHeight;
     setLive(true);
   });
+  es.addEventListener('caps', (e) => {
+    let c = {};
+    try { c = JSON.parse(e.data); } catch (err) { /* keep the default */ }
+    if (c.input === false) { inputUrl = null; setHint(); }
+    // No tmux session behind an event-log pane: nothing for a terminal to attach to.
+    if (c.attach === false) { termTarget = null; drawTerm(); }
+  });
   es.addEventListener('unsupported', () => showMsg('this harness has no live pane view'));
   es.addEventListener('busy', () => showMsg('too many live panes open — close one and try again'));
   es.addEventListener('no-pane', (e) => {
