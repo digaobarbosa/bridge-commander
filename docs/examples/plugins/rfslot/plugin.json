@@ -1,0 +1,52 @@
+{
+  "id": "rfslot",
+  "name": "rfslot deploy",
+  "description": "Run a card's worktree in a warm rfslot dev slot: mirror it in, keep it in sync, start the services. The form opens on the first slot whose lease is free or expired.",
+  "version": "1.0.0",
+  "server": "server.js",
+  "contributes": {
+    "commands": [
+      {
+        "id": "rfslot.deploy",
+        "title": "Run in rfslot",
+        "icon": "🚀",
+        "description": "rfslot use <slot> --from <worktree> --watch, then rfslot start <slot> <services>. The lease owner is the card id.",
+        "prepare": "server",
+        "form": {
+          "slot": {
+            "type": "string",
+            "required": true,
+            "title": "Slot",
+            "description": "A slot number (2) or a cloud slot name (digao-a), as `rfslot ls` prints it."
+          },
+          "services": {
+            "title": "Services",
+            "enum": ["emulators app", "emulators", "app", "api"],
+            "default": "emulators app"
+          }
+        },
+        "tracked": true,
+        "run": {
+          "exec": "rfslot use ${input.slot} --from ${card.worktree} --watch && rfslot start ${input.slot} $BC_INPUT_SERVICES",
+          "env": { "RFSLOT_OWNER": "${card.id}" }
+        }
+      }
+    ],
+    "menus": {
+      "card.menu/v1": [
+        {
+          "command": "rfslot.deploy",
+          "rank": 200,
+          "when": { "card.worktree": { "$exists": true }, "card.column": { "$in": ["working", "review"] } }
+        }
+      ],
+      "detail.actions/v1": [
+        {
+          "command": "rfslot.deploy",
+          "rank": 200,
+          "when": { "card.worktree": { "$exists": true }, "card.column": { "$in": ["working", "review"] } }
+        }
+      ]
+    }
+  }
+}
