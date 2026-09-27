@@ -10,8 +10,11 @@ import { openDetail } from './detail.js';
 import { openLieutenantChat } from './chat.js';
 import { openCardPane } from './pane.js';
 import { avatarGridHtml, wireAvatarGrid } from './avatars.js';
-import { selectionOn, isSelected, enterSelection, pick } from './selection.js';
-import { openPopover } from './popover.js';
+import { selectionOn, isSelected, pick } from './selection.js';
+import { openCardMenu, moveCard, pluginBadgesHtml, activityChipHtml, tileActionsHtml } from './cardactions.js';
+import { runCommand } from './commandui.js';
+import { openActivity } from './activities.js';
+import { fillHarnessOptions, defaultHarness } from './plugins.js';
 
 const boardEl = document.getElementById('board');
 
@@ -36,6 +39,9 @@ function tileHtml(c) {
     ? '<span class="t-perm" title="' + nPerm + ' permission request' + (nPerm > 1 ? 's' : '') + ' waiting for you">🔐 needs approval' + (nPerm > 1 ? ' ×' + nPerm : '') + '</span>'
     : '';
   const order = orderHtml(f, 'chip', c.owner);
+  // plugin data only — badges and the running-activity chip are markup built
+  // from the card and the manifests; no plugin code runs per tile
+  const ext = pluginBadgesHtml(c, S.doc) + activityChipHtml(c, S.doc);
   // worker-state stripe on the tile's RIGHT edge — a PERSISTENT status signal,
   // deliberately separate from the transient top-right corner (the LEFT edge is
   // the owner's color). workerState is whitelisted in cardview, so no server
@@ -59,7 +65,7 @@ function tileHtml(c) {
     '<div class="t-row1">' + box + '<span class="t-emoji">' + esc(f.emoji) + '</span>' +
     '<span class="t-title">' + esc(c.title || c.id) + '</span>' +
     cardNumHtml(c.id) + cornerInd + '</div>' +
-    (perm || labels || prs || order ? '<div class="t-chips">' + perm + order + labels + prs + '</div>' : '') +
+    (perm || labels || prs || order || ext ? '<div class="t-chips">' + perm + order + ext + labels + prs + '</div>' : '') +
     '<div class="t-foot">' +
     '<span class="t-owner' + (filterSelected('owner', c.owner) ? ' active' : '') + '" data-owner="' + esc(c.owner) +
       '" title="click: filter by lieutenant · alt-click: exclude"><span class="dot" style="background:' + esc(lieutenantColor(c.owner)) + '"></span>' + esc(f.ownerName) + '</span>' +
@@ -70,6 +76,7 @@ function tileHtml(c) {
     // Working tiles carry the worker's context bar and the 👁 peek (its terminal)
     (f.inWorking ? ctxBarHtml(f.agentStatus) : '') +
     (f.inWorking ? '<button class="t-peek" title="watch this worker\'s terminal live">👁</button>' : '') +
+    tileActionsHtml(c, S.doc) +
     agoSpanHtml(cardRecency(c), 't-ago') +
     '</div></div>';
 }
@@ -131,6 +138,10 @@ function wire() {
       const t = e.target;
       if (t.closest('a')) return; // PR chip / link: let the anchor navigate, don't open detail
       if (t.closest('.t-peek')) { openCardPane(el.dataset.id); return; }
+      const cmd = t.closest('.t-cmd');
+      if (cmd) { runCommand(cmd.dataset.cmd, el.dataset.id); return; }
+      const act = t.closest('.t-activity');
+      if (act) { openActivity(act.dataset.activity); return; }
       if (t.classList.contains('label')) { toggleFilter('label', t.dataset.label, e.altKey); return; }
       const own = t.closest('.t-owner');
       if (own) { toggleFilter('owner', own.dataset.owner, e.altKey); return; }
@@ -170,56 +181,18 @@ function wire() {
       e.preventDefault();
       col.classList.remove('drag-over');
       const cardId = e.dataTransfer.getData('text/bc-card');
-      if (cardId) { try { await api.moveCard(cardId, id, orderComment(cardId, id)); } catch (err) { alert(err.message); } }
+      if (cardId) await moveCard(cardId, id);
     };
     col.querySelector('.add-card').onclick = (e) => { e.stopPropagation(); openNewCard(id); };
   });
 }
 
-// A captain move that becomes an ORDER (any → working = start-order,
-// review → backlog = rework-order) carries an optional comment for the owning
-// lieutenant (the DNA: the rework-order QueueItem carries the captain's thread
-// comment). Empty or cancelled = no comment; the order still goes.
-function orderComment(cardId, to) {
-  const c = cards().find((k) => k.id === cardId);
-  if (!c || c.column === to) return '';
-  const order = to === 'working' ? 'start order'
-    : c.column === 'review' && to === 'backlog' ? 'rework order' : '';
-  if (!order) return '';
-  return (window.prompt('Comment for the ' + order + ' (optional):', '') || '').trim();
-}
-
 // ---------- move / actions menu ----------
+// The menu itself (moves with the order-comment rule, select, archive with its
+// refusal, plugin commands) is the card command table in cardactions.js; this
+// name stays for the callers that open it at a point.
 export function openMoveMenu(cardId, x, y) {
-  const c = cards().find((k) => k.id === cardId);
-  if (!c) return;
-  const move = (col) => async () => {
-    try { await api.moveCard(cardId, col.id, orderComment(cardId, col.id)); } catch (e) { alert(e.message); }
-  };
-  openPopover({ x, y }, [
-    { head: 'move to' },
-    ...columns().map((col) => col.id === c.column
-      ? { label: '● ' + col.title, current: true }
-      : { label: col.title, onClick: move(col) }),
-    { sep: true },
-    // The way INTO selection mode, on both the board and the table — nothing has
-    // to sit on screen the rest of the time for this to be reachable.
-    { label: '☑ select cards', onClick: () => { enterSelection(cardId); render(); } },
-    archiveItem(c),
-  ], { id: 'move-menu' });
-}
-// The same refusal the bulk bar applies (cardFacts.canArchive): archiving kills
-// a live worker's session, so a refused card shows why and cannot be pressed.
-// Asked again on click, since a board push may have bound a worker meanwhile.
-function archiveItem(c) {
-  const verdict = cardFacts(c, S.doc, Date.now()).canArchive;
-  if (!verdict.ok) return { label: '✕ archive — ' + verdict.reason, danger: true, title: 'not archivable: ' + verdict.reason };
-  return { label: '✕ archive', danger: true, onClick: async () => {
-    const now = cards().find((k) => k.id === c.id);
-    const v = now ? cardFacts(now, S.doc, Date.now()).canArchive : verdict;
-    if (!v.ok) { alert('Not archived: ' + v.reason); return; }
-    try { await api.archiveCard(c.id); } catch (e) { alert(e.message); }
-  } };
+  return openCardMenu(cardId, { x, y });
 }
 
 // ---------- new card modal ----------
@@ -306,7 +279,8 @@ const ltAvatarGrid = document.getElementById('lt-avatar-grid');
 let ltAvatarPick = null; // null = no avatar (the "none" cell), "none" allowed
 export function openNewLieutenant() {
   document.getElementById('lt-name').value = '';
-  document.getElementById('lt-harness').value = 'claude';
+  // the harnesses the server lists (GET /api/plugins), the built-in pair otherwise
+  fillHarnessOptions(document.getElementById('lt-harness'), defaultHarness());
   ltAvatarPick = null;
   ltAvatarGrid.innerHTML = avatarGridHtml(ltAvatarPick);
   wireAvatarGrid(ltAvatarGrid, (idx) => { ltAvatarPick = idx; });
@@ -332,7 +306,7 @@ document.getElementById('lt-modal').onsubmit = async (e) => {
       name,
       avatar: ltAvatarPick,
       color: document.getElementById('lt-color').value,
-      harness: document.getElementById('lt-harness').value || 'claude',
+      harness: document.getElementById('lt-harness').value || defaultHarness(),
       spawn: true,
     });
     closeNewLieutenant();

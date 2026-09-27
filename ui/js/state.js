@@ -14,7 +14,7 @@ export const S = {
   chatMode: null,          // {mode:'lieutenant', id} | {mode:'card', id} | null
   openCardId: null,        // detail panel
   view: 'chat',            // mobile tab: 'chat' | 'board'
-  boardMode: 'board',      // the board region's view: 'board' (kanban) | 'table' | 'archive'
+  boardMode: 'board',      // the board region's view id (views.js registry): 'board' (kanban), 'table', …
   // The ONE filter state, shared by every board-region mode. `text` lives in
   // the topbar input; the rest is configured in the filter popup (filterpop.js).
   // Every dimension is MULTI: sel holds {kind:'label'|'owner', value} chips,
@@ -26,9 +26,16 @@ export const S = {
   notifExpanded: new Set(), // seq of level-1 item whose preceding gap is expanded
 };
 
-let renderFn = () => {};
-export function onRender(fn) { renderFn = fn; }
-export function render() { renderFn(); }
+// A listener set, not a single slot: main's orchestrator is one listener, the
+// 3D room another, and a plugin view host may add its own. Returns dispose().
+const renderFns = new Set();
+export function onRender(fn) {
+  renderFns.add(fn);
+  return () => renderFns.delete(fn);
+}
+export function render() {
+  for (const fn of [...renderFns]) fn();
+}
 
 // ---------- board ingest ----------
 // Every board document — SSE push, reconnect refetch, the chat's echo refetch,

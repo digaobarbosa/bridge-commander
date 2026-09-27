@@ -8,7 +8,7 @@ import { esc, agoSpanHtml, cardPrs, prChipHtml, ctxBarHtml, setHtmlIfChanged } f
 import { cardFacts, cornerHtml, orderHtml } from './cardview.js';
 import { labelChipHtml } from './labels.js';
 import { openDetail } from './detail.js';
-import { openMoveMenu } from './board.js';
+import { openCardMenu } from './cardactions.js';
 import { selectionOn, isSelected, pick, setAll, allSelected } from './selection.js';
 
 const tableEl = document.getElementById('table');
@@ -128,8 +128,8 @@ function wire(order) {
     };
   }
   for (const tr of tableEl.querySelectorAll('tbody tr[data-id]')) {
-    // right-click is the way into selection mode here, same menu as a tile's
-    tr.oncontextmenu = (e) => { e.preventDefault(); openMoveMenu(tr.dataset.id, e.clientX, e.clientY); };
+    // right-click is the way into selection mode here: the tile's menu (cardactions.js)
+    tr.oncontextmenu = (e) => { e.preventDefault(); openCardMenu(tr.dataset.id, { x: e.clientX, y: e.clientY }); };
     tr.onclick = (e) => {
       // in selection mode the whole row is the checkbox — shift takes the range,
       // and a PR chip's <a> does not navigate out from under it

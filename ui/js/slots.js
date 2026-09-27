@@ -64,6 +64,15 @@ function visible(e, ctx) {
   try { return matches(e.when, ctx); } catch (err) { return false; }
 }
 
+/** Whether a slot holds anything at all — the tile asks before it builds a card context. */
+export function hasEntries(slot) {
+  const m = bySlot.get(slot);
+  return !!(m && m.size);
+}
+
+/** Whether the captain switched this contribution key off (built-in keys included). */
+export function isDisabled(key) { return disabled.has(key); }
+
 /** Replace the set of contribution keys the captain switched off. */
 export function setDisabled(keys) {
   disabled = new Set(keys || []);
