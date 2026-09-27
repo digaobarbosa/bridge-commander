@@ -1,0 +1,5 @@
+{
+  "id": "wsone",
+  "activation": "boot",
+  "server": "server.js"
+}
