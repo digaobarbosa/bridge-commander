@@ -267,8 +267,33 @@ function repoWithWorktree() {
 async function checkoutPlan(r, branch, mode) {
   const ctx = await contextFor({ id: 'C-7', column: 'working', attributes: { repo: 'proj', branch, worktree: r.wt } },
     [{ name: 'proj', path: r.proj }]);
-  return planRun(commandOf(path.join(SHIPPED, 'local-git'), 'local-git.checkout'), { context: ctx, input: { mode }, workspace: r.root });
+  return planRun(commandOf(path.join(SHIPPED, 'local-git'), 'local-git.checkout'),
+    { context: ctx, input: { mode }, workspace: r.root, pluginDir: path.join(SHIPPED, 'local-git') });
 }
+
+// How BC provisions a worker: a DETACHED worktree whose branch name is only a
+// plan until the worker's first commit creates it.
+test('local-git.checkout: a worktree whose branch does not exist yet → detach takes the worktree HEAD; branch mode explains', async () => {
+  const r = repoWithWorktree();
+  const bcWt = path.join(r.root, 'bc-wt');
+  git(r.proj, 'worktree', 'add', '-q', '--detach', bcWt, 'feat');
+  fs.writeFileSync(path.join(bcWt, 'b.txt'), 'worker\n');
+  git(bcWt, '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', 'add', 'b.txt');
+  git(bcWt, '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'worker commit');
+  fs.writeFileSync(path.join(bcWt, 'b.txt'), 'uncommitted\n');
+  const ctx = await contextFor({ id: 'C-8', column: 'working', attributes: { repo: 'proj', branch: 'bc/C-8', worktree: bcWt } },
+    [{ name: 'proj', path: r.proj }]);
+  const plan = (mode) => planRun(commandOf(path.join(SHIPPED, 'local-git'), 'local-git.checkout'),
+    { context: ctx, input: { mode }, workspace: r.root, pluginDir: path.join(SHIPPED, 'local-git') });
+  let out = runPlan(await plan('detach'));
+  assert.strictEqual(out.status, 0, out.stderr);
+  assert.strictEqual(git(r.proj, 'rev-parse', 'HEAD'), git(bcWt, 'rev-parse', 'HEAD'), 'the project is at the worker\'s commit');
+  assert.match(out.stdout, /uncommitted changes; they are not part of this checkout/);
+  git(r.proj, 'switch', '-q', 'main');
+  out = runPlan(await plan('branch'));
+  assert.strictEqual(out.status, 1);
+  assert.match(out.stderr, /bc\/C-8 does not exist yet/);
+});
 
 test('local-git.checkout: clean project → detached at the branch commit; dirty → exit 1 with the reason', async () => {
   const r = repoWithWorktree();
@@ -315,14 +340,20 @@ test('local-git.checkout mode=branch: refused while a worktree holds the branch;
 
 test('local-git.checkout with a hostile branch name fails as git, never as the shell', async () => {
   const r = repoWithWorktree();
+  // detach takes the worktree's HEAD, so the name never reaches git there; branch
+  // mode hands it to git, which refuses it. Neither runs it as shell.
   for (const mode of ['detach', 'branch']) {
     const out = runPlan(await checkoutPlan(r, HOSTILE, mode));
-    assert.notStrictEqual(out.status, 0);
+    if (mode === 'branch') assert.notStrictEqual(out.status, 0);
     for (const d of [r.root, r.proj, r.wt, process.cwd()]) assert.ok(!fs.existsSync(path.join(d, 'PWNED')), mode + ': ' + d);
   }
-  const opt = runPlan(await checkoutPlan(r, '--orphan=x', 'detach'));
+  // Without a worktree the branch name is the target, and one shaped like an option is refused.
+  const ctx = await contextFor({ id: 'C-9', column: 'review', attributes: { repo: 'proj', branch: '--orphan=x' } },
+    [{ name: 'proj', path: r.proj }]);
+  const opt = runPlan(await planRun(commandOf(path.join(SHIPPED, 'local-git'), 'local-git.checkout'),
+    { context: ctx, input: { mode: 'detach' }, workspace: r.root, pluginDir: path.join(SHIPPED, 'local-git') }));
   assert.strictEqual(opt.status, 1);
-  assert.match(opt.stderr, /looks like an option/);
+  assert.match(opt.stderr, /looks like an option|no usable branch/);
 });
 
 // ---------- rfslot prepare ----------

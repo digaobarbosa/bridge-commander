@@ -1,7 +1,7 @@
 {
   "id": "local-git",
   "name": "Local git",
-  "description": "Check a card's branch out in the project folder, so you can run it from your usual checkout. Refuses when the project folder has uncommitted changes.",
+  "description": "Check a card's code out in the project folder, so you can run it from your usual checkout. Refuses when the project folder has uncommitted changes.",
   "version": "1.0.0",
   "contributes": {
     "commands": [
@@ -9,28 +9,53 @@
         "id": "local-git.checkout",
         "title": "Check out in project folder",
         "icon": "⎇",
-        "description": "Switch the project folder to the card's branch. \"detach\" works while the card's worktree holds the branch; \"branch\" needs no worktree to hold it.",
+        "description": "Put the card's code in the project folder. \"detach\" checks out the worker's latest commit (the worktree's HEAD) detached, always possible; \"branch\" switches to the branch itself, only when no worktree holds it.",
         "form": {
           "mode": {
             "title": "How",
-            "description": "detach: the branch's commit, detached (always possible). branch: the branch itself (only when no worktree has it checked out).",
-            "enum": ["detach", "branch"],
+            "description": "detach: the worktree's latest commit, detached. branch: the branch itself (only when it exists and no worktree has it checked out).",
+            "enum": [
+              "detach",
+              "branch"
+            ],
             "default": "detach"
           }
         },
         "tracked": true,
         "run": {
-          "exec": "p=${project.path}; b=${card.branch}; case \"$b\" in -*) echo \"refusing: branch name $b looks like an option\" >&2; exit 1 ;; esac; git -C \"$p\" rev-parse --git-dir >/dev/null 2>&1 || { echo \"$p is not a git checkout\" >&2; exit 1; }; if [ -n \"$(git -C \"$p\" status --porcelain --untracked-files=no)\" ]; then echo \"refusing: $p has uncommitted changes. Commit or stash them there first:\" >&2; git -C \"$p\" status --short --untracked-files=no >&2; exit 1; fi; if [ \"$BC_INPUT_MODE\" = branch ]; then top=$(git -C \"$p\" rev-parse --show-toplevel); holder=$(git -C \"$p\" worktree list --porcelain | awk -v ref=\"refs/heads/$b\" 'substr($0,1,9)==\"worktree \" {w=substr($0,10)} $0==\"branch \" ref {print w}'); if [ \"$holder\" = \"$top\" ]; then echo \"$p is already on $b\"; exit 0; fi; if [ -n \"$holder\" ]; then echo \"refusing: $b is checked out in the worktree $holder, and git lets one branch be checked out in only one place. Use How = detach to get the same commit here, or remove that worktree first.\" >&2; exit 1; fi; git -C \"$p\" switch \"$b\" && echo \"$p is on $b\"; else git -C \"$p\" switch --detach \"$b\" && echo \"$p is at $b ($(git -C \"$p\" rev-parse --short HEAD), detached)\"; fi",
+          "exec": "sh \"$BC_PLUGIN_DIR/checkout.sh\"",
           "timeoutMs": 120000
         }
       }
     ],
     "menus": {
       "card.menu/v1": [
-        { "command": "local-git.checkout", "rank": 420, "when": { "card.branch": { "$exists": true }, "project.path": { "$exists": true } } }
+        {
+          "command": "local-git.checkout",
+          "rank": 420,
+          "when": {
+            "card.branch": {
+              "$exists": true
+            },
+            "project.path": {
+              "$exists": true
+            }
+          }
+        }
       ],
       "detail.actions/v1": [
-        { "command": "local-git.checkout", "rank": 420, "when": { "card.branch": { "$exists": true }, "project.path": { "$exists": true } } }
+        {
+          "command": "local-git.checkout",
+          "rank": 420,
+          "when": {
+            "card.branch": {
+              "$exists": true
+            },
+            "project.path": {
+              "$exists": true
+            }
+          }
+        }
       ]
     }
   }

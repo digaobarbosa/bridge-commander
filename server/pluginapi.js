@@ -262,7 +262,7 @@ function createPluginApi(deps) {
       return sendJson(res, 403, { error: 'command ' + id + ' does not apply to card ' + c.card.id + ' (no menu entry of it matches the card)' });
     }
     const p = pluginEntry(command.plugin);
-    const plan = await planRun(command, { context: c.ctx, input: body.input, config: (p && p.config) || {}, workspace: deps.workspace });
+    const plan = await planRun(command, { context: c.ctx, input: body.input, config: (p && p.config) || {}, workspace: deps.workspace, pluginDir: p && p.dir });
     if (plan.error) {
       const out = { error: plan.error };
       if (plan.field) out.field = plan.field;

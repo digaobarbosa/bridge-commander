@@ -2783,7 +2783,7 @@ pluginHost.bootActivate()
     syncPrWatch();
     broadcast();
     for (const r of await checks.run('boot')) {
-      if (!r.ok) pluginLog('check ' + r.plugin + '/' + r.id + ' (' + r.severity + '): ' + r.title + ' — ' + r.message + (r.fix ? ' (fix: ' + r.fix + ')' : ''));
+      if (!r.ok) pluginLog('check ' + r.plugin + '/' + r.id + ' (' + r.severity + ') failed: "' + r.title + '" — ' + r.message + (r.fix ? ' (fix: ' + r.fix + ')' : ''));
     }
   })
   .catch((e) => {

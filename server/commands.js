@@ -197,6 +197,8 @@ async function planRun(command, args) {
     BC_EVENT: 'command', BC_COMMAND: String(command.id || ''), BC_PLUGIN: String(command.plugin || ''),
     BC_CARD: String(card.id || ''), BC_WORKTREE: String(card.worktree || ''), BC_BRANCH: String(card.branch || ''),
     BC_REPO: String((scope.project && scope.project.path) || ''), BC_WORKSPACE: ws.path,
+    // A plugin's own scripts: "$BC_PLUGIN_DIR/x.sh" beats a shell program inlined in JSON.
+    BC_PLUGIN_DIR: String(a.pluginDir || ''),
   };
   for (const [k, v] of Object.entries(input)) env['BC_INPUT_' + k.toUpperCase()] = String(v);
   if (run.env && typeof run.env === 'object') {
