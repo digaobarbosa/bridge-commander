@@ -1,5 +1,6 @@
 // card detail: attributes header + markdown body + event timeline (chat lives in the chat panel)
-import { S, card, lieutenant, lieutenants, lieutenantColor, cardStatus, cardActivityTs, cardRecency, kindEmoji, render, toggleFilter, filterSelected } from './state.js';
+import { S, card, lieutenants, lieutenantColor, cardActivityTs, cardRecency, kindEmoji, render, toggleFilter, filterSelected } from './state.js';
+import { cardFacts, orderHtml, archiveReasonHtml } from './cardview.js';
 import { esc, hhmm, agoSpanHtml, cardEmoji, cardPrs, prChipHtml, cardArtifacts, artifactsHtml, cardStripHtml, uriBasename, uriDir, setHtmlIfChanged, playbookAttrHtml, classifyFile, attachmentKind } from './util.js';
 import { md, mdEnhance, copyText } from './md.js';
 import { api } from './api.js';
@@ -717,7 +718,8 @@ avOverlay.onclick = (e) => { if (e.target === avOverlay) closeArtifact(); };
 // server refuses owner changes otherwise).
 function openOwnerMenu(cardId, anchor) {
   const c = card(cardId);
-  if (!c) return;
+  // the ✎ may be stale: a worker can bind between the paint and the click
+  if (!c || !cardFacts(c, S.doc).canEditOwner) return;
   const others = lieutenants().filter((l) => l.id !== c.owner);
   openPopover(anchor, [
     { head: 'hand card to' },
@@ -736,9 +738,9 @@ async function patchOrSay(cardId, body) {
 // means the card cannot start.
 async function openPlaybookMenu(cardId, anchor) {
   const c = card(cardId);
-  // Backlog only, the same rule the ✎ is drawn by — a card that moved while the
-  // panel was open must not pick up an editor through a stale button.
-  if (!c || c.column !== 'backlog') return;
+  // the same rule the ✎ is drawn by (cardFacts) — a card that moved while the
+  // panel was open must not pick up an editor through a stale button
+  if (!c || !cardFacts(c, S.doc).canEditPlaybook) return;
   const pop = openPopover(anchor, [{ head: 'playbook' }], { id: 'playbook-menu' });
   let ids = [];
   try { ids = (await api.playbooks()).playbooks || []; }
@@ -759,9 +761,9 @@ async function openPlaybookMenu(cardId, anchor) {
 // this is the detail-side half. Debounced like chat.js maybeMarkRead: keyed by
 // the newest unread-relevant ts so re-renders never spam the endpoint.
 let lastMarked = { id: '', ts: '' };
-function maybeMarkCardRead(c) {
+function maybeMarkCardRead(c, f) {
   if (document.hidden) return;
-  if (!cardStatus(c).unread) return; // server-derived; false once the marker lands
+  if (!f.unread) return; // server-derived; false once the marker lands
   const ts = cardActivityTs(c);
   if (lastMarked.id === c.id && lastMarked.ts === ts) return; // already sent
   lastMarked = { id: c.id, ts };
@@ -803,26 +805,22 @@ export function renderDetail() {
   if (arch) unBtn.onclick = () => unarchive(c.id, unBtn);
   titleEl.title = arch ? '' : 'click to rename'; // rename is live-only (the editor no-ops on frozen ids)
 
+  // every derived fact (worker, owner, order, archive reason, what is editable)
+  // comes from the card view model the board and the table also draw from
+  const f = cardFacts(c, S.doc, Date.now(), arch);
   const emojiEl = document.getElementById('dt-emoji');
-  const emoji = cardEmoji(c);
-  if (emojiEl.textContent !== emoji) emojiEl.textContent = emoji;
+  if (emojiEl.textContent !== f.emoji) emojiEl.textContent = f.emoji;
   if (!editingTitle && titleEl.textContent !== (c.title || c.id)) titleEl.textContent = c.title || c.id; // don't clobber an in-progress rename
   // sub line: id + timestamps, plus a worker-id chip when a worker is attached.
-  // Same whitelist as the tile stripe (board.js) — only known states render, so
-  // no server value ever reaches the class name; the id itself is esc()'d.
-  // Frozen snapshots swap the worker chip for when/why they were archived.
-  const WORKER_STATES = { working: 1, 'needs-you': 1, idle: 1 };
-  const w = cardStatus(c).worker;
-  const worker = !arch && w && w.id && WORKER_STATES[w.state] ? w : null;
-  const rsn = arch && (arch.reason === 'merged' ? 'merged' : 'killed');
+  // workerState is whitelisted in cardview, so no server value reaches the class
+  // name; the id itself is esc()'d. Frozen snapshots carry no worker: they swap
+  // the chip for when/why they were archived.
   setHtmlIfChanged(document.getElementById('dt-sub'),
     esc(c.id + ' · ' + c.type + ' · created ') + agoSpanHtml(c.created) + esc(' ago') +
     (arch
-      ? esc(' · archived ') + agoSpanHtml(arch.ts) + esc(' ago') +
-        '<span class="tv-rsn tv-rsn-' + rsn + '"' + (arch.note ? ' title="' + esc(arch.note) + '"' : '') + '>' +
-        (rsn === 'merged' ? '🏁 merged' : '🪦 killed') + '</span>'
+      ? esc(' · archived ') + agoSpanHtml(arch.ts) + esc(' ago') + archiveReasonHtml(f)
       : esc(' · updated ') + agoSpanHtml(cardRecency(c)) + esc(' ago')) +
-    (worker ? '<span class="dt-worker dt-worker-' + worker.state + '" title="worker: ' + esc(worker.state) + '">' + esc(worker.id) + '</span>' : ''));
+    (f.workerId ? '<span class="dt-worker dt-worker-' + f.workerState + '" title="worker: ' + esc(f.workerState) + '">' + esc(f.workerId) + '</span>' : ''));
 
   // the collapsed line: what he needs before he needs anything else
   setHtmlIfChanged(stripEl, cardStripHtml(c, kindEmoji));
@@ -837,19 +835,18 @@ export function renderDetail() {
   // c, so a same-looking attrs row on another card must not skip the rebuild
   const attrsChanged = setHtmlIfChanged(attrsEl,
     '<span class="attr attr-owner" data-card="' + esc(c.id) + '" title="click: filter by lieutenant · alt-click: exclude"><span class="k">lieutenant</span>' +
-    '<span class="v" style="color:' + esc(lieutenantColor(c.owner)) + '">' + esc((lieutenant(c.owner) || {}).name || c.owner) + '</span>' +
-    // ✎ only while no worker is bound — mirrors the server guard on owner PATCH.
+    '<span class="v" style="color:' + esc(lieutenantColor(c.owner)) + '">' + esc(f.ownerName) + '</span>' +
+    // ✎ only while no worker is bound — the server's guard on owner PATCH.
     // Rendered in the markup (not appended after) so a worker binding/unbinding
     // changes the innerHTML signature and setHtmlIfChanged rebuilds the row.
     // Frozen snapshots never offer it: nothing about them is editable.
-    (worker || arch ? '' : '<button type="button" class="owner-edit" title="change owner (only while no worker is bound)">✎</button>') +
+    (f.canEditOwner ? '<button type="button" class="owner-edit" title="change owner (only while no worker is bound)">✎</button>' : '') +
     '</span>' +
     // playbook: which one card.start renders. Shown always, editable only in
-    // Backlog — see playbookAttrHtml. The column is in the innerHTML signature
-    // through the chip's own markup, so the ✎ appears and disappears with the
-    // move without a special case here.
-    playbookAttrHtml(c, !arch && c.column === 'backlog') +
-    (c.pendingOrder ? '<span class="attr"><span class="k">pending</span><span class="v">⏳ ' + esc(c.pendingOrder.kind) + '</span></span>' : '') +
+    // Backlog (cardFacts.canEditPlaybook). The ✎ is in the chip's own markup, so
+    // it appears and disappears with the move without a special case here.
+    playbookAttrHtml(c, f.canEditPlaybook) +
+    orderHtml(f, 'attr') +
     Object.entries(at)
       .filter(([k]) => k !== 'emoji' && k !== 'prs' && k !== 'artifacts')
       .map(([k, v]) => attrHtml(k, v)).join('') +
@@ -957,5 +954,5 @@ export function renderDetail() {
     '<div class="sub">' + esc(e.actor || '') + ' · ' + hhmm(e.ts) + ' · ' + agoSpanHtml(e.ts) + ' ago</div>' +
     '</div></div>').join('') || '<div class="ev"><div class="bd"><div class="sub">no events yet</div></div></div>');
 
-  if (!arch) maybeMarkCardRead(c); // frozen snapshots have no read state to advance
+  if (!arch) maybeMarkCardRead(c, f); // frozen snapshots have no read state to advance
 }

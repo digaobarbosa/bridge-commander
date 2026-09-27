@@ -3,8 +3,9 @@
 // text input plus the filter popup (filterpop.js). Clicking a label or an
 // owner in a row toggles it as a popup chip. Archived cards live in their own
 // 🧊 mode (archtable.js) — they never mix in here.
-import { S, cards, columns, lieutenant, lieutenantColor, cardVisible, cardStatus, cardRecency, targetOwedState, workerFor, render, toggleFilter, filterSelected } from './state.js';
-import { esc, agoSpanHtml, cardEmoji, cardPrs, prChipHtml, ctxBarHtml, setHtmlIfChanged } from './util.js';
+import { S, cards, columns, columnTitle, lieutenantName, lieutenantColor, cardVisible, cardRecency, render, toggleFilter, filterSelected } from './state.js';
+import { esc, agoSpanHtml, cardPrs, prChipHtml, ctxBarHtml, setHtmlIfChanged } from './util.js';
+import { cardFacts, cornerHtml, orderHtml } from './cardview.js';
 import { labelChipHtml } from './labels.js';
 import { openDetail } from './detail.js';
 import { openMoveMenu } from './board.js';
@@ -29,8 +30,11 @@ const COLS = [
 ];
 
 // ---------- rows ----------
+// a row carries its card's facts (cardview.js): the same model the tile draws
+// from, so the corner ⚠/⏳/dots and the order mark cannot drift from the board
 function rows() {
-  return cards().filter(cardVisible).map((c) => ({ c })).sort(cmp);
+  const now = Date.now();
+  return cards().filter(cardVisible).map((c) => ({ c, f: cardFacts(c, S.doc, now) })).sort(cmp);
 }
 const colIndex = (id) => columns().findIndex((k) => k.id === id);
 function sortVal(row, key) {
@@ -39,8 +43,8 @@ function sortVal(row, key) {
     case 'title': return String(c.title || c.id).toLowerCase();
     case 'status': return colIndex(c.column);
     case 'type': return c.type || '';
-    case 'owner': return (lieutenant(c.owner) || {}).name || c.owner || '';
-    case 'msgs': return (c.thread || []).length;
+    case 'owner': return lieutenantName(c.owner) || '';
+    case 'msgs': return row.f.messageCount;
     case 'activity': return cardRecency(c);
     case 'created': return c.created || '';
     default: return '';
@@ -76,35 +80,26 @@ function headHtml(list) {
   }).join('') + '</tr>';
 }
 function statusCellHtml(row) {
-  const c = row.c;
-  const col = columns().find((k) => k.id === c.column);
-  const order = c.pendingOrder ? ' <span class="t-order" title="' + esc(c.pendingOrder.kind) + ' pending">⏳</span>' : '';
-  return esc(col ? col.title : c.column) + order;
+  return esc(columnTitle(row.c.column)) + orderHtml(row.f, 'mark');
 }
 function titleCellHtml(row) {
   const c = row.c;
-  const owed = targetOwedState('card:' + c.id);
-  const st = cardStatus(c);
-  const ind = owed
-    ? '<span class="t-typing" title="the lieutenant owes you a reply"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></span>'
-    : st.unread ? '<span class="t-unread" title="unread activity"></span>' : '';
-  return '<span class="tv-emoji">' + esc(cardEmoji(c)) + '</span>' +
-    '<span class="tv-title">' + esc(c.title || c.id) + '</span>' + ind;
+  return '<span class="tv-emoji">' + esc(row.f.emoji) + '</span>' +
+    '<span class="tv-title">' + esc(c.title || c.id) + '</span>' + cornerHtml(row.f);
 }
 function rowHtml(row) {
-  const c = row.c;
-  const l = lieutenant(c.owner);
-  const wst = c.column === 'working' ? ctxBarHtml((workerFor(c.id) || {}).agentStatus) : '';
+  const c = row.c, f = row.f;
+  const wst = f.inWorking ? ctxBarHtml(f.agentStatus) : '';
   return '<tr data-id="' + esc(c.id) + '"' + (selectionOn() && isSelected(c.id) ? ' class="sel"' : '') + '>' +
     selCellHtml(c) +
     '<td class="c-title">' + titleCellHtml(row) + '</td>' +
     '<td class="c-status">' + statusCellHtml(row) + '</td>' +
     '<td class="c-type hide-m">' + esc(c.type || '') + '</td>' +
     '<td class="c-owner' + (filterSelected('owner', c.owner) ? ' active' : '') + '" data-owner="' + esc(c.owner) + '" title="click: filter by lieutenant · alt-click: exclude">' +
-    '<span class="dot" style="background:' + esc(lieutenantColor(c.owner)) + '"></span>' + esc((l && l.name) || c.owner) + '</td>' +
+    '<span class="dot" style="background:' + esc(lieutenantColor(c.owner)) + '"></span>' + esc(f.ownerName) + '</td>' +
     '<td class="c-labels hide-m">' + (c.labels || []).map((n) => labelChipHtml(n, filterSelected('label', n))).join('') + '</td>' +
     '<td class="c-prs">' + cardPrs(c).map((pr) => prChipHtml(pr)).join('') + '</td>' +
-    '<td class="c-msgs">' + ((c.thread || []).length || '') + '</td>' +
+    '<td class="c-msgs">' + (f.messageCount || '') + '</td>' +
     '<td class="c-act">' + agoSpanHtml(cardRecency(c), 'tv-ago') + wst + '</td>' +
     '<td class="c-created hide-m">' + agoSpanHtml(c.created, 'tv-ago') + '</td>' +
     '</tr>';
