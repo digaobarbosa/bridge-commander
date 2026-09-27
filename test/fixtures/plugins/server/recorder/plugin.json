@@ -1,0 +1,34 @@
+{
+  "id": "recorder",
+  "name": "Recorder",
+  "description": "Test fixture: records every lifecycle event, decorates labelled cards, and ships one command of each kind.",
+  "version": "0.0.1",
+  "activation": "boot",
+  "server": "server.js",
+  "ui": "ui.js",
+  "config": { "greeting": { "type": "string", "default": "hello" } },
+  "contributes": {
+    "commands": [
+      { "id": "recorder.greet", "title": "Greet", "icon": "👋", "run": "server", "prepare": "server",
+        "form": { "name": { "type": "string", "required": true } } },
+      { "id": "recorder.echo", "title": "Echo", "tracked": true,
+        "form": { "word": { "type": "string", "default": "x" } },
+        "run": { "exec": "echo card ${card.id}; echo word $BC_INPUT_WORD" } },
+      { "id": "recorder.fail", "title": "Fail", "tracked": true, "run": { "exec": "echo about to fail; exit 3" } },
+      { "id": "recorder.slow", "title": "Slow", "tracked": true, "run": { "exec": "echo started; sleep 30" } },
+      { "id": "recorder.quick", "title": "Quick", "run": { "exec": "echo quick" } },
+      { "id": "recorder.link", "title": "Link", "run": { "open": "https://example.com/c/${card.id}?t=${card.title}" } }
+    ],
+    "menus": {
+      "card.menu/v1": [
+        { "command": "recorder.greet", "when": { "card.column": "backlog" } },
+        { "command": "recorder.link" }
+      ],
+      "detail.actions/v1": [{ "command": "recorder.fail", "when": { "card.labels": "failable" } }]
+    },
+    "checks": [
+      { "id": "fine", "phase": "boot", "exec": "echo all fine", "title": "always fine" },
+      { "id": "nope", "phase": "init", "bin": "bc-definitely-not-a-binary", "title": "a binary nobody has", "severity": "warn", "hint": "install nothing" }
+    ]
+  }
+}

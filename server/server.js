@@ -71,7 +71,7 @@ const port = require(path.join(__dirname, '..', 'harness', 'port.js'));
 const { isHarnessRef, keyOf, isSpawnableSession } = port;
 const { createWorktree, releaseWorktree, worktreeToolFor } = require(path.join(__dirname, 'worktrees.js'));
 const { createWorkers } = require(path.join(__dirname, 'workers.js'));
-const { runHooks, runTeardown, listAllHooks, runNamedHook, runningHook, readRuns, lastRuns, hookKey,
+const { runHooks, runTeardown, runOne: hookRunOne, listAllHooks, runNamedHook, runningHook, readRuns, lastRuns, hookKey,
   hooksDir, namedHookFile,
   TEARDOWN_TIMEOUT_MS: TEARDOWN_DEFAULT_MS, HOOK_NAME_RE } = require(path.join(__dirname, 'hooks.js'));
 const { parseWhen, normalizeSchedules,
@@ -89,6 +89,11 @@ const { createFileGate } = require(path.join(__dirname, 'filegate.js'));
 const { createClock } = require(path.join(__dirname, 'clock.js'));
 const { createWatchers } = require(path.join(__dirname, 'watchers.js'));
 const { createPrWatch } = require(path.join(__dirname, 'prwatch.js'));
+const manifests = require(path.join(__dirname, 'manifests.js'));
+const { createPluginHost } = require(path.join(__dirname, 'plugins.js'));
+const { createRuns } = require(path.join(__dirname, 'runs.js'));
+const { createChecks } = require(path.join(__dirname, 'checks.js'));
+const { createPluginApi } = require(path.join(__dirname, 'pluginapi.js'));
 const { createConversation, parseTarget, CAPTAIN } = require(path.join(__dirname, 'conversation.js'));
 const { permissionModes, permissionMode, summarize, createPermissions } = require(path.join(__dirname, 'permissions.js'));
 const { readJsonl, sealJsonl } = require(path.join(__dirname, 'jsonl.js'));
@@ -283,17 +288,24 @@ function getHarness(name) { return port.getHarness(name, HARNESS_ENV); }
 // The harnesses plugins contribute as profiles (plugins/*/plugin.json and the
 // workspace's own), registered once, before anything asks for one by name.
 // A bad profile is logged and skipped; it never stops the boot.
-{
-  const manifests = require(path.join(__dirname, 'manifests.js'));
+const PLUGINS_DIR = path.join(STATE_DIR, 'plugins');
+// Which profiles a catalog enables, as one comparable string: an overlay change
+// that moves it needs a restart (profiles register once, here).
+function profilesKey(catalog) {
+  return manifests.contributions(catalog).profiles.map((p) => p.plugin + '/' + p.name).sort().join(',');
+}
+const BOOT_PROFILES = (() => {
   const log = (m) => console.error(now() + ' ' + m);
-  const catalog = manifests.resolveCatalog({ workspaceDir: path.join(STATE_DIR, 'plugins'), stateDir: STATE_DIR, log });
+  const catalog = manifests.resolveCatalog({ workspaceDir: PLUGINS_DIR, stateDir: STATE_DIR, log });
+  const profiles = manifests.contributions(catalog).profiles;
   require(path.join(__dirname, '..', 'harness', 'profiles.js')).loadProfiles({
-    profiles: manifests.contributions(catalog).profiles,
+    profiles,
     stateDir: STATE_DIR, // where secrets.env lives
     harnessStateDir: HARNESS_STATE_DIR,
     log,
   });
-}
+  return profilesKey(catalog);
+})();
 
 // The commit this process is RUNNING, decided once here at boot and never
 // re-read: a merge into the checkout below moves the files, not this record,
@@ -519,6 +531,9 @@ const BUILTIN_KINDS = {
   'worker-send': { emoji: '📨', level: 2 },
   'pr-merged': { emoji: '🟣', level: 2 },
   permission: { emoji: '🔐', level: 2 },
+  // A tracked plugin command (an activity) that failed or timed out. Level 1,
+  // like hook-failed: somebody asked for it and it did not happen.
+  'activity-failed': { emoji: '🧯', level: 1 },
 };
 function validKindEntry(v) {
   return !!(v && typeof v === 'object' && typeof v.emoji === 'string' && v.emoji.trim() &&
@@ -1116,9 +1131,19 @@ function cardActivity(card) {
 }
 // Serialization view: cards go out with the derived `status` and `activity`
 // attached; the stored board keeps only the raw lease.
+// `ext` is what the running plugins' decorators say about the card, cached by
+// the host per card.updated — absent when no plugin has anything to say.
 function publicCard(card, user) {
-  return Object.assign({}, card, { status: cardStatus(card, user), activity: cardActivity(card) });
+  const out = Object.assign({}, card, { status: cardStatus(card, user), activity: cardActivity(card) });
+  const ext = pluginHost ? pluginHost.decorations(card, board) : null;
+  if (ext && Object.keys(ext).length) out.ext = ext;
+  return out;
 }
+// Assigned once the plugin host exists (further down); a board served before
+// that simply carries no plugin data.
+let pluginHost = null;
+let runs = null;
+let pluginsVersion = 0;
 // The served board carries the EFFECTIVE kinds map (built-ins merged under the
 // registered entries); the stored board keeps only the registered map.
 // `boot` identifies this server instance: a client seeing it change knows the
@@ -1138,6 +1163,10 @@ function publicBoard(user) {
     // Held permission asks — in memory only, never in board.json (storedBoard
     // never sees them): a restart drops the held requests they stand for.
     permissions: permissions.list(),
+    // Tracked plugin command runs, running first; the log is fetched on demand.
+    activities: runs ? runs.list({ limit: 30 }) : [],
+    // Bumped by every plugin reload: a client refetches /api/plugins on a change.
+    pluginsVersion,
     // chatOwed/chatQueued mirror status.owed/owedState:'queued' for a
     // lieutenant's MAIN chat — both queue-derived, same rules as cards.
     lieutenants: board.lieutenants.map((l) => Object.assign({}, withStatusAge(l), {
@@ -2343,6 +2372,9 @@ function hookContext(card, w) {
 // call site knows it is leaving: opts.boardLevel) the events land on the
 // board-level stream with a card reference instead of being dropped.
 async function fireHooks(event, card, w, opts) {
+  // The plugins hear the same lifecycle the hooks do, and like the hooks they
+  // only observe: emit never waits on a handler and never fails the event.
+  emitPlugins(event, { card, worker: w ? { card: w.card, ref: w.ref, outcome: w.outcome || null } : null });
   try {
     const results = await runHooks(event, hookContext(card, w),
       HOOK_TIMEOUT_MS ? { timeoutMs: HOOK_TIMEOUT_MS } : undefined);
@@ -2651,7 +2683,113 @@ const prWatch = createPrWatch({
   archiveCard,
   commit: store.commit,
 });
-watchers.register({ id: 'prwatch', intervalMs: PRWATCH_MS, tick: prWatch.tick });
+// The PR watch belongs to the shipped `github` plugin (the internal tier hands
+// it prWatch.tick): disabling that plugin is how a board turns the watch off.
+// A board with no github plugin at all still watches — see syncPrWatch below.
+
+// ---------- plugins (server/plugins.js; docs/rfc/plugins.md) ----------
+const pluginLog = (m) => console.error(now() + ' ' + m);
+// A plugin reaches the board only through this, and reads it as a copy.
+const pluginApi = {
+  board: () => structuredClone(storedBoard(board)),
+  findCard: (id) => { const c = findCard(String(id || '')); return c ? structuredClone(c) : null; },
+  queuePush: (owner, item) => {
+    if (!findLieutenant(owner)) throw new Error('queuePush: unknown lieutenant ' + owner);
+    return queuePush(owner, item);
+  },
+  cardEvent: (card, text, kind) => {
+    const ev = landCardEvent(card, mkEvent({ text: String(text || '').slice(0, 4000), actor: 'server' }, kind ? { kind: String(kind) } : {}));
+    store.commit();
+    return ev;
+  },
+  get runs() { return runs; },
+  commit: store.commit,
+};
+pluginHost = createPluginHost({
+  catalog: () => manifests.resolveCatalog({ workspaceDir: PLUGINS_DIR, stateDir: STATE_DIR, log: pluginLog }),
+  log: pluginLog, now, api: pluginApi, watchers,
+  internal: { prWatch, prWatchIntervalMs: PRWATCH_MS },
+});
+// Observe-only: nothing awaits a handler, and a throwing one is the host's to log.
+function emitPlugins(name, payload) {
+  if (!pluginHost) return;
+  try { pluginHost.emit(name, payload).catch(() => {}); } catch (e) { pluginLog('plugin event ' + name + ' failed: ' + String((e && e.message) || e)); }
+}
+
+// A tracked run that fails is owed to the card's owner, the way a failed hook is.
+const trackedRuns = new Set();
+runs = createRuns({ stateDir: STATE_DIR, now, log: pluginLog, onChange: broadcast, runOne: hookRunOne });
+runs.onEnd((run) => {
+  const tracked = trackedRuns.delete(run.id);
+  emitPlugins('activity-ended', { activity: run });
+  if (!tracked || !run.card || (run.status !== 'failed' && run.status !== 'timeout')) return;
+  const card = findCard(run.card) || { id: run.card, title: run.card, owner: run.owner };
+  let tail = '';
+  try { tail = runs.readLog(run.id).text.trim().slice(-1500); } catch (e) {}
+  const text = (run.title || run.command) + ' ' + run.status + (run.error ? ' (' + run.error + ')' : '')
+    + ' — activity ' + run.id + (tail ? ':\n' + tail : '');
+  landCardEvent(card, mkEvent({ text, actor: 'server', level: 1 }, { kind: 'activity-failed' }));
+  const owner = card.owner || run.owner;
+  if (owner && findLieutenant(owner)) queuePush(owner, { kind: 'activity-failed', card: run.card, activity: run.id, text: text.slice(0, 2000) });
+  store.commit();
+});
+
+// Checks: what the enabled plugins declare, re-registered on every reload.
+const checks = createChecks({ log: pluginLog });
+let checkDisposers = [];
+function registerChecks() {
+  for (const d of checkDisposers) d();
+  checkDisposers = [];
+  const cat = pluginHost.catalog();
+  if (!cat) return;
+  for (const c of manifests.contributions(cat).checks) {
+    const p = cat.plugins.find((x) => x.id === c.plugin);
+    try { checkDisposers.push(checks.register(checks.fromManifest(c, { plugin: c.plugin, dir: p && p.dir }))); }
+    catch (e) { pluginLog('check ' + c.plugin + '/' + c.id + ' not registered: ' + String((e && e.message) || e)); }
+  }
+}
+
+// The PR watch's fallback: a board whose github plugin is missing (or failed
+// to register the watch) keeps the watch it always had. Only an overlay that
+// says `github: {enabled: false}` turns it off — that is the captain's word.
+let prWatchFallback = null;
+function syncPrWatch() {
+  const cat = pluginHost.catalog();
+  const o = cat && cat.overlay.plugins && cat.overlay.plugins.github;
+  const off = !!(o && typeof o === 'object' && o.enabled === false);
+  const pluginOwns = watchers.list().some((w) => w.id !== 'prwatch' && w.id.endsWith('/prwatch'));
+  if (prWatchFallback && (off || pluginOwns)) { prWatchFallback(); prWatchFallback = null; }
+  if (!prWatchFallback && !off && !pluginOwns) {
+    prWatchFallback = watchers.register({ id: 'prwatch', intervalMs: PRWATCH_MS, tick: prWatch.tick });
+    pluginLog('no plugin registered the PR watch — the server runs it itself');
+  }
+}
+
+// After every catalog change: the checks, the watch, and the version clients poll.
+async function reloadPlugins() {
+  await pluginHost.reload();
+  pluginsVersion++;
+  registerChecks();
+  syncPrWatch();
+  broadcast();
+}
+
+
+// Boot: the boot plugins start, the boot checks run (a failure is one log
+// line, never a failed boot), and the PR watch is settled either way.
+pluginHost.bootActivate()
+  .then(async () => {
+    registerChecks();
+    syncPrWatch();
+    broadcast();
+    for (const r of await checks.run('boot')) {
+      if (!r.ok) pluginLog('check ' + r.plugin + '/' + r.id + ' (' + r.severity + '): ' + r.title + ' — ' + r.message + (r.fix ? ' (fix: ' + r.fix + ')' : ''));
+    }
+  })
+  .catch((e) => {
+    pluginLog('plugin boot failed: ' + String((e && e.message) || e));
+    syncPrWatch();
+  });
 
 // ---------- the clock (schedules; server/clock.js runs them) ----------
 // A schedule fires a NAMED hook through `hook run`, and a failed firing lands
@@ -2771,6 +2909,20 @@ const files = createFileGate({
   maxBytes: ARTIFACT_MAX_BYTES,
 });
 
+// The plugin routes (server/pluginapi.js): catalog, overlay, commands,
+// activities, checks, a plugin's own routes and its browser module.
+const pluginRoutes = createPluginApi({
+  host: pluginHost, runs, checks, stateDir: STATE_DIR, workspace: WORKSPACE,
+  board: () => board, findCard, publicCard: (c) => publicCard(c, 'user'),
+  listHarnesses: () => port.listHarnesses(),
+  pluginsVersion: () => pluginsVersion,
+  reload: reloadPlugins,
+  profilesKey: () => profilesKey(manifests.resolveCatalog({ workspaceDir: PLUGINS_DIR, stateDir: STATE_DIR })),
+  profilesAtBoot: BOOT_PROFILES,
+  onRunStarted: (run, tracked) => { if (tracked) trackedRuns.add(run.id); },
+  sendJson, readBody, sseFrame, SSE_HEADERS, mime: MIME, log: pluginLog,
+});
+
 // ---------- server ----------
 
 const server = http.createServer(async (req, res) => {
@@ -2785,6 +2937,8 @@ const server = http.createServer(async (req, res) => {
     // ----- reads -----
     if (route === 'GET /api/board') return sendJson(res, 200, publicBoard(url.searchParams.get('user') || 'user'));
     if (route === 'GET /api/config') return sendJson(res, 200, userConfig());
+    // ----- plugins: catalog, overlay, commands, activities, checks, /api/x, /plugins -----
+    if (await pluginRoutes.handle(req, res, url)) return;
     // ----- the TTS and STT engines, on the board's own origin -----
     // Any method, any path under the prefix, streamed both ways (the STT
     // websocket half is on 'upgrade').
@@ -3075,6 +3229,7 @@ const server = http.createServer(async (req, res) => {
     if (route === 'POST /api/cards') {
       const body = JSON.parse(await readBody(req) || '{}');
       const r = store.mutate(() => createCard(body));
+      if (!r.error) emitPlugins('card-created', { card: r.card });
       return respond(res, r, () => ({ ok: true, card: publicCard(r.card, 'user') }));
     }
     // restore targets a card that is NOT on the board, so it routes before the
@@ -3092,7 +3247,12 @@ const server = http.createServer(async (req, res) => {
       const sub = cardRoute[3];
       if (sub === 'start' && req.method === 'POST') { // card.start — the ONE atomic op into Working
         const body = JSON.parse(await readBody(req) || '{}');
+        const from = card.column;
         const r = await store.mutate(() => workers.start(card, body));
+        if (!r.error) {
+          if (from !== card.column) emitPlugins('card-moved', { card, from, to: card.column });
+          emitPlugins('worker-started', { card, worker: r.worker || null, resumed: !!r.resumed });
+        }
         return respond(res, r, () => ({ ok: true, card: publicCard(card, 'user'), worker: r.worker, resumed: !!r.resumed }));
       }
       if (sub === 'worker/signal' && req.method === 'POST') {
@@ -3107,13 +3267,17 @@ const server = http.createServer(async (req, res) => {
       }
       if (sub === 'worker/pause' && req.method === 'POST') {
         const body = JSON.parse(await readBody(req) || '{}');
+        const from = card.column;
         const r = await store.mutate(() => workers.pause(card, body));
+        if (!r.error && from !== card.column) emitPlugins('card-moved', { card, from, to: card.column });
         return respond(res, r, () => ({ ok: true, event: r.event, session: r.session,
           parked: r.parked, parkError: r.parkError, card: publicCard(card, 'user') }));
       }
       if (sub === 'park' && req.method === 'POST') {
         const body = JSON.parse(await readBody(req) || '{}');
+        const from = card.column;
         const r = await store.mutate(() => workers.park(card, body));
+        if (!r.error && from !== card.column) emitPlugins('card-moved', { card, from, to: card.column });
         return respond(res, r, () => ({ ok: true, event: r.event, card: publicCard(card, 'user') }));
       }
       if (sub === 'worker/done' && req.method === 'POST') {
@@ -3144,7 +3308,9 @@ const server = http.createServer(async (req, res) => {
       if (sub === 'move' && req.method === 'POST') {
         const wasWorking = card.column === 'working';
         const body = JSON.parse(await readBody(req) || '{}');
+        const from = card.column;
         const r = store.mutate(() => moveCard(card, body));
+        if (!r.error && from !== card.column) emitPlugins('card-moved', { card, from, to: card.column });
         // The handoff IS the end of the worker (workers.end: kill, then release,
         // with its exceptions). NOT awaited: the release queues behind the clone
         // lock and a teardown, and lands on the timeline when it lands.

@@ -1,6 +1,6 @@
 # RFC: a plugin system where the built-ins are plugins too
 
-Status: **proposed**. Base: `kiss/all` (`1a4e73b`). Nothing here is implemented.
+Status: **partly implemented**. Base: `kiss/all` (`1a4e73b`). Built: agent profiles (Slice 1), the plugin host, tracked runs, commands, watchers, checks and the ACP adapter (wave A), and the server wiring — HTTP routes, board payload, lifecycle events, the `bc-axi` plugin verbs (wave B1). The spec for what shipped is [docs/api/overview.md](../api/overview.md) § plugin; the exact shapes are in [plugins-contracts.md](plugins-contracts.md). The UI slots and the view registry are still proposals.
 
 ## Why
 
