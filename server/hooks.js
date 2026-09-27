@@ -61,13 +61,14 @@
 //
 // A playbook's `teardown` command (runTeardown) is the same kind of thing one
 // layer over: a user-owned command the board runs on a lifecycle moment, best
-// effort, reported not thrown. It shares this module's runner, its env and its
-// kill-the-whole-tree timeout — it differs only in being a shell command string
+// effort, reported not thrown. It shares this module's runner, its env, its
+// trace (hook `teardown`, trigger `teardown`) and its kill-the-whole-tree timeout — it differs only in being a shell command string
 // declared per playbook rather than a file the workspace drops in a directory.
 
 const fs = require('node:fs');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
+const { StringDecoder } = require('node:string_decoder');
 const { STATE_DIR_NAME, ID_RE } = require(path.join(__dirname, 'layout.js'));
 
 const HOOKS_DIRNAME = 'hooks'; // under <workspace>/.bridge-commander/
@@ -120,15 +121,27 @@ function listHooks(workspace, event) {
   return out;
 }
 
-// Run one command -> result (never rejects).
-//   { hook, ok, code, signal, timedOut, error?, output, truncated, ms, startedAt }
-// `hook` is the label the caller reports it by (a hook's filename, a teardown's
-// command line). ok ⇔ exited 0 within the timeout. A spawn/interpreter failure
-// ('error' event: broken shebang, EACCES...) is ok:false with `error` set.
-// opts.tail keeps the LAST OUTPUT_CAP bytes instead of the first — what a
-// caller wants when the interesting part is where the command gave up.
-// opts.onSpawn(kill) hands the caller a way to end the run early — the whole
-// process group, exactly as the timeout does. What `restart` is built on.
+// runOne(label, cmd, args, env, cwd, timeoutMs, opts?) -> Promise<result>, never
+// rejects. The one runner every user-owned command goes through: hooks, a
+// playbook's teardown, a plugin command's run (server/runs.js).
+//   label      what the result reports itself as (`hook`): a hook's filename,
+//              a teardown's command line
+//   cmd, args  spawned DIRECTLY, no shell. A shell is the caller's choice:
+//              '/bin/sh', ['-c', line]
+//   env, cwd   handed to spawn as they are
+//   timeoutMs  then SIGKILL to the whole process group (timedOut: true)
+//   opts.tail          keep the LAST OUTPUT_CAP bytes instead of the first —
+//                      what a caller wants when the interesting part is where
+//                      the command gave up
+//   opts.onSpawn(kill) a way to end the run early — the whole process group,
+//                      exactly as the timeout does. `restart` and a tracked
+//                      run's cancel are built on it
+//   opts.onOutput(chunk: string)  every stdout/stderr chunk as it arrives,
+//                      UNCAPPED: `output` keeps OUTPUT_CAP bytes, a caller that
+//                      wants the whole log streams it from here
+// result = { hook, ok, code, signal, timedOut, error?, output, truncated, ms, startedAt }
+// ok ⇔ exited 0 within the timeout. A spawn/interpreter failure ('error' event:
+// broken shebang, EACCES, a missing cwd...) is ok:false with `error` set.
 function runOne(hook, cmd, args, env, cwd, timeoutMs, opts) {
   const tail = !!(opts && opts.tail);
   const startedAt = Date.now();
@@ -160,8 +173,21 @@ function runOne(hook, cmd, args, env, cwd, timeoutMs, opts) {
         truncated = true;
       }
     };
-    child.stdout.on('data', collect);
-    child.stderr.on('data', collect);
+    const onOutput = opts && typeof opts.onOutput === 'function' ? opts.onOutput : null;
+    // One decoder per stream: a multi-byte character split across two chunks
+    // reaches the streaming caller whole, not as two replacement marks.
+    const collector = () => {
+      const dec = onOutput ? new StringDecoder('utf8') : null;
+      return (chunk) => {
+        if (dec) {
+          const s = dec.write(chunk);
+          if (s) { try { onOutput(s); } catch (e) { /* a listener's bug is not the run's */ } }
+        }
+        collect(chunk);
+      };
+    };
+    child.stdout.on('data', collector());
+    child.stderr.on('data', collector());
     const killTree = () => {
       try { process.kill(-child.pid, 'SIGKILL'); } // the whole group
       catch (e) { try { child.kill('SIGKILL'); } catch (e2) {} }
@@ -565,11 +591,18 @@ function runTeardown(command, ctx, opts) {
   const cwd = (ctx && ctx.worktree) || (ctx && ctx.workspace);
   if (!cwd) throw new Error('runTeardown: ctx.worktree or ctx.workspace required');
   const timeoutMs = (opts && opts.timeoutMs > 0) ? opts.timeoutMs : TEARDOWN_TIMEOUT_MS;
-  return runOne(cmd, '/bin/sh', ['-c', cmd], bcEnv('teardown', ctx), cwd, timeoutMs, { tail: true });
+  // Traced like every other run: no run is invisible. The trace names it
+  // `teardown`, because the command line is the playbook's and `hook runs`
+  // groups by name. The caller still gets the runner's own result.
+  return runOne(cmd, '/bin/sh', ['-c', cmd], bcEnv('teardown', ctx), cwd, timeoutMs, { tail: true })
+    .then((r) => {
+      if (ctx && ctx.workspace) traceRun(ctx.workspace, 'teardown', ctx.card, Object.assign({}, r, { hook: 'teardown' }));
+      return r;
+    });
 }
 
 module.exports = {
-  runHooks, runTeardown, listHooks, listAllHooks, namedHookFile, runNamedHook, runningHook,
+  runOne, runHooks, runTeardown, listHooks, listAllHooks, namedHookFile, runNamedHook, runningHook,
   cancelNamedHook, traceSkip, seedHooks, PACKAGED_HOOKS_DIR,
   readRuns, lastRuns, lastRunsFor, hookKey, hooksDir, runsFile, HOOK_NAME_RE: NAME_RE, LIFECYCLE_EVENTS,
   DEFAULT_TIMEOUT_MS, TEARDOWN_TIMEOUT_MS,

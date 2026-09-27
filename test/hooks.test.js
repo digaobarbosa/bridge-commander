@@ -395,6 +395,30 @@ test('runTeardown: output keeps the TAIL — where a teardown gives up is the en
   } finally { fs.rmSync(ws, { recursive: true, force: true }); }
 });
 
+test('runTeardown is traced like every run: hook teardown, trigger teardown, the card', async () => {
+  const ws = scratchWs();
+  try {
+    fs.mkdirSync(path.join(ws, '.bridge-commander'));
+    const r = await runTeardown('echo stopping; exit 3', { workspace: ws, card: 'c7' });
+    assert.strictEqual(r.hook, 'echo stopping; exit 3', 'the caller still gets the runner result');
+    const [rec] = lines(ws);
+    assert.deepStrictEqual([rec.hook, rec.trigger, rec.card, rec.ok, rec.code, rec.output],
+      ['teardown', 'teardown', 'c7', false, 3, 'stopping']);
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+test('runOne streams every chunk through opts.onOutput, past the result cap', async () => {
+  const { runOne } = require('../server/hooks.js');
+  const chunks = [];
+  const r = await runOne('big', '/bin/sh', ['-c', 'i=0; while [ $i -lt 1000 ]; do echo 0123456789; i=$((i+1)); done; echo é >&2'],
+    process.env, os.tmpdir(), 10000, { onOutput: (c) => chunks.push(c) });
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.truncated, true, 'the result keeps its 4 KB cap');
+  const all = chunks.join('');
+  assert.strictEqual(all.split('\n').filter((l) => l === '0123456789').length, 1000, 'the stream is whole');
+  assert.match(all, /é/, 'utf8 decoded');
+});
+
 // ================= integration: through a real server =================
 
 function bootWithProject(env = {}) {

@@ -385,3 +385,105 @@ test('/reset does not race supervision: the restart it performs is not a death',
       'the reset session is alive, so unguarded ticks stay quiet too');
   } finally { await s.stop(); }
 });
+
+// ================= server/commands.js: plugin command templates and plans =================
+// Pure: a plugin command + a card context -> a shell line, a URL, or "ask the
+// plugin". The one rule under test: card or user text never becomes shell
+// syntax — it arrives as one quoted word, or the template is refused.
+const cmds = require('../server/commands.js');
+
+const EVIL = ["'; rm -rf /; '", '$(touch PWNED)', '`touch PWNED`', 'a"b\\c', "it's\nnewline; touch PWNED"];
+
+function planCtx(over) {
+  return Object.assign({
+    card: { id: 'MON-1', title: 'Fix it', branch: 'bc/mon-1', worktree: '/wt/mon-1', attributes: { prs: [{ url: 'https://gh/pr/1' }] }, labels: [] },
+    project: { name: 'proj', path: '/repo/proj' },
+    worker: { state: 'working', live: true },
+    harness: 'claude',
+  }, over || {});
+}
+
+test('expandTemplate quotes every substitution: hostile text is one literal word', async () => {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'bc-tpl-'));
+  try {
+    for (const evil of EVIL) {
+      const r = await cmds.expandTemplate('printf %s ${card.title} ${card.branch}', { card: { title: evil, branch: evil } }, { quote: true });
+      assert.ok(r.text, 'expanded: ' + JSON.stringify(r));
+      const out = execFileSync('/bin/sh', ['-c', r.text], { cwd: dir, encoding: 'utf8' });
+      assert.strictEqual(out, evil + evil, 'the shell saw exactly the text, nothing ran');
+      assert.ok(!fs.existsSync(path.join(dir, 'PWNED')), 'nothing was executed for ' + JSON.stringify(evil));
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('expandTemplate refuses a substitution where quoting cannot hold', async () => {
+  const scope = { card: { title: 'x' } };
+  for (const tpl of ['echo "${card.title}"', "echo '${card.title}'", 'echo `${card.title}`', 'echo $${card.title}', "echo $'a${card.title}'", 'true # ${card.title}', 'cat <<EOF\n${card.title}\nEOF']) {
+    const r = await cmds.expandTemplate(tpl, scope, { quote: true });
+    assert.ok(r.error && r.unsafe && r.unsafe.includes('card.title'), 'refused: ' + tpl + ' -> ' + JSON.stringify(r));
+  }
+  // a quote that CLOSED before the substitution is fine
+  const ok = await cmds.expandTemplate('echo "a" ${card.title} \'b\' # tail', scope, { quote: true });
+  assert.strictEqual(ok.text, "echo \"a\" 'x' 'b' # tail");
+  // a backslash is the escape: literal text for the shell, no substitution
+  const esc = await cmds.expandTemplate('echo \\${card.title}', scope, { quote: true });
+  assert.strictEqual(esc.text, 'echo \\${card.title}');
+});
+
+test('expandTemplate reports every missing name; a non-root ${VAR} is left for the shell', async () => {
+  const r = await cmds.expandTemplate('deploy ${card.branch} ${input.env} ${card.branch} ${HOME} ${card.attributes.prs[0].url}',
+    { card: { branch: '', attributes: { prs: [] } }, input: {} }, { quote: true });
+  assert.deepStrictEqual(r.missing, ['card.branch', 'input.env', 'card.attributes.prs[0].url']);
+  assert.match(r.error, /missing/);
+  const raw = await cmds.expandTemplate('${card.attributes.prs[0].url}?x=${HOME}', { card: { attributes: { prs: [{ url: 'u' }] } } }, { quote: false });
+  assert.strictEqual(raw.text, 'u?x=${HOME}', 'unquoted for a URL; ${HOME} untouched');
+  const obj = await cmds.expandTemplate('${card.attributes}', { card: { attributes: { a: 1 } } }, { quote: true });
+  assert.deepStrictEqual(obj.missing, ['card.attributes'], 'an object is not a word');
+});
+
+test('planRun exec: validated input, quoted shell, cwd chain, env, timeout, tracked', async () => {
+  const command = { id: 'deploy.run', plugin: 'deploy', tracked: true,
+    form: { env: { type: 'enum', enum: ['staging', 'prod'], default: 'staging' }, n: { type: 'number' } },
+    run: { exec: 'rfslot deploy --branch ${card.branch} --env ${input.env} --title ${card.title}', env: { SLOT: '${input.env}-${card.id}' } } };
+  const p = await cmds.planRun(command, { context: planCtx({ card: Object.assign(planCtx().card, { title: "'; rm -rf /; '" }) }),
+    input: { n: '3' }, workspace: '/ws' });
+  assert.strictEqual(p.kind, 'exec');
+  assert.strictEqual(p.shell, "rfslot deploy --branch 'bc/mon-1' --env 'staging' --title ''\\''; rm -rf /; '\\'''");
+  assert.strictEqual(p.cwd, '/wt/mon-1', 'the card worktree first');
+  assert.strictEqual(p.env.SLOT, 'staging-MON-1', 'env is not a shell: unquoted');
+  assert.strictEqual(p.env.BC_INPUT_ENV, 'staging');
+  assert.strictEqual(p.env.BC_INPUT_N, '3');
+  assert.strictEqual(p.env.BC_CARD, 'MON-1');
+  assert.strictEqual(p.tracked, true);
+  assert.ok(p.timeoutMs > 0);
+  assert.deepStrictEqual(p.input, { env: 'staging', n: 3 });
+
+  const noWt = await cmds.planRun(command, { context: planCtx({ card: { id: 'X', branch: 'b', title: 't' } }), workspace: '/ws' });
+  assert.strictEqual(noWt.cwd, '/repo/proj', 'then the project');
+  const bare = await cmds.planRun(command, { context: { card: { id: 'X', branch: 'b', title: 't' } }, workspace: '/ws' });
+  assert.strictEqual(bare.cwd, '/ws', 'then the workspace');
+  const rel = await cmds.planRun(Object.assign({}, command, { run: Object.assign({}, command.run, { cwd: 'web' }) }),
+    { context: planCtx(), workspace: '/ws' });
+  assert.strictEqual(rel.cwd, '/wt/mon-1/web', 'a relative cwd hangs off the chain');
+});
+
+test('planRun refusals carry HTTP-ish codes', async () => {
+  const command = { id: 'd.run', plugin: 'd', form: { env: { type: 'enum', enum: ['a'], required: true } }, run: { exec: 'x ${card.branch}' } };
+  const bad = await cmds.planRun(command, { context: planCtx(), input: { env: 'zzz' }, workspace: '/ws' });
+  assert.deepStrictEqual([bad.code, bad.field], [400, 'env']);
+  const missing = await cmds.planRun(command, { context: planCtx({ card: { id: 'X' } }), input: { env: 'a' }, workspace: '/ws' });
+  assert.deepStrictEqual([missing.code, missing.missing], [422, ['card.branch']]);
+  const unsafe = await cmds.planRun(Object.assign({}, command, { run: { exec: 'x "${card.branch}"' } }), { context: planCtx(), input: { env: 'a' }, workspace: '/ws' });
+  assert.strictEqual(unsafe.code, 500, 'a manifest bug, not the card');
+  assert.strictEqual((await cmds.planRun(null, {})).code, 404);
+});
+
+test('planRun open and server kinds', async () => {
+  const open = await cmds.planRun({ id: 'g.pr', run: { open: '${card.attributes.prs[0].url}' } }, { context: planCtx(), workspace: '/ws' });
+  assert.deepStrictEqual([open.kind, open.url], ['open', 'https://gh/pr/1']);
+  const js = await cmds.planRun({ id: 'g.pr', run: { open: '${card.attributes.prs[0].url}' } },
+    { context: planCtx({ card: { attributes: { prs: [{ url: 'javascript:alert(1)' }] } } }), workspace: '/ws' });
+  assert.strictEqual(js.code, 422, 'only http(s) opens');
+  const server = await cmds.planRun({ id: 'g.s', run: 'server', form: { x: { type: 'string', default: 'd' } } }, { context: planCtx(), workspace: '/ws' });
+  assert.deepStrictEqual(server, { kind: 'server', input: { x: 'd' } });
+});
