@@ -229,7 +229,7 @@ test('applyBoard stores the doc, runs every subscriber in order, then renders on
   St.onBoard((doc) => seen.push(['a', doc.n, S.doc === doc]));
   St.onBoard((doc) => seen.push(['b', doc.n]));
   let renders = 0;
-  St.onRender(() => { renders++; seen.push(['render']); });
+  const dispose = St.onRender(() => { renders++; seen.push(['render']); });
   St.applyBoard({ n: 1 });
   St.applyBoard({ n: 2 });
   assert.deepStrictEqual(seen, [['a', 1, true], ['b', 1], ['render'], ['a', 2, true], ['b', 2], ['render']]);
@@ -237,7 +237,9 @@ test('applyBoard stores the doc, runs every subscriber in order, then renders on
   St.applyBoard(null); // a failed refetch hands nothing — nothing changes
   assert.strictEqual(S.doc.n, 2);
   assert.strictEqual(renders, 2);
-  St.onRender(() => {});
+  dispose();
+  St.render();
+  assert.strictEqual(renders, 2, 'a disposed listener hears no more renders');
 });
 
 test('applyLocalRead moves the marker forward only and clears the card dot', () => {

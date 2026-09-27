@@ -2,8 +2,9 @@
 // After the profiles slice, nothing in the core names an agent CLI: what a CLI
 // is, how it launches and what its screens mean live in its harness profile
 // (harness/*-tmux.js). The one literal left outside the profiles is the
-// default in port.defaultHarness(). ui/js is not checked here yet: its harness
-// dropdowns move to listHarnesses() with the plugin UI.
+// default in port.defaultHarness(). The board UI reads its harness list from
+// GET /api/plugins; its one literal is the fallback for a server without it
+// (plugins.js FALLBACK_HARNESSES).
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
@@ -28,4 +29,21 @@ test('no quoted CLI name in server/ or cli/', () => {
     });
   }
   assert.deepStrictEqual(hits, [], 'harness names belong in the profile:\n' + hits.join('\n'));
+});
+
+function walk(dir) {
+  return fs.readdirSync(dir, { withFileTypes: true })
+    .flatMap((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : [path.join(dir, e.name)]));
+}
+
+test('no quoted CLI name in ui/ outside the fallback harness list', () => {
+  const files = [...walk(path.join(ROOT, 'ui', 'js')).filter((f) => f.endsWith('.js')), path.join(ROOT, 'ui', 'index.html')];
+  const hits = [];
+  for (const file of files) {
+    fs.readFileSync(file, 'utf8').split('\n').forEach((line, i) => {
+      if (/^\s*\/\//.test(line) || /FALLBACK_HARNESSES = /.test(line)) return;
+      if (LITERAL.test(line)) hits.push(path.relative(ROOT, file) + ':' + (i + 1) + ': ' + line.trim());
+    });
+  }
+  assert.deepStrictEqual(hits, [], 'the dropdowns read GET /api/plugins harnesses:\n' + hits.join('\n'));
 });

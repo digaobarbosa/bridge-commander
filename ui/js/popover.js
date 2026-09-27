@@ -24,7 +24,8 @@ export function clampToViewport(x, y, w, h, vw, vh, margin = 8) {
  * Open a popover. `anchor` is an element (the popover opens under it) or a
  * {x, y} point. `content` is a DOM node or a list of items:
  *   {head} a caption · {sep: true} a rule · {note} a quiet line ·
- *   {label, onClick, current, danger, dot, title} a button (no onClick = inert).
+ *   {label, onClick, current, danger, dot, title} a button (no onClick = inert:
+ *   disabled and grey, never danger red).
  * opts: {id} — reopening the same id replaces it; {align: 'right'} lines the
  * popover's right edge up with the anchor's; {onClose}.
  * Returns {el, close(), isOpen(), set(content)}; set() refills and re-clamps.
@@ -113,7 +114,10 @@ function item(it, handle) {
   }
   const b = document.createElement('button');
   b.type = 'button';
-  b.className = [it.current && 'cur', it.danger && 'danger'].filter(Boolean).join(' ');
+  // An item that cannot be pressed is inert and grey whatever it would do: a
+  // refused "✕ archive" in danger red read as a live button that did nothing.
+  const inert = !it.onClick;
+  b.className = [it.current && 'cur', inert && !it.current && 'inert', !inert && it.danger && 'danger'].filter(Boolean).join(' ');
   if (it.title) b.title = it.title;
   if (it.dot) {
     const dot = document.createElement('span');

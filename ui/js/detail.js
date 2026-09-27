@@ -7,7 +7,11 @@ import { api } from './api.js';
 import { labelChipHtml, openLabelPicker, saveCardLabels } from './labels.js';
 import { openCardThread, syncChatToMain } from './chat.js';
 import { openFile, closeFile, fileKey, fileDirty, fileMerges, fileResolve, fileUpdate, fileNotice } from './filepane.js';
-import { openMoveMenu } from './board.js';
+import { openCardMenu, detailActionsHtml } from './cardactions.js';
+import { runCommand } from './commandui.js';
+import { entries, hasEntries } from './slots.js';
+import { renderPluginSection } from './plugins.js';
+import { cardContext } from './cardview.js';
 import { archivedCard, unarchive } from './archive.js';
 import { openPopover } from './popover.js';
 
@@ -60,6 +64,7 @@ function renderAux() {
   document.getElementById('dt-talk').hidden = true;
   document.getElementById('dt-menu-btn').hidden = true;
   document.getElementById('dt-unarch').hidden = true;
+  setHtmlIfChanged(pactEl, ''); // plugin buttons are a card's, not a schedule's
   const emojiEl = document.getElementById('dt-emoji');
   if (emojiEl.textContent !== (aux.emoji || '')) emojiEl.textContent = aux.emoji || '';
   if (titleEl.textContent !== aux.title) titleEl.textContent = aux.title;
@@ -153,6 +158,9 @@ document.addEventListener('click', (e) => {
     t.closest('#settings-panel') ||
     t.closest('#label-picker') ||
     t.closest('#av-overlay') ||               // artifact viewer sits above the detail
+    t.closest('.bc-modal-overlay') ||         // a command form or an activity log opened from it
+    t.closest('#taskbar') ||                  // …and the taskbar that opens those logs
+    t.closest('#toast-stack') ||
     t.closest('#mmd-overlay') ||              // fullscreen mermaid diagram overlay
     t.closest('.speech-transport') ||         // floating speech transport (and its buttons)
     t.closest('[data-label-add]')
@@ -160,17 +168,18 @@ document.addEventListener('click', (e) => {
   if (editingTitle) commitTitleEdit();        // save the in-progress rename first
   closeDetail();
 });
-document.getElementById('dt-talk').onclick = () => {
-  if (S.openCardId) {
-    const id = S.openCardId;
-    // Desktop already shows the thread on the left (synced on select), so just
-    // focus that thread — keep the detail open for the side-by-side view. Mobile
-    // has no side-by-side, so switch the chat tab to the thread as before.
-    if (isDesktop()) { openCardThread(id); return; }
-    closeDetail();
-    openCardThread(id);
-  }
-};
+// 💬 talk — the card command table's talk action (cardactions.js) lands here,
+// from the header button and from any card's menu alike.
+export function talkOnCard(id) {
+  if (!id) return;
+  // Desktop already shows the thread on the left (synced on select), so just
+  // focus that thread — keep the detail open for the side-by-side view. Mobile
+  // has no side-by-side, so switch the chat tab to the thread as before.
+  if (isDesktop()) { openCardThread(id); return; }
+  if (S.openCardId) closeDetail();
+  openCardThread(id);
+}
+document.getElementById('dt-talk').onclick = () => talkOnCard(S.openCardId);
 // ---------- the collapsed line, and the artifacts accordion ----------
 // Both are per-card view state, and the card viewer remembers nothing across
 // cards: opening a different card collapses the line again and re-opens
@@ -193,12 +202,62 @@ stripEl.onkeydown = (e) => {
   if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleFold(); }
 };
 
+// ⋯ — the same card menu the tile and the table row open (cardactions.js)
 document.getElementById('dt-menu-btn').onclick = (e) => {
-  if (S.openCardId) {
-    const r = e.target.getBoundingClientRect();
-    openMoveMenu(S.openCardId, r.left, r.bottom + 4);
-  }
+  if (S.openCardId) openCardMenu(S.openCardId, e.currentTarget);
 };
+// the plugin buttons (detail.actions/v1) — one delegated handler, the markup is repainted
+const pactEl = document.getElementById('dt-pactions');
+pactEl.onclick = (e) => {
+  const b = e.target.closest('button[data-cmd]');
+  if (b && S.openCardId) runCommand(b.dataset.cmd, S.openCardId);
+};
+
+// ---------- plugin sections (detail.sections/v1) ----------
+// Below the built-in sections, each in its own box: the plugin's module is
+// imported the first time one is shown and its render(el, card, state) runs on
+// every repaint, inside the slot error boundary. The boxes are rebuilt only
+// when the card or the set of sections changes, so a plugin's DOM survives a
+// board push.
+const secEl = document.getElementById('dt-sections');
+let secMounts = { sig: '', list: [] };
+function clearSections() {
+  for (const m of secMounts.list) if (m.dispose) m.dispose();
+  secMounts = { sig: '', list: [] };
+  if (secEl.firstChild) secEl.textContent = '';
+}
+function renderSections(c, arch) {
+  // a frozen snapshot is not something a plugin acts on
+  const list = arch || !hasEntries('detail.sections/v1') ? [] : entries('detail.sections/v1', cardContext(c, S.doc));
+  const sig = c.id + '|' + list.map((e) => e.key).join(',');
+  if (sig !== secMounts.sig) {
+    clearSections();
+    secMounts.sig = sig;
+    for (const entry of list) {
+      const box = document.createElement('section');
+      box.className = 'dt-psec';
+      box.dataset.key = entry.key;
+      const head = document.createElement('div');
+      head.className = 'dt-events-head dt-psec-head';
+      head.textContent = (entry.icon ? entry.icon + ' ' : '') + entry.title;
+      if (entry.plugin) {
+        const by = document.createElement('span');
+        by.className = 'dt-psec-by';
+        by.textContent = entry.plugin;
+        head.appendChild(by);
+      }
+      const body = document.createElement('div');
+      body.className = 'dt-psec-body';
+      box.append(head, body);
+      secEl.appendChild(box);
+      secMounts.list.push({ entry, el: body, dispose: null });
+    }
+  }
+  for (const m of secMounts.list) {
+    const d = renderPluginSection(m.entry, m.el, c);
+    if (d) m.dispose = d;
+  }
+}
 
 // ---------- inline title rename ----------
 function startTitleEdit() {
@@ -779,10 +838,10 @@ function attrHtml(k, v) {
 }
 
 export function renderDetail() {
-  if (aux) { renderAux(); return; }
+  if (aux) { clearSections(); renderAux(); return; }
   el.classList.remove('dt-aux-on');
   auxEl.hidden = true;
-  if (!S.openCardId) { el.hidden = true; return; }
+  if (!S.openCardId) { el.hidden = true; clearSections(); return; }
   let c = card(S.openCardId);
   let arch = null; // the archive record when this is a frozen snapshot
   if (!c) {
@@ -953,6 +1012,10 @@ export function renderDetail() {
     '<div class="tx">' + (kindEmoji(e.kind) ? esc(kindEmoji(e.kind)) + ' ' : '') + esc(e.text) + '</div>' +
     '<div class="sub">' + esc(e.actor || '') + ' · ' + hhmm(e.ts) + ' · ' + agoSpanHtml(e.ts) + ' ago</div>' +
     '</div></div>').join('') || '<div class="ev"><div class="bd"><div class="sub">no events yet</div></div></div>');
+
+  // plugin buttons in the header, plugin sections under everything else
+  setHtmlIfChanged(pactEl, arch ? '' : detailActionsHtml(c, S.doc));
+  renderSections(c, arch);
 
   if (!arch) maybeMarkCardRead(c, f); // frozen snapshots have no read state to advance
 }

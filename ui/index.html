@@ -34,15 +34,10 @@
     <!-- mobile only: leaves search mode (the filter itself stays applied) -->
     <button id="filter-close" title="done">✕</button>
   </span>
-  <!-- board ⇄ table over the live cards; 🧊 is the archived cards' own mode;
-       ⚡ is the clock and the scripts it fires, which are watched rather than
-       configured and so are a mode of their own rather than a config tab -->
-  <span id="view-seg" role="group" aria-label="board view">
-    <button id="vs-board" class="on" title="kanban board">▦</button>
-    <button id="vs-table" title="table view">☰</button>
-    <button id="vs-arch" title="archived cards">🧊</button>
-    <button id="vs-auto" title="hooks &amp; schedules">⚡</button>
-  </span>
+  <!-- the view switcher: one button per switcher view in the main/v1 registry
+       (views.js), in rank order — ▦ kanban, ☰ table, 🧊 archived, ⚡ automation,
+       then any plugin view. main.js builds the buttons. -->
+  <span id="view-seg" role="group" aria-label="board view"></span>
   <span id="status-dot" title="connecting…"></span>
   <button id="bell" title="notifications">🔔<span id="bell-n" class="badge-n" hidden></span></button>
   <button id="gear" title="settings">⚙️</button>
@@ -152,19 +147,23 @@
     <div class="pane-resize" id="chat-resize" title="drag to resize · double-click to reset"></div>
   </section>
 
-  <!-- board: right — one region, six modes (kanban | table | archived |
-       automation | file | settings). The first four are the switcher and are
-       remembered; the file and settings screens are not in it (you enter them
-       by opening a file, or from the gear). All of them take the board's place
-       with the chat still at its side. -->
+  <!-- board: right — one region, one view at a time from the main/v1
+       registry (views.js): kanban | table | archived | automation, then any
+       plugin view — the switcher, remembered — and the file and settings
+       screens, which are not in it (you enter them by opening a file, or from
+       the gear). All of them take the board's place with the chat still at
+       its side. -->
   <section id="board-wrap">
-    <div id="board"><div class="empty">waiting for board…</div></div>
-    <div id="table"></div>
-    <div id="archive"></div>
-    <div id="filepane"></div>
+    <!-- every view below is a .bc-view: views.js marks the one on screen
+         .view-on. Plugin views get a div of their own, inserted before the
+         taskbar. -->
+    <div id="board" class="bc-view"><div class="empty">waiting for board…</div></div>
+    <div id="table" class="bc-view"></div>
+    <div id="archive" class="bc-view"></div>
+    <div id="filepane" class="bc-view"></div>
     <!-- the config screen: one section per thing the BOARD owns, as opposed to
          the browser looking at it — labels, playbooks, projects, lieutenants. -->
-    <div id="settings-screen">
+    <div id="settings-screen" class="bc-view">
       <!-- the heading row carries the tabs: one button per section, wearing the
            same segmented look as the ▦☰🧊⚡ switcher. data-tab pairs with the
            section's data-sec — that pairing IS the switching logic, so a new
@@ -180,6 +179,7 @@
           <button type="button" data-tab="playbooks">playbooks</button>
           <button type="button" data-tab="projects">projects</button>
           <button type="button" data-tab="lieutenants">lieutenants</button>
+          <button type="button" data-tab="plugins">plugins</button>
         </span>
       </div>
       <section class="ss-sec on" id="ss-labels" data-sec="labels">
@@ -219,6 +219,13 @@
         <div class="ss-title">lieutenants</div>
         <div id="lt-list"></div>
       </section>
+      <!-- plugins: what the server found (shipped + the workspace's own), each
+           switched on or off, its config, and what it adds. Writes go to the
+           workspace overlay, .bridge-commander/plugins.json. -->
+      <section class="ss-sec" id="ss-plugins" data-sec="plugins">
+        <div class="ss-title">plugins</div>
+        <div id="pl-list"></div>
+      </section>
     </div>
     <!-- automation (⚡): the board's clock and the scripts it fires. A schedule
          fires a hook, so the two are ONE screen rather than two tabs — the
@@ -226,7 +233,7 @@
          names what fires it) instead of being inferred across a tab switch.
          Anything red is what this screen is opened for, so it sorts to the top
          of its column and the masthead counts it. -->
-    <div id="auto-screen">
+    <div id="auto-screen" class="bc-view">
       <div class="au-masthead">
         <div class="au-head">automation</div>
         <!-- the one line that answers "is anything wrong" without scrolling -->
@@ -295,6 +302,9 @@
         </section>
       </div>
     </div>
+    <!-- the taskbar (activities.js): tracked command runs — running ones with a
+         spinner, the last few that ended with ✓ / ✗. Hidden while there are none. -->
+    <div id="taskbar" hidden></div>
   </section>
 </main>
 
@@ -315,6 +325,8 @@
              aria-label="card title" autocomplete="off" spellcheck="false" hidden />
       <div class="dt-sub" id="dt-sub"></div>
     </div>
+    <!-- plugin buttons (detail.actions/v1), painted by detail.js -->
+    <span id="dt-pactions"></span>
     <button id="dt-talk" title="talk in this card's thread">💬 talk</button>
     <button id="dt-menu-btn" title="move / archive">⋯</button>
     <!-- archived snapshots only: the one action a frozen card offers -->
@@ -351,6 +363,8 @@
     <!-- archived snapshots: the frozen thread, inline (live cards chat on the left) -->
     <div class="dt-events-head" id="dt-thread-head" hidden>thread (frozen)</div>
     <div id="dt-thread" hidden></div>
+    <!-- plugin sections (detail.sections/v1), below every built-in one -->
+    <div id="dt-sections"></div>
   </div>
 </aside>
 
@@ -371,10 +385,8 @@
          free-text box on purpose — the board keeps no list of model names, the
          string goes straight to the harness CLI. -->
     <div class="lt-row">
-      <select id="ls-harness" title="agent harness — changing this respawns the lieutenant">
-        <option value="claude">claude</option>
-        <option value="codex">codex</option>
-      </select>
+      <!-- options: the harnesses GET /api/plugins lists (plugins.js fills them) -->
+      <select id="ls-harness" title="agent harness — changing this respawns the lieutenant"></select>
       <input id="ls-model" placeholder="model (harness default)" autocomplete="off" spellcheck="false"
              title="passed to the harness as --model on every spawn and resume; empty = the harness default">
     </div>
@@ -414,10 +426,7 @@
     <div class="lt-row">
       <input id="lt-color" type="color" value="#58b6ff" title="lieutenant color">
       <input id="lt-name" placeholder="name" autocomplete="off" required>
-      <select id="lt-harness" title="agent harness">
-        <option value="claude" selected>claude</option>
-        <option value="codex">codex</option>
-      </select>
+      <select id="lt-harness" title="agent harness"></select>
     </div>
     <div id="lt-avatar-grid"></div>
     <div class="nc-actions">
