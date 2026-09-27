@@ -58,22 +58,20 @@ function claudeProjectSlug(cwd) {
   return String(cwd).replace(/[^A-Za-z0-9]/g, '-');
 }
 
-// Context window per model — matched by substring so versioned ids
-// (claude-fable-5, claude-opus-4-8, …) hit without an exhaustive list.
-// Extend by adding a pair; unknown models get the conservative default.
-const CLAUDE_CONTEXT_WINDOWS = [
-  ['fable', 1000000],
-  ['opus', 200000],
-  ['sonnet', 200000],
-  ['haiku', 200000],
-];
-const CLAUDE_DEFAULT_WINDOW = 200000;
-function claudeContextWindow(model) {
+// Context window per model: `windows` is the profile's [[needle, n], ...]
+// (claude-tmux.js CONTEXT_WINDOWS, plus a derived profile's own), matched by
+// substring so versioned ids hit without an exhaustive list. Unknown models
+// get the conservative default.
+const DEFAULT_WINDOW = 200000;
+function windowFor(model, windows) {
   const m = String(model || '').toLowerCase();
-  for (const [needle, window] of CLAUDE_CONTEXT_WINDOWS) {
+  for (const [needle, window] of windows || []) {
     if (m.includes(needle)) return window;
   }
-  return CLAUDE_DEFAULT_WINDOW;
+  return null;
+}
+function claudeContextWindow(model, windows) {
+  return windowFor(model, windows) || DEFAULT_WINDOW;
 }
 
 // ---------- claude statusline sidecar ----------
@@ -146,7 +144,13 @@ function claudeSidecarStatus(ref, opts = {}) {
 function claudeStatus(ref, opts = {}) {
   if (!ref || !ref.cwd || !ref.resumeId) return null;
   const sidecar = claudeSidecarStatus(ref, opts);
-  if (sidecar) return sidecar;
+  if (sidecar) {
+    // A derived profile that names its model's window beats claude's own
+    // report: claude sizes the window for models it knows, not a proxied one.
+    const own = windowFor(sidecar.model, opts.windowOverrides);
+    if (own) sidecar.contextWindow = own;
+    return sidecar;
+  }
   const projectsDir = opts.projectsDir || process.env.BC_CLAUDE_PROJECTS_DIR
     || path.join(os.homedir(), '.claude', 'projects');
   const file = path.join(projectsDir, claudeProjectSlug(ref.cwd), ref.resumeId + '.jsonl');
@@ -177,7 +181,7 @@ function claudeStatus(ref, opts = {}) {
       return {
         model: msg.model || null,
         contextUsed: used,
-        contextWindow: claudeContextWindow(msg.model),
+        contextWindow: claudeContextWindow(msg.model, opts.contextWindows),
       };
     }
     if (size <= maxBytes) break; // whole file scanned — a bigger tail finds nothing new

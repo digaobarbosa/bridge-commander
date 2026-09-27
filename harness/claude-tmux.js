@@ -28,7 +28,8 @@ const crypto = require('node:crypto');
 const { claudeStatus } = require('./agent-status.js');
 const { tmuxAdapter } = require('./tmux-adapter.js');
 const { shellQuote } = require('./util.js');
-const { installHooks, writeOutputStyle } = require('./claude-settings.js');
+const { installHooks, installStatusLine, writeOutputStyle } = require('./claude-settings.js');
+const onboard = require('./claude-onboard.js');
 
 const TRUST_RE = /Yes, I trust this folder|Quick safety check/;
 
@@ -80,7 +81,9 @@ const UI_READY_RE = /bypass permissions|auto mode on|accept edits on|esc (to )?i
 //              not one to answer with a blind Enter, and it is not ours to
 //              accept on anyone's behalf: it is a person saying yes to an agent
 //              that skips permission prompts on their machine.
-const FATAL_RE = /cannot be used with root\/sudo privileges|Choose the text style|To change this later, run \/theme|claude: command not found|command not found: claude|Bypass Permissions mode|Yes, I accept/;
+// (`env: claude: No such file` is the missing binary under a profile with
+// env, whose launch runs through `exec env`.)
+const FATAL_RE = /cannot be used with root\/sudo privileges|Choose the text style|To change this later, run \/theme|claude: command not found|command not found: claude|env: .?claude.?: No such file|Bypass Permissions mode|Yes, I accept/;
 // DECLINE_RE — a menu whose cursor sits on a "No". Claude 2.1.282 preselects
 // "No, exit" on the folder-trust screen, where Enter quits claude to the shell
 // and the launch times out at 45s. The settle walks the cursor off it first.
@@ -256,6 +259,35 @@ async function setOutputStyle(ref, line, opts) {
   return 'output style set to ' + hit.value + ' — it applies the next time this session starts';
 }
 
+// The launch modes config.json may name. Anything else reads as the first
+// one: a typo must not turn into a flag claude refuses to start on.
+const PERMISSION_MODES = ['auto', 'default', 'acceptEdits', 'bypass'];
+
+// describe(request) — one line the captain can judge a permission ask from:
+// the field that carries the risk for the tools that have one. '' lets the
+// core fall back to the input itself.
+function describePermission(req) {
+  const tool = req && req.tool_name;
+  const i = req && req.tool_input && typeof req.tool_input === 'object' ? req.tool_input : {};
+  const pick = (k) => (typeof i[k] === 'string' && i[k].trim() ? i[k].trim() : '');
+  if (tool === 'Bash') return pick('command');
+  if (tool === 'Edit' || tool === 'Write' || tool === 'Read' || tool === 'MultiEdit' || tool === 'NotebookEdit') {
+    return pick('file_path') || pick('notebook_path');
+  }
+  if (tool === 'WebFetch') return pick('url');
+  return '';
+}
+
+// Context window per model — matched by substring so versioned ids
+// (claude-fable-5, claude-opus-4-8, …) hit without an exhaustive list. A
+// derived profile prepends its own pairs; unknown models get the default.
+const CONTEXT_WINDOWS = [
+  ['fable', 1000000],
+  ['opus', 200000],
+  ['sonnet', 200000],
+  ['haiku', 200000],
+];
+
 const profile = {
   name: 'claude',
   settle: SETTLE,
@@ -275,14 +307,55 @@ const profile = {
   resumeLaunch: (id, ctx) => launchPrefix(permissionModeOf(ctx.permissionMode), ctx.allowRoot)
     + (id ? ` --resume ${id}` : '')
     + (ctx.extra ? ' ' + ctx.extra : ''),
-  status: (ref) => claudeStatus(ref),
+  // ctx.profile is the MERGED profile, so a derived one's windows apply.
+  status: (ref, ctx) => claudeStatus(ref, {
+    contextWindows: ctx && ctx.profile && ctx.profile.contextWindows,
+    windowOverrides: ctx && ctx.profile && ctx.profile.windowOverrides,
+  }),
   noStatusHint: 'session transcript not found',
   commands: ownCommands,
   handlers: { [OUTPUT_STYLE]: setOutputStyle },
   passthrough: ['/autocompact'],
+
+  // ---- typed options: --model / --effort (both verified in `claude --help`) ----
+  options: ['model', 'effort'],
+  modelArgs: ({ model, effort } = {}) => [].concat(model ? ['--model', model] : [], effort ? ['--effort', effort] : []),
+
+  // ---- data the core reads through profileInfo() ----
+  permissions: { modes: PERMISSION_MODES, describe: describePermission },
+  requirements: { bins: ['claude'], tmux: true, rootBypass: true },
+  installHint: onboard.INSTALL_HINT,
+  contextWindows: CONTEXT_WINDOWS,
+
+  // ---- first run (cli/firstrun.js frames these) ----
+  handRunLine: onboard.handRunLine,
+  setupScreens: onboard.setupScreens,
+  rootBlock: onboard.rootBlock,
+  diagnose: onboard.diagnose,
+
+  // detectSelf(env) — claude exports CLAUDECODE (and CLAUDE_SESSION_ID when it
+  // has one) to the commands it runs; that is how `bc-axi init` knows its caller.
+  detectSelf: (env) => (env && (env.CLAUDECODE || env.CLAUDE_SESSION_ID)
+    ? { resumeId: env.CLAUDE_SESSION_ID || '' } : null),
+  // Where the worker-duties skill is linked so a claude worker can load it.
+  skillsDir: (home) => path.join(home || os.homedir(), '.claude', 'skills'),
+  // The workspace-level Stop + PermissionRequest hooks and the statusLine, for
+  // every claude whose cwd is the workspace (the founder included).
+  async installWorkspace(ws, env = {}) {
+    await installHooks(ws, 'ws', env.stateDir, env.callbackUrl);
+    await installStatusLine(ws);
+    return [
+      'turn-end + permission hooks installed (.claude/settings.local.json -> /api/turn-end, /api/permission)',
+      'statusLine installed (.claude/settings.local.json -> real context window sidecar)',
+    ];
+  },
+  // `bc-axi open` self-heals the statusLine wiring on every open.
+  refreshWorkspace: (ws) => installStatusLine(ws),
 };
 
 module.exports = { ...tmuxAdapter(profile),
+  // The JS base a derived JSON profile `extends` (harness/profiles.js).
+  profile, PERMISSION_MODES, describePermission,
   // Exported for the tests that pin the style list against a temp directory and
   // the built-ins against the binary.
   outputStyles, BUILTIN_OUTPUT_STYLES,

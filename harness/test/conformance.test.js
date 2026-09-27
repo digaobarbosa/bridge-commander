@@ -1,7 +1,9 @@
 'use strict';
-// Conformance — ONE suite, run against every tmux profile (claude, codex) and,
-// where the case applies, the fake. What the port promises is checked here
-// once; each profile's own test file keeps only facts about its CLI.
+// Conformance — ONE suite, run against every tmux-backed harness the port
+// lists (claude, codex, and any JSON-derived profile — one is loaded below,
+// the way a plugin's would be) and, where the case applies, the fake. What the
+// port promises is checked here once; each profile's own test file keeps only
+// facts about its CLI.
 //
 // The tmux profiles run on harness/test/tmux-mock.js: no tmux process, every
 // call recorded, and the pane shows whatever screens the case hands it.
@@ -11,12 +13,18 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { mockTmux } = require('./tmux-mock.js');
-const { isHarnessRef, VERBS } = require('../port.js');
+const port = require('../port.js');
+const { isHarnessRef, VERBS } = port;
+const { loadProfiles } = require('../profiles.js');
 
-const SUBJECTS = [
-  {
-    name: 'claude',
-    impl: require('../claude-tmux.js'),
+// A derived profile joins the suite for free: nothing below names it.
+process.env.BC_CONFORMANCE_KEY = 'sk-conformance';
+loadProfiles({ profiles: [{ name: 'conf-derived', extends: 'claude', plugin: 'conformance',
+  env: { ANTHROPIC_AUTH_TOKEN: '${BC_CONFORMANCE_KEY}' }, contextWindows: { conf: 1000 } }] });
+
+// The screens each BASE profile's CLI shows; a derived profile shows its base's.
+const SCREENS = {
+  claude: {
     idAtBirth: true,
     extra: ['/autocompact', '/output-style'],
     ready: '⏵⏵ auto mode on (shift+tab to cycle)\n❯ ',
@@ -27,9 +35,7 @@ const SUBJECTS = [
       + '--dangerously-skip-permissions cannot be used with root/sudo privileges for security reasons\n$ ',
     fatalRe: /root\/sudo/,
   },
-  {
-    name: 'codex',
-    impl: require('../codex-tmux.js'),
+  codex: {
     idAtBirth: false,
     extra: [],
     ready: 'OpenAI Codex (v0.155.1)\nYOLO mode\n› ',
@@ -38,7 +44,16 @@ const SUBJECTS = [
     fatal: '$ codex --dangerously-bypass-approvals-and-sandbox\nzsh: command not found: codex\n$ ',
     fatalRe: /command not found: codex/,
   },
-];
+};
+const SUBJECTS = port.listHarnesses().filter((h) => h.adapter === 'tmux').map((h) => {
+  const impl = port.getHarness(h.name);
+  const base = (impl.profile && impl.profile.extends) || h.name;
+  assert.ok(SCREENS[base], 'no screens for the base of ' + h.name);
+  return { name: h.name, impl, ...SCREENS[base] };
+});
+test('the suite covers every tmux harness the port lists, derived ones included', () => {
+  assert.deepStrictEqual(SUBJECTS.map((x) => x.name), ['claude', 'codex', 'conf-derived']);
+});
 const fake = require('../fake.js');
 
 function tmpdir(prefix) {
@@ -69,7 +84,7 @@ function assertCleanRef(ref, harness) {
 
 test('every subject exposes the seven verbs and the optional ones the server uses', () => {
   for (const impl of [...SUBJECTS.map((x) => x.impl), fake]) {
-    for (const verb of VERBS.concat(['openPane', 'paneSnapshot', 'paneInput', 'commands', 'runCommand', 'status', 'adoptWindow', 'brief'])) {
+    for (const verb of VERBS.concat(['openPane', 'paneSnapshot', 'paneInput', 'commands', 'runCommand', 'status', 'adoptWindow', 'brief', 'profileInfo'])) {
       assert.strictEqual(typeof impl[verb], 'function', verb);
     }
   }
@@ -216,6 +231,27 @@ for (const sub of SUBJECTS) {
       await assert.rejects(() => h.runCommand(ref, '/status', { stateDir: tmpdir('bc-conf-st-') }), /no status for bc-cmd/);
       assert.deepStrictEqual(mock.calls.filter((c) => c.fn === 'submit' || c.fn === 'sendLiteral'), [], 'nothing typed');
     });
+  });
+}
+
+// profileInfo — the data the core reads instead of naming a CLI.
+for (const sub of SUBJECTS) {
+  test(`${sub.name}: profileInfo names itself and carries the data the core reads`, async () => {
+    const info = sub.impl.profileInfo();
+    assert.strictEqual(info.name, sub.name);
+    assert.strictEqual(info.adapter, 'tmux');
+    assert.ok(Array.isArray(info.options) && Array.isArray(info.permissionModes));
+    assert.ok(Array.isArray(info.requirements.bins) && info.requirements.bins.length, 'a CLI to look for');
+    assert.strictEqual(info.requirements.tmux, true);
+    assert.strictEqual(typeof info.installHint, 'string');
+    assert.ok(Array.isArray(info.contextWindows));
+    // a typed option it honors reaches the launch line as the profile's own flag
+    if (info.options.includes('model')) {
+      await withDirs((cwd, stateDir) => withMock(sub.ready, async (mock) => {
+        await sub.impl.spawn(cwd, 'go', { session: 'bc-typed', stateDir, installHooks: false, model: 'm-typed' });
+        assert.match(launches(mock)[0], /'m-typed'/);
+      }));
+    }
   });
 }
 

@@ -1,0 +1,8 @@
+{
+  "id": "codex",
+  "name": "OpenAI Codex CLI",
+  "description": "The codex profile of the tmux adapter family (harness/codex-tmux.js).",
+  "contributes": {
+    "profiles": [{ "name": "codex", "builtin": true }]
+  }
+}

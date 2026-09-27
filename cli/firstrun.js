@@ -20,6 +20,7 @@ const path = require('path');
 const net = require('net');
 const { execFileSync } = require('child_process');
 const { STATE_DIR_NAME, LEGACY_STATE_DIR_NAME } = require(path.join(__dirname, '..', 'server', 'layout.js'));
+const port = require(path.join(__dirname, '..', 'harness', 'port.js'));
 
 // Entries that say nothing about what a folder is for. A stranger's "empty
 // folder" has usually already been opened by an agent, and the agent left its
@@ -190,66 +191,49 @@ function gitIdentityText(id) {
 }
 
 // The permission mode agents launch with (.bridge-commander/config.json
-// `permissionMode`). Only 'bypass' launches with --dangerously-skip-permissions,
-// so only 'bypass' can hit the root refusal and the bypass consent screen.
+// `permissionMode`). Only 'bypass' skips permission prompts, so only 'bypass'
+// can hit a root refusal and a bypass consent screen.
 function permissionModeOf(config) {
   const m = config && config.permissionMode;
   return typeof m === 'string' && m ? m : 'auto';
 }
 
-// Root. Claude Code refuses `--dangerously-skip-permissions` as uid 0 and exits
-// immediately, so as root there is no lieutenant to be had — the board would
-// come up with nobody on it. That is checked HERE, before anything is written,
-// rather than discovered from a dead pane afterwards. Only asked in bypass mode:
-// no other mode trips the refusal.
-function rootBlockText() {
-  return 'you are running as root, and Claude Code refuses --dangerously-skip-permissions as root.\n'
-    + 'Bridget is a real claude session, so as root she cannot start and you would be left with a\n'
-    + 'board nobody is on. Two honest ways forward:\n\n'
-    + '  1. RECOMMENDED — do the first run as a normal user:\n'
-    + '       useradd -m dev && su - dev\n'
-    + '     Then, as that user: install the skill (npx skills add …), install the agent CLI in a\n'
-    + '     way that needs no root (curl -fsSL https://claude.ai/install.sh | bash puts it in\n'
-    + '     ~/.local/bin — `npm i -g` would fail with EACCES for them), and run this again.\n\n'
-    + '  2. This is a throwaway box (a container you will delete) and you accept the risk:\n'
-    + '       bc-axi init --onboard --allow-root\n'
-    + '     That launches her with IS_SANDBOX=1, which is the escape hatch claude itself checks.\n'
-    + '     It turns off a guard that exists because an agent with skipped permissions running as\n'
-    + '     root can do anything to the machine. Never on a box you care about.\n\n'
-    + 'ASK the person which one. Do not pick --allow-root for them.';
+// Everything below that is about ONE agent CLI — its launch line, its install
+// route, its screens — is the harness profile's (harness/*-tmux.js, reached
+// through the port). This file frames it for the stranger reading it.
+// A harness without a profile (a test double, a hand-registered impl) still
+// gets the generic texts, named after itself.
+function profileFor(harness) {
+  const name = harness || port.defaultHarness();
+  let p = null;
+  try { p = port.profileOf(name); } catch (e) { p = null; }
+  return p || { name, requirements: { bins: [name] }, handRunLine: () => name };
+}
+function binOf(p) { return (p.requirements && p.requirements.bins && p.requirements.bins[0]) || p.name; }
+
+// Root. A profile whose bypass launch refuses uid 0 (requirements.rootBypass)
+// is checked HERE, before anything is written, rather than discovered from a
+// dead pane afterwards. Only asked in bypass mode.
+function rootBlockText(harness) {
+  const p = profileFor(harness);
+  if (typeof p.rootBlock === 'function') return p.rootBlock();
+  return 'you are running as root, and ' + binOf(p) + ' refuses to skip permissions as root.\n'
+    + 'Do the first run as a normal user (useradd -m dev && su - dev), or, on a throwaway box you\n'
+    + 'accept the risk on, re-run with --allow-root. ASK the person which one. Do not pick --allow-root for them.';
 }
 
-// The agent CLI itself. Cheap and certain (is it on PATH?), so it is answered
-// before the spawn instead of being guessed at from a timeout afterwards.
-//
-// The install line has to work for the user who will RUN it. `npm i -g` on a
-// stock image writes into a root-owned prefix and fails with EACCES for exactly
-// the normal user the root block just told them to become — two blocks that
-// contradict each other are worse than either one alone. The official installer
-// puts the binary under ~/.local/bin and needs no root, so that is what is
-// offered first.
-// Installed-but-invisible is a different problem from not-installed, and it has
-// a different fix. The curl installer puts the binary in ~/.local/bin and leaves
-// the PATH edit to the user; on Debian a normal login shell picks that up from
-// ~/.profile, but root's does not — so as root the very next step dies with
-// "command not found" and re-running loops forever on the same message.
 // The launch line a PERSON runs by hand to clear the setup screens. There is one
 // of these in the whole file on purpose: it is the line a stranger copies
 // verbatim, and every place that prints it has to get the same details right.
 //
-// Round 5: as root it needs IS_SANDBOX=1 — the same escape hatch --allow-root
-// passes to her spawn. Without it the line dies on sight with the very refusal
-// the person is trying to get past, which reads as "these instructions are
-// broken" at exactly the moment they have no other move.
-//
-// The flag is the spawn's own (opts.mode, default 'auto'), so the hand run
-// clears the same screens her launch meets. Outside bypass there is no root
-// refusal and no IS_SANDBOX=1. codex ignores the mode, so its line is unchanged.
-function handRunLine(bin, here, opts = {}) {
+// The command is the profile's handRunLine(mode, {root}): the spawn's own flag,
+// so the hand run clears the same screens her launch meets, and as root the
+// same escape hatch --allow-root passes to her spawn — without it the line dies
+// on sight with the very refusal the person is trying to get past.
+function handRunLine(harness, here, opts = {}) {
   const mode = opts.mode || 'auto';
-  if (bin === 'claude' && mode !== 'bypass') return '  cd ' + here + ' && claude --permission-mode ' + mode;
   const root = opts.root === undefined ? isRoot() : opts.root;
-  return '  cd ' + here + ' && ' + (root ? 'IS_SANDBOX=1 ' : '') + bin + ' --dangerously-skip-permissions';
+  return '  cd ' + here + ' && ' + profileFor(harness).handRunLine(mode, { root });
 }
 
 function agentAtHome(bin) {
@@ -259,20 +243,24 @@ function agentAtHome(bin) {
   try { fs.accessSync(p, fs.constants.X_OK); return p; } catch (e) { return ''; }
 }
 
+// The agent CLI itself. Cheap and certain (is it on PATH?), so it is answered
+// before the spawn instead of being guessed at from a timeout afterwards.
+//
+// The install line has to work for the user who will RUN it, so it is the
+// profile's installHint (claude's needs no root). Installed-but-invisible is a
+// different problem from not-installed, with a different fix: an installer
+// that puts the binary in ~/.local/bin leaves the PATH edit to the user, and
+// root's login shell does not pick it up — so re-running would loop forever.
 function agentMissingText(harness, workspace, opts = {}) {
-  const codex = harness === 'codex';
-  const bin = codex ? 'codex' : 'claude';
+  const p = profileFor(harness);
+  const bin = binOf(p);
   const here = workspace || '<the workspace folder>';
   const installed = agentAtHome(bin);
   const mode = opts.mode || 'auto';
-  // The consent screen exists only for the skip-permissions launch.
-  const screens = codex || mode === 'bypass'
-    ? '(a theme picker, a login, a trust question about this folder, and a\n'
-      + 'one-time bypass-permissions consent screen that only the launch flag raises):\n'
-    : '(a theme picker, a login, and a trust question about this folder):\n';
+  const screens = typeof p.setupScreens === 'function' ? p.setupScreens(mode) : ':\n';
   const runByHand = 'Then run it once by hand IN THE WORKSPACE — it has setup screens of its own that a spawned\n'
     + 'session cannot answer ' + screens
-    + handRunLine(bin, here, { mode });
+    + handRunLine(p.name, here, { mode });
   if (installed) {
     return '`' + bin + '` is installed at ' + installed + ' but is not on PATH, so neither I nor her\n'
       + 'session can start it. The board is up and her welcome message is on it.\n\n'
@@ -281,85 +269,45 @@ function agentMissingText(harness, workspace, opts = {}) {
       + '  echo \'export PATH="$HOME/.local/bin:$PATH"\' >> ~/.bashrc\n\n'
       + runByHand;
   }
-  const install = codex
-    ? '  npm i -g @openai/codex          # a user-local npm prefix, or an administrator, may be needed'
-    : '  curl -fsSL https://claude.ai/install.sh | bash    # installs to ~/.local/bin — no root needed\n'
-      + '  # It does NOT edit your PATH. Afterwards:\n'
-      + '  export PATH="$HOME/.local/bin:$PATH" && echo \'export PATH="$HOME/.local/bin:$PATH"\' >> ~/.bashrc\n'
-      + '  # (npm i -g @anthropic-ai/claude-code also works, but as a normal user it needs a\n'
-      + '  #  user-local prefix: npm config set prefix ~/.npm-global, and that dir on PATH)';
   return 'the `' + bin + '` CLI is not on PATH, so Bridget has nothing to be a session of.\n'
     + 'The board is up and her welcome message is on it — she just cannot answer yet.\n\n'
     + 'ASK the person for permission, then install it as the user who will run it:\n'
-    + install + '\n\n'
+    + (p.installHint || '  (see the ' + bin + ' documentation)') + '\n\n'
     + runByHand;
 }
 
 // diagnoseSpawn — read the pane, do not guess at it.
 //
 // A spawn failure arrives with the tail of the session's own pane attached, and
-// that tail says exactly what happened. Every branch below is a signature seen
-// in a real container; the fallback is the only place a guess is allowed, and it
-// is labelled as one. Guessing "not installed, or not logged in" at a pane that
-// plainly says something else is how a tester loses an afternoon.
+// that tail says exactly what happened. The profile names what its CLI's
+// screens mean (profile.diagnose); the fallback here is the only place a guess
+// is allowed, and it is labelled as one. Guessing "not installed, or not logged
+// in" at a pane that plainly says something else is how a tester loses an
+// afternoon. opts: { mode, harness }.
 function diagnoseSpawn(text, workspace, opts = {}) {
   const t = String(text || '');
   const tail = (/pane tail:\n([\s\S]*)$/.exec(t) || [, ''])[1].trim();
   const here = workspace || '<the workspace folder>';
   const mode = opts.mode || 'auto';
-  const bypass = mode === 'bypass';
-  const hit = (re, cause, headline, fix) => (re.test(t) ? { cause, headline, fix, tail } : null);
-  // First, because it is the one screen our own launch line raises and the one
-  // no hand-run of plain `claude` can ever clear. Only the bypass launch raises
-  // it, so its recipe is the bypass line whatever the config says now.
-  return hit(/Bypass Permissions mode|Yes, I accept/, 'bypass',
-    'her pane is on Claude Code\'s one-time bypass-permissions consent screen. That warning is\n'
-      + 'raised BY the --dangerously-skip-permissions flag the spawn uses, so running plain `claude`\n'
-      + 'never sees it — and it is not mine to accept for anyone: it is consent to an agent that\n'
-      + 'skips permission prompts on this machine.',
-    'Have the person run the launch line itself, once, and answer 2 (Yes, I accept) — then /exit\n'
-      + 'and run the SAME command again:\n'
-      + handRunLine('claude', here, { mode: 'bypass' }) + '\n'
-      + '(The preselected option on that screen is "No, exit", so it is theirs to answer, not mine.)')
-  || hit(/Quick safety check|trust this folder|Accessing workspace/, 'trust',
-    'her pane is on Claude Code\'s folder-trust question for the workspace — it asks about any\n'
-      + 'directory it has not already trusted, and it comes BEFORE login.',
-    'Trust is inherited from a trusted ancestor, so running `claude` in their home directory MAY\n'
-      + 'have cleared it (a workspace under ~ usually is) — but it may not have. Run it in the\n'
-      + 'workspace itself, answer the question, quit with /exit, then run the SAME command again:\n'
-      + handRunLine('claude', here, { mode })
-      + (bypass ? '\n(The flag is in there so this one sitting also clears the consent screen behind it.)' : ''))
-  || hit(/cannot be used with root\/sudo privileges/, 'root',
-    'claude refuses --dangerously-skip-permissions as root, and exited.',
-    'Do the first run as a normal user (`useradd -m dev && su - dev`), or, on a throwaway box,\n'
-      + 're-run with --allow-root — see the block that command prints before it starts.')
-  || hit(/Choose the text style|run \/theme|Let's get started/, 'setup',
-    'the `claude` CLI has never been run on this machine — her pane is parked on its setup wizard\n'
-      + '(theme picker), which comes BEFORE any login question.',
-    'Run it once by hand IN THE WORKSPACE, answer its questions (there is a folder-trust one about\n'
-      + 'this directory after the theme), quit with /exit, then run the SAME command again:\n'
-      + handRunLine('claude', here, { mode }))
-  || hit(/command not found|ENOENT|not found: claude/, 'missing',
-    'the agent CLI is not installed — the shell answered "command not found".',
-    'Install it and run the SAME command again:\n  npm i -g @anthropic-ai/claude-code')
-  || hit(/\/login|Invalid API key|not authenticated|Please run .*login|Sign in|log in to/i, 'auth',
-    'the `claude` CLI is installed but not logged in — her pane is on its login screen.',
-    'Log in once by hand in the workspace, then run the SAME command again:\n'
-      + '  cd ' + here + ' && claude   (and follow its login)')
-  // The only branch that guesses — and the guess is different depending on
-  // whether there was a pane to read. "Read it above" pointing at nothing is
-  // worse than saying plainly that there was nothing to read.
-  || (tail
+  const p = profileFor(opts.harness);
+  const bin = binOf(p);
+  const hit = typeof p.diagnose === 'function'
+    ? p.diagnose(t, { here, mode, handRun: (m) => handRunLine(p.name, here, { mode: m }) }) : null;
+  if (hit) return Object.assign({}, hit, { tail });
+  // The guess is different depending on whether there was a pane to read.
+  // "Read it above" pointing at nothing is worse than saying plainly that there
+  // was nothing to read.
+  return tail
     ? { cause: 'unknown', tail,
       headline: 'I could not match her pane to anything I know. What it shows is printed above — act on that.',
-      fix: 'If it is a menu or a prompt, it is waiting for a human: run `claude` by hand in the\n'
-        + 'workspace (cd ' + here + ' && claude), get it to a working session, then run the SAME\n'
+      fix: 'If it is a menu or a prompt, it is waiting for a human: run `' + bin + '` by hand in the\n'
+        + 'workspace (cd ' + here + ' && ' + bin + '), get it to a working session, then run the SAME\n'
         + 'command again.' }
     : { cause: 'unknown', tail: '',
       headline: 'her pane was empty — the session left nothing on screen to read.',
-      fix: 'With nothing to go on, the usual causes are the `claude` CLI missing, never run, or not\n'
+      fix: 'With nothing to go on, the usual causes are the `' + bin + '` CLI missing, never run, or not\n'
         + 'logged in. That is a guess, not something this pane showed. Check it by hand:\n'
-        + '  cd ' + here + ' && claude' });
+        + '  cd ' + here + ' && ' + bin };
 }
 
 // portFree — can we bind it? An occupied port is not automatically a problem

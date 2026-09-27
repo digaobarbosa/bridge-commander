@@ -56,36 +56,44 @@ function spawnArgsFile(stateDir, key) {
 // refuses to come back as uid 0) and the permission mode (claude only; a
 // resume that drops it comes back in the default mode). Written as an object;
 // a bare array is the older record's shape and still reads as flags-only.
-function recordSpawnArgs(stateDir, key, opts = {}) {
+function recordSpawnArgs(stateDir, key, opts = {}, envTemplate) {
   const file = spawnArgsFile(stateDir, key);
   try {
     const rec = { args: (opts.extraArgs || []).map(String) };
     if (opts.allowRoot) rec.allowRoot = true;
     if (typeof opts.permissionMode === 'string' && opts.permissionMode) rec.permissionMode = opts.permissionMode;
-    if (rec.args.length || rec.allowRoot || rec.permissionMode) fs.writeFileSync(file, JSON.stringify(rec) + '\n');
+    for (const k of ['model', 'effort']) if (typeof opts[k] === 'string' && opts[k]) rec[k] = opts[k];
+    // Env TEMPLATES only (`${NAME}`, never the value): resume re-expands them.
+    if (envTemplate && Object.keys(envTemplate).length) rec.env = envTemplate;
+    if (rec.args.length || rec.allowRoot || rec.permissionMode || rec.model || rec.effort || rec.env) {
+      fs.writeFileSync(file, JSON.stringify(rec) + '\n');
+    }
     else fs.rmSync(file, { force: true });
   } catch {
     // best-effort: the record is an optimisation, never a precondition
   }
 }
-// -> { args: string[], allowRoot: boolean, permissionMode: string|null }. Missing, unreadable or corrupt
+// -> { args: string[], allowRoot: boolean, permissionMode, model, effort: string|null }. Missing, unreadable or corrupt
 // reads as "nothing extra" and never throws: a resume that cannot read a hint
 // must still resume.
 function recordedSpawnArgs(stateDir, key) {
   try {
     const v = JSON.parse(fs.readFileSync(spawnArgsFile(stateDir, key), 'utf8'));
-    if (Array.isArray(v)) return { args: v.filter((a) => typeof a === 'string'), allowRoot: false, permissionMode: null };
+    if (Array.isArray(v)) return { args: v.filter((a) => typeof a === 'string'), allowRoot: false, permissionMode: null, model: null, effort: null };
     if (v && typeof v === 'object') {
+      const str = (x) => (typeof x === 'string' && x ? x : null);
       return {
         args: Array.isArray(v.args) ? v.args.filter((a) => typeof a === 'string') : [],
         allowRoot: !!v.allowRoot,
-        permissionMode: typeof v.permissionMode === 'string' && v.permissionMode ? v.permissionMode : null,
+        permissionMode: str(v.permissionMode),
+        model: str(v.model),
+        effort: str(v.effort),
       };
     }
   } catch {
     // fall through to the empty record
   }
-  return { args: [], allowRoot: false, permissionMode: null };
+  return { args: [], allowRoot: false, permissionMode: null, model: null, effort: null };
 }
 
 function newSessionName() {

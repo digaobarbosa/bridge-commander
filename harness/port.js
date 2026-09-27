@@ -11,7 +11,10 @@
 //   onTurnEnd(ref, hook, opts?) -> unsubscribe()   turn-boundary detection
 //
 // opts is one bag for spawn, resumable, resume and onTurnEnd: stateDir,
-// callbackUrl, extraArgs, allowRoot, installHooks, session, window. The first
+// callbackUrl, extraArgs, model, effort, allowRoot, installHooks, session,
+// window. model/effort are TYPED options: a profile turns them into its own
+// flags (profile.modelArgs), and one it does not honor is dropped by the
+// caller with a warning — options are best-effort, verbs throw. The first
 // two are plumbing: a server binds them once (getHarness(name, env) /
 // harnessFor(ref, env), see "binding" below) and passes only the rest.
 //
@@ -83,6 +86,7 @@ const BUILTINS = {
 };
 
 const registry = new Map();
+const pluginOf = new Map(); // harness name -> the plugin that contributed or declared it
 
 function validateImpl(name, impl) {
   if (!impl || typeof impl !== 'object') {
@@ -96,11 +100,21 @@ function validateImpl(name, impl) {
   return impl;
 }
 
-function registerHarness(name, impl) {
+// meta.plugin names the plugin that contributed the harness (listHarnesses).
+function registerHarness(name, impl, meta) {
   if (!name || typeof name !== 'string') throw new TypeError('harness name must be a non-empty string');
   registry.set(name, validateImpl(name, impl));
+  if (meta && meta.plugin) pluginOf.set(name, meta.plugin);
   return impl;
 }
+
+function isBuiltin(name) { return Object.prototype.hasOwnProperty.call(BUILTINS, name); }
+// A shipped plugin declares a built-in profile so it is listed with its plugin.
+function tagHarness(name, plugin) { if (plugin) pluginOf.set(name, plugin); }
+
+// The one place the default harness literal lives outside the profiles; a
+// workspace's config.json `harness` overrides it at every call site.
+function defaultHarness() { return 'claude'; }
 
 function lookup(name) {
   if (registry.has(name)) return registry.get(name);
@@ -153,6 +167,55 @@ function getHarness(name, env) {
   return env ? bind(impl, env) : impl;
 }
 
+// profileInfo(name) -> the profile's data (options, permission modes,
+// requirements, install hint, context windows), or null for an impl that
+// offers none.
+function profileInfo(name) {
+  const impl = lookup(name);
+  return typeof impl.profileInfo === 'function' ? impl.profileInfo() : null;
+}
+
+// profileOf(name) -> the profile object behind a profile-backed impl, or null.
+// The core calls its behavioural fields (handRunLine, diagnose, detectSelf,
+// skillsDir, installWorkspace, permissions.describe) directly.
+function profileOf(name) {
+  const impl = lookup(name);
+  return impl && impl.profile && typeof impl.profile === 'object' ? impl.profile : null;
+}
+
+// listHarnesses() -> [{name, adapter, plugin?}], sorted. The fake is a test
+// double, so it is listed only where tests run it.
+function listHarnesses() {
+  const withFake = !!(process.env.BC_FAKE_STATE || process.env.BC_LIST_FAKE);
+  const names = [...new Set([...Object.keys(BUILTINS), ...registry.keys()])]
+    .filter((n) => withFake || n !== 'fake').sort();
+  const out = [];
+  for (const name of names) {
+    let info = null;
+    try { info = profileInfo(name); } catch { continue; } // a builtin that cannot load is not offered
+    const e = { name, adapter: (info && info.adapter) || (name === 'fake' ? 'fake' : 'custom') };
+    if (pluginOf.has(name)) e.plugin = pluginOf.get(name);
+    out.push(e);
+  }
+  return out;
+}
+
+// splitOptions(impl, wanted) -> {opts, ignored[]}: the typed options the impl
+// honors (profileInfo().options), and the names of the ones it does not.
+// Empty values are neither.
+function splitOptions(impl, wanted) {
+  const info = impl && typeof impl.profileInfo === 'function' ? impl.profileInfo() : null;
+  const honored = new Set((info && info.options) || []);
+  const opts = {};
+  const ignored = [];
+  for (const [k, v] of Object.entries(wanted || {})) {
+    if (v === undefined || v === null || v === '') continue;
+    if (honored.has(k)) opts[k] = v;
+    else ignored.push(k);
+  }
+  return { opts, ignored };
+}
+
 // isHarnessRef — structural check for a persisted/deserialized ref.
 function isHarnessRef(ref) {
   return !!ref
@@ -172,4 +235,5 @@ function harnessFor(ref, env) {
 }
 
 module.exports = { VERBS, registerHarness, getHarness, isHarnessRef, harnessFor,
+  listHarnesses, defaultHarness, profileInfo, profileOf, splitOptions, isBuiltin, tagHarness,
   keyOf, isSpawnableSession, validatePaneInput, KEY_RE, PANE_INPUT_MAX };

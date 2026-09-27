@@ -281,7 +281,7 @@ test('a fetch that fails says so on the card, at level 1 — not on a stderr nob
 // attributes it cannot work without, and whether a branch is cut. Precedence is
 // explicit CLI flag > frontmatter > config default. Observed through a 'recfake'
 // harness preloaded into the server process (test/recording-harness.js via
-// NODE_OPTIONS) that captures the extraArgs card.start builds — the harness port
+// NODE_OPTIONS) that captures the launch opts card.start builds — the harness port
 // (harness/) itself stays untouched.
 test('playbook frontmatter names the harness and model; an explicit flag still wins', async () => {
   const recFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'bc-rec-')), 'extraargs.json');
@@ -290,7 +290,7 @@ test('playbook frontmatter names the harness and model; an explicit flag still w
     NODE_OPTIONS: '--require ' + preload,
     BC_REC_EXTRAARGS: recFile,
   });
-  const readExtra = () => JSON.parse(fs.readFileSync(recFile, 'utf8')).extraArgs;
+  const readModel = () => JSON.parse(fs.readFileSync(recFile, 'utf8')).model;
   const clearExtra = () => { try { fs.unlinkSync(recFile); } catch (e) {} };
   try {
     writePlaybook(s, 'runs-on-recfake', [
@@ -298,15 +298,15 @@ test('playbook frontmatter names the harness and model; an explicit flag still w
     ].join('\n'));
 
     // (a) no flags: the template decides. recfake is reachable ONLY through the
-    // frontmatter here, so its extraArgs file being written proves the harness
-    // key fired; the --model proves the model key fired.
+    // frontmatter here, so its record being written proves the harness key
+    // fired; the typed model proves the model key fired.
     await s.api('POST', '/api/cards', withOwner({
       title: 'FM A', id: 'fm-a', playbook: 'runs-on-recfake', attributes: { repo: 'proj' },
     }));
     clearExtra();
     let r = await s.api('POST', '/api/cards/fm-a/start', {});
     assert.strictEqual(r.status, 200, JSON.stringify(r.body));
-    assert.deepStrictEqual(readExtra(), ['--model', 'template-model']);
+    assert.strictEqual(readModel(), 'template-model');
 
     // (b) explicit --model overrides the template's model
     await s.api('POST', '/api/cards', withOwner({
@@ -315,10 +315,10 @@ test('playbook frontmatter names the harness and model; an explicit flag still w
     clearExtra();
     r = await s.api('POST', '/api/cards/fm-b/start', { model: 'cli-model' });
     assert.strictEqual(r.status, 200, JSON.stringify(r.body));
-    assert.deepStrictEqual(readExtra(), ['--model', 'cli-model']);
+    assert.strictEqual(readModel(), 'cli-model');
 
     // (c) explicit --harness overrides the template's harness: the plain 'fake'
-    // never writes the extraArgs file, so its absence is the proof.
+    // never writes the record, so its absence is the proof.
     await s.api('POST', '/api/cards', withOwner({
       title: 'FM C', id: 'fm-c', playbook: 'runs-on-recfake', attributes: { repo: 'proj' },
     }));

@@ -195,8 +195,11 @@ async function spawn(cwd, prompt, opts = {}) {
   if (marker) {
     // stateDir rides along so a watching test can verify what dir the caller
     // plumbed through the port (the fake itself never writes state there).
+    // The typed options too, so a server test can see which ones reached it.
+    const typed = {};
+    for (const k of ['model', 'effort']) if (opts[k]) typed[k] = opts[k];
     fs.writeFileSync(marker,
-      JSON.stringify({ cwd, resumeId, prompt, stateDir: opts.stateDir || null }, null, 2) + '\n');
+      JSON.stringify(Object.assign({ cwd, resumeId, prompt, stateDir: opts.stateDir || null }, typed), null, 2) + '\n');
   }
   if (opts.stateDir) {
     fs.mkdirSync(opts.stateDir, { recursive: true });
@@ -435,7 +438,16 @@ function reset() {
   sessions.clear();
 }
 
-const impl = { spawn, send, alive, resumable, resume, onTurnEnd, kill, adoptWindow, brief, transcript, reset };
+// profileInfo — the fake honors both typed options unless BC_FAKE_OPTIONS
+// names fewer ('' = none), which is how a server test gets an option dropped.
+function profileInfo() {
+  const raw = process.env.BC_FAKE_OPTIONS;
+  const options = raw === undefined ? ['model', 'effort'] : raw.split(',').map((x) => x.trim()).filter(Boolean);
+  return { name: 'fake', adapter: 'fake', options, permissionModes: [],
+    requirements: { bins: [], tmux: false, rootBypass: false }, installHint: '', contextWindows: [] };
+}
+
+const impl = { spawn, send, alive, resumable, resume, onTurnEnd, kill, adoptWindow, brief, transcript, reset, profileInfo };
 // Pane verbs are OPTIONAL by contract; BC_FAKE_NO_PANE simulates a harness
 // that never implemented them (capability-absent degradation under test).
 if (!process.env.BC_FAKE_NO_PANE) {

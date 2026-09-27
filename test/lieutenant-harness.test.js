@@ -7,8 +7,8 @@
 // Fake harnesses stand in for claude and codex: the builtin `fake`, plus
 // `recfake` and `recfake2` (test/recording-harness.js, preloaded into the
 // SERVER process via NODE_OPTIONS) — the same fake plus a JSONL log of every
-// spawn/resume and the extraArgs it was handed, which is how --model is
-// observed. Two of them, because a switch needs somewhere observable to go.
+// spawn/resume and the opts it was handed, which is how the typed model
+// option is observed. Two of them, because a switch needs somewhere observable to go.
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
@@ -145,7 +145,7 @@ test('an unknown harness is refused before the live session is touched', async (
   } finally { await b.teardown(); }
 });
 
-test('the model is stored, rides --model on the switch spawn, and clears with null', async () => {
+test('the model is stored, rides the typed model option on the switch spawn, and clears with null', async () => {
   const b = await boot({ seed: (dir, fdir) => fakeSession(fdir, 'bc-lt-ada:lt') });
   try {
     // model alone: stored, nothing relaunched — it applies to the next launch
@@ -157,7 +157,7 @@ test('the model is stored, rides --model on the switch spawn, and clears with nu
     // and it is on the very next spawn, which here is the harness switch
     r = await b.s.api('PATCH', '/api/lieutenants/ada', { harness: 'recfake' });
     assert.strictEqual(r.status, 200, JSON.stringify(r.body));
-    assert.deepStrictEqual(b.launches().map((l) => l.extraArgs), [['--model', 'gpt-6-astra']]);
+    assert.deepStrictEqual(b.launches().map((l) => l.model), ['gpt-6-astra']);
     const ev = (await b.s.api('GET', '/api/board')).body.events.find((e) => e.kind === 'harness-switch');
     assert.match(ev.text, /moved to recfake:gpt-6-astra/, 'the event names the model it moved onto');
 
@@ -165,10 +165,28 @@ test('the model is stored, rides --model on the switch spawn, and clears with nu
     r = await b.s.api('PATCH', '/api/lieutenants/ada', { model: null });
     assert.strictEqual(r.status, 200, JSON.stringify(r.body));
     assert.strictEqual((await b.lt()).model, undefined);
-    // …proved by the next launch carrying no --model at all
+    // …proved by the next launch carrying no model at all
     r = await b.s.api('PATCH', '/api/lieutenants/ada', { harness: 'recfake2' });
     assert.strictEqual(r.status, 200, JSON.stringify(r.body));
-    assert.deepStrictEqual(b.launches().map((l) => l.extraArgs), [['--model', 'gpt-6-astra'], []]);
+    assert.deepStrictEqual(b.launches().map((l) => l.model), ['gpt-6-astra', null]);
+  } finally { await b.teardown(); }
+});
+
+// A harness that cannot take a model still gets the lieutenant: the option is
+// dropped, the board says so once, and the pin stays for a harness that can.
+test('a pinned model the new harness does not honor is dropped with a board warning', async () => {
+  const b = await boot({
+    lieutenant: LT_ADA({ model: 'gpt-6-astra' }),
+    env: { BC_FAKE_OPTIONS: '' },
+    seed: (dir, fdir) => fakeSession(fdir, 'bc-lt-ada:lt'),
+  });
+  try {
+    const r = await b.s.api('PATCH', '/api/lieutenants/ada', { harness: 'recfake' });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+    assert.deepStrictEqual(b.launches().map((l) => l.model), [null], 'no model reached the spawn');
+    const warns = (await b.s.api('GET', '/api/board')).body.events.filter((e) => e.kind === 'option-ignored');
+    assert.deepStrictEqual(warns.map((e) => e.text), ['lieutenant Ada: recfake does not support model; started without it']);
+    assert.strictEqual((await b.lt()).model, 'gpt-6-astra', 'the pin survives for a harness that can take it');
   } finally { await b.teardown(); }
 });
 
@@ -202,7 +220,7 @@ test('the model survives a supervisor respawn', async () => {
     });
     const seen = b.launches();
     assert.ok(seen.length >= 1, 'the supervisor relaunched it');
-    assert.deepStrictEqual(seen[0].extraArgs, ['--model', 'gpt-6-astra']);
+    assert.strictEqual(seen[0].model, 'gpt-6-astra');
     assert.strictEqual((await b.lt()).model, 'gpt-6-astra', 'and the pin outlives the session that had it');
   } finally { await b.teardown(); }
 });
@@ -252,7 +270,7 @@ test('bc-axi lieutenant patch moves the harness and pins the model; list shows b
     assert.strictEqual(r.code, 0, r.stderr);
     assert.match(r.stdout, /harness=recfake model=gpt-6-astra/);
     assert.match(r.stdout, /respawned on recfake — session bc-lt-ada/);
-    assert.deepStrictEqual(b.launches().map((l) => l.extraArgs), [['--model', 'gpt-6-astra']],
+    assert.deepStrictEqual(b.launches().map((l) => l.model), ['gpt-6-astra'],
       'the model set in the same call is on the spawn the switch performs');
 
     r = await cli('lieutenant', 'list');
@@ -274,7 +292,7 @@ test('bc-axi lieutenant patch with nothing to change prints the usage', async ()
   try {
     const r = await runCli(['lieutenant', 'patch', 'ada', '--workspace', b.s.dir]);
     assert.notStrictEqual(r.code, 0);
-    assert.match(r.stderr, /--harness claude\|codex/);
+    assert.match(r.stderr, /--harness h/);
     assert.match(r.stderr, /--model m\|none/);
   } finally { await b.teardown(); }
 });

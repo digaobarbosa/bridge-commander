@@ -6,7 +6,7 @@
 // is true of "an agent TUI in a tmux pane" lives here, once.
 //
 // Profile shape:
-//   name                         'claude' | 'codex' — the ref's `harness`
+//   name                         'claude' | 'codex' | a derived name — the ref's `harness`
 //   settle                       { trustRe, resumeRe?, readyRe, fatalRe, declineRe?, label } (tmux-session.js)
 //   idAtBirth() -> string|undefined
 //                                the resume id known before launch (claude mints
@@ -24,9 +24,15 @@
 //                                the profile's commands beyond the shared trio
 //   handlers?                    { '/name': (ref, line, opts) -> reply } — emulated commands
 //   passthrough?                 extra names typed literally into the session
+//   modelArgs?({model, effort}) -> argv   the profile's own flags for the typed options
+//   options?                     the typed options it honors (['model', 'effort'])
+//   env?                         { NAME: '${VAR}' | literal } — expanded at every
+//                                launch into <stateDir>/<key>.env (mode 0600)
+//   permissions?, requirements?, installHint?, contextWindows?  data for profileInfo()
 //
-// ctx = { opts, stateDir, key, callbackUrl, resumeId, extra, allowRoot, permissionMode }:
-// `extra` is the already shell-quoted extra flags, `allowRoot` the caller's
+// ctx = { opts, stateDir, key, callbackUrl, resumeId, extra, allowRoot, permissionMode, model, effort }:
+// `extra` is the already shell-quoted extra flags (the typed options' flags
+// included), `allowRoot` the caller's
 // consent, `permissionMode` the caller's mode (undefined = the profile's
 // default; codex ignores it) — on resume all three are replayed from the
 // spawn's record, and opts wins over it.
@@ -36,6 +42,7 @@ const path = require('node:path');
 const t = require('./tmux.js');
 const s = require('./tmux-session.js');
 const { SLASH_COMMANDS, runSlashCommand } = require('./agent-status.js');
+const { expandEnv, envSources } = require('./profiles.js');
 
 function submitOpts() {
   return {
@@ -67,6 +74,30 @@ function promptFile(stateDir, key) {
 function tmuxAdapter(profile) {
   const callbackOf = (opts) => opts.callbackUrl || process.env.BC_TURNEND_URL || '';
   const quote = (args) => args.map((a) => s.shellQuote(String(a))).join(' ');
+  const envTemplate = profile.env && Object.keys(profile.env).length ? profile.env : null;
+  const typedArgs = (model, effort) => (profile.modelArgs && (model || effort)
+    ? profile.modelArgs({ model: model || undefined, effort: effort || undefined }) : []);
+
+  // withEnv(line, stateDir, key) — a profile with env gets its values through
+  // a 0600 file the launch sources, so a secret never rides argv, the typed
+  // launch line or spawn-args. The subshell keeps them out of the pane's own
+  // shell; `exec env` keeps the CLI the pane's foreground command.
+  function withEnv(line, stateDir, key) {
+    const file = path.join(stateDir, `${key}.env`);
+    if (!envTemplate) {
+      fs.rmSync(file, { force: true });
+      return line;
+    }
+    const { env, missing } = expandEnv(envTemplate, envSources(profile.secretsFile));
+    if (missing.length) {
+      throw new Error(`${profile.name}: missing ${missing.map((m) => '${' + m + '}').join(', ')} — export it for the server`
+        + (profile.secretsFile ? ` or add it to ${profile.secretsFile}` : ''));
+    }
+    const body = Object.entries(env).map(([k, v]) => `${k}=${s.shellQuote(v)}`).join('\n') + '\n';
+    fs.writeFileSync(file, body, { mode: 0o600 });
+    fs.chmodSync(file, 0o600); // mode only applies when the file is created
+    return `( set -a; . ${s.shellQuote(file)}; set +a; exec env ${line} )`;
+  }
 
   // deliverPrompt — the brief goes into the settled composer via verified
   // submit, never argv: a prompt in argv is visible to `ps` for the session's
@@ -93,9 +124,10 @@ function tmuxAdapter(profile) {
     const key = s.stateKey(session, window);
     const ctx = {
       opts, stateDir, key, callbackUrl: callbackOf(opts), resumeId: profile.idAtBirth(),
-      extra: quote(opts.extraArgs || []), allowRoot: !!opts.allowRoot,
-      permissionMode: opts.permissionMode || undefined,
+      extra: quote((opts.extraArgs || []).concat(typedArgs(opts.model, opts.effort))), allowRoot: !!opts.allowRoot,
+      permissionMode: opts.permissionMode || undefined, model: opts.model || undefined, effort: opts.effort || undefined,
     };
+    const launchLine = withEnv(profile.launch(ctx), stateDir, key);
     if (profile.prepare) await profile.prepare(cwdAbs, key, ctx);
 
     const briefFile = promptFile(stateDir, key);
@@ -103,12 +135,12 @@ function tmuxAdapter(profile) {
     // Recorded so resume() can replay them — a worker pinned to a model by its
     // playbook must not come back on the default one, nor a worker born asking
     // permission come back skipping it.
-    s.recordSpawnArgs(stateDir, key, opts);
+    s.recordSpawnArgs(stateDir, key, opts, envTemplate);
 
     const target = s.paneTarget(session, window);
     await s.createPane(session, window, cwdAbs);
     try {
-      await s.launchAndSettle(target, profile.launch(ctx), profile.settle);
+      await s.launchAndSettle(target, launchLine, profile.settle);
       await deliverPrompt(target, prompt);
       // Returning claims a session is here. A settle can match a modal's own
       // wording, so look once more after the brief.
@@ -162,17 +194,22 @@ function tmuxAdapter(profile) {
     // The spawn's launch facts are replayed, not rebuilt; opts wins over the
     // record, and a missing or corrupt record is no flags, never a throw.
     const rec = s.recordedSpawnArgs(stateDir, key);
+    const model = opts.model || rec.model || undefined;
+    const effort = opts.effort || rec.effort || undefined;
     const ctx = {
       opts, stateDir, key, callbackUrl: callbackOf(opts), resumeId,
-      extra: quote(opts.extraArgs || rec.args), allowRoot: !!(opts.allowRoot || rec.allowRoot),
-      permissionMode: opts.permissionMode || rec.permissionMode || undefined,
+      extra: quote((opts.extraArgs || rec.args).concat(typedArgs(model, effort))),
+      allowRoot: !!(opts.allowRoot || rec.allowRoot),
+      permissionMode: opts.permissionMode || rec.permissionMode || undefined, model, effort,
     };
+    // Re-expanded from the profile, never from a record: a rotated key lands on the next resume.
+    const launchLine = withEnv(profile.resumeLaunch(resumeId, ctx), stateDir, key);
     await s.killPane(ref.session, ref.window); // clear any dead pane still holding the name
     if (profile.prepare) await profile.prepare(ref.cwd, key, ctx);
     const target = s.paneTarget(ref.session, ref.window);
     await s.createPane(ref.session, ref.window, ref.cwd);
     try {
-      await s.launchAndSettle(target, profile.resumeLaunch(resumeId, ctx), profile.settle);
+      await s.launchAndSettle(target, launchLine, profile.settle);
       await s.verifyLive(target, profile.settle);
     } catch (err) {
       await s.killPane(ref.session, ref.window);
@@ -203,7 +240,21 @@ function tmuxAdapter(profile) {
 
   /** status(ref, opts?) -> status | null — read from files the CLI already writes. */
   async function status(ref, opts = {}) {
-    return profile.status(ref, { opts, stateDir: s.stateDirOf(opts) });
+    return profile.status(ref, { opts, stateDir: s.stateDirOf(opts), profile });
+  }
+
+  /** profileInfo() -> the profile's data, for the core to read without naming a CLI. */
+  function profileInfo() {
+    const req = profile.requirements || {};
+    return {
+      name: profile.name,
+      adapter: 'tmux',
+      options: profile.modelArgs ? (profile.options || ['model', 'effort']).slice() : [],
+      permissionModes: ((profile.permissions && profile.permissions.modes) || []).slice(),
+      requirements: { bins: (req.bins || []).slice(), tmux: req.tmux !== false, rootBypass: !!req.rootBypass },
+      installHint: profile.installHint || '',
+      contextWindows: (profile.contextWindows || []).map((p) => p.slice()),
+    };
   }
 
   /** runCommand(ref, line, opts?) -> reply text — /help, /status, the profile's handlers, then pass-through. */
@@ -222,7 +273,9 @@ function tmuxAdapter(profile) {
     onTurnEnd: s.onTurnEnd,
     openPane: s.openPane, paneSnapshot: s.paneSnapshot, paneInput: s.paneInput,
     adoptWindow: s.adoptWindow, panePids: s.panePids,
-    commands, runCommand, status, brief,
+    commands, runCommand, status, brief, profileInfo,
+    // The profile's behaviour (handRunLine, diagnose, detectSelf, …) for port.profileOf.
+    profile,
   };
 }
 

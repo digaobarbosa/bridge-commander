@@ -1,25 +1,36 @@
 'use strict';
 // Board permission approvals — the server half. A PermissionRequest hook
-// (harness/permission-hook.js) POSTs what Claude Code is about to ask, and
+// (harness/permission-hook.js) POSTs what an agent is about to ask, and
 // its HTTP request IS the question: we hold the response open until the
 // captain decides, the cap runs out, or the hook goes away. Nothing here is
 // persisted — a held request cannot outlive the process that holds it.
 
-// The launch modes config.json may name. Anything else reads as the default:
-// a typo must not turn into a flag claude refuses to start on.
-const PERMISSION_MODES = ['auto', 'default', 'acceptEdits', 'bypass'];
-function permissionMode(v) { return PERMISSION_MODES.includes(v) ? v : 'auto'; }
+// Which launch modes exist, and what a tool's input means, are harness facts
+// (profile.permissions); the core gets them injected and names no tool.
 
-// One line the captain can judge from: the field that carries the risk for
-// the tools that have one, else the input itself, trimmed.
-function summarize(tool, input) {
+// permissionModes(lists) — the union of the harnesses' mode lists, in order,
+// so the default harness's first mode is the board default.
+function permissionModes(lists) {
+  const out = [];
+  for (const l of lists || []) for (const m of l || []) if (typeof m === 'string' && !out.includes(m)) out.push(m);
+  return out;
+}
+
+// permissionMode(v, modes) — v when a harness knows it, else the default. A
+// typo must not turn into a flag a CLI refuses to start on.
+function permissionMode(v, modes) {
+  const list = modes || [];
+  return list.includes(v) ? v : list[0];
+}
+
+// One line the captain can judge from: what the harness's describe() picks
+// (the field that carries the risk), else the input itself, trimmed.
+function summarize(tool, input, describe) {
   const i = input && typeof input === 'object' ? input : {};
-  const pick = (k) => (typeof i[k] === 'string' && i[k].trim() ? i[k].trim() : '');
   let s = '';
-  if (tool === 'Bash') s = pick('command');
-  else if (tool === 'Edit' || tool === 'Write' || tool === 'Read' || tool === 'MultiEdit' || tool === 'NotebookEdit') {
-    s = pick('file_path') || pick('notebook_path');
-  } else if (tool === 'WebFetch') s = pick('url');
+  if (typeof describe === 'function') {
+    try { s = String(describe({ tool_name: tool, tool_input: i }) || ''); } catch (e) { s = ''; }
+  }
   if (!s) { try { s = JSON.stringify(i); } catch (e) { s = ''; } }
   s = s.replace(/\s+/g, ' ');
   return s.length > 200 ? s.slice(0, 199) + '…' : s;
@@ -77,4 +88,4 @@ function createPermissions({ capMs, onChange }) {
   return { hold, decide, list, has };
 }
 
-module.exports = { PERMISSION_MODES, permissionMode, summarize, createPermissions };
+module.exports = { permissionModes, permissionMode, summarize, createPermissions };

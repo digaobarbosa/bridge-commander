@@ -16,6 +16,8 @@ const {
 } = require('../server/playbooks.js');
 const { startServerWithProject, withOwner, runCli, LT } = require('./helper');
 const { lieutenantSession, workerWindow } = require('../server/layout.js');
+// Where the skill is linked is the claude profile's answer, not the core's.
+const skillsDir = (home) => require('../harness/port.js').profileOf('claude').skillsDir(home);
 
 function tmpState(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-playbooks-'));
@@ -270,7 +272,7 @@ test('render() substitutes only what it was given, and leaves the rest alone', (
 test('init seeds COPIES of the playbooks and never overwrites one the user edited', () => {
   const dir = tmpState({ 'default.md': 'MY default, do not touch\n' });
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-home-'));
-  const first = seedPlaybooksAndDuties(dir, home);
+  const first = seedPlaybooksAndDuties(dir, [skillsDir(home)]);
   // the edited one is left alone; the rest arrive
   assert.ok(!first.playbooks.includes('default.md'), 'an existing file is not re-seeded');
   assert.ok(first.playbooks.includes('no-mistakes.md'));
@@ -279,7 +281,7 @@ test('init seeds COPIES of the playbooks and never overwrites one the user edite
   assert.ok(!fs.lstatSync(path.join(playbooksDir(dir), 'no-mistakes.md')).isSymbolicLink());
 
   // idempotent — a re-run (an upgrade, a second init) copies nothing
-  assert.deepStrictEqual(seedPlaybooksAndDuties(dir, home).playbooks, []);
+  assert.deepStrictEqual(seedPlaybooksAndDuties(dir, [skillsDir(home)]).playbooks, []);
   fs.rmSync(dir, { recursive: true, force: true });
   fs.rmSync(home, { recursive: true, force: true });
 });
@@ -289,7 +291,7 @@ test('init SYMLINKS the worker-duties skill, repoints a stale link, and leaves a
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-home-'));
   const skillDst = path.join(home, '.claude', 'skills', 'bridge-commander-worker');
 
-  const r = seedPlaybooksAndDuties(dir, home);
+  const r = seedPlaybooksAndDuties(dir, [skillsDir(home)]);
   assert.strictEqual(r.skill, skillDst);
   assert.ok(fs.lstatSync(skillDst).isSymbolicLink(), 'a symlink, so an upgrade upgrades the duties');
   assert.strictEqual(fs.readlinkSync(skillDst), PACKAGED_SKILL_DIR);
@@ -297,19 +299,19 @@ test('init SYMLINKS the worker-duties skill, repoints a stale link, and leaves a
   assert.ok(fs.existsSync(path.join(skillDst, 'images.md')), 'the whole skill dir ships, not one file');
 
   // already ours and pointing right: nothing to do
-  assert.strictEqual(seedPlaybooksAndDuties(dir, home).skill, '');
+  assert.strictEqual(seedPlaybooksAndDuties(dir, [skillsDir(home)]).skill, '');
 
   // a link left by an older checkout is repointed at the current one
   fs.unlinkSync(skillDst);
   fs.symlinkSync(path.join(home, 'somewhere-else'), skillDst, 'dir');
-  assert.strictEqual(seedPlaybooksAndDuties(dir, home).skill, skillDst);
+  assert.strictEqual(seedPlaybooksAndDuties(dir, [skillsDir(home)]).skill, skillDst);
   assert.strictEqual(fs.readlinkSync(skillDst), PACKAGED_SKILL_DIR);
 
   // a REAL directory is someone's own install — never clobbered
   fs.unlinkSync(skillDst);
   fs.mkdirSync(skillDst);
   fs.writeFileSync(path.join(skillDst, 'SKILL.md'), 'hand-rolled\n');
-  assert.strictEqual(seedPlaybooksAndDuties(dir, home).skill, '');
+  assert.strictEqual(seedPlaybooksAndDuties(dir, [skillsDir(home)]).skill, '');
   assert.strictEqual(fs.readFileSync(path.join(skillDst, 'SKILL.md'), 'utf8'), 'hand-rolled\n');
 
   fs.rmSync(dir, { recursive: true, force: true });
