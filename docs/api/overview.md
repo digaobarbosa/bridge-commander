@@ -165,6 +165,9 @@ actor strings are honor-system. The network boundary is the auth boundary.
 The server speaks ONLY this port. Builtins: `claude`, `codex` (OpenAI Codex CLI) and a
 file-backed `fake` for tests; adding a harness is implementing these seven verbs, nothing
 else. A verb a harness cannot honor THROWS with the reason — never silently succeeds.
+**A harness is an adapter family + a profile; plugins contribute profiles; options are
+best-effort, verbs throw** — `opts.model`/`opts.effort` a profile does not honor are dropped
+with a timeline warning and the agent starts without them (`harness/README.md`).
 Harness working state (session ids, prompts, turn-end logs) lives in the workspace's
 `.bridge-commander/harness/` — never global; spawned session names are unique per workspace.
 The server BINDS the port to that dir and its turn-end callback URL once
@@ -189,6 +192,7 @@ session status, window adoption, the brief file, pane pids):
 | `harness.status` | `ref → {model, contextUsed, contextWindow, rateLimits?}` | ⚙️ | session vitals; the server caches the result at each turn-end and serves it on the board payload (the lane/card context bars) |
 | `harness.adoptWindow` | `ref, window, taken? → HarnessRef\|null` | ⚙️ supervision | migrate a session-granular ref to window granularity without restarting the agent — the tmux adapters rename the session's first window (the lieutenants registered before their ref carried a window) — `taken` names windows that belong to someone else and must never be adopted; `null` = the agent's window cannot be identified, keep the old ref |
 | `harness.brief` | `ref → path\|null` | ⚙️ card.start | the file the brief was persisted to at spawn, attached to the card as its `brief` artifact on start and resume (deduped by uri); `null` = none, nothing attached |
+| `harness.profileInfo` | `→ {name, adapter, options, permissionModes, requirements, installHint, contextWindows}` | ⚙️ · `bc-axi init` | the profile's DATA, so the core reads a CLI's facts without naming it: the typed options it honors, its permission modes, what it needs on the machine (`bins`, `tmux`, `rootBypass`), its install line and context windows. Not an opts verb, so a binding passes it through; a harness without it honors no typed option |
 | `harness.panePids` | `ref\|session → [{window, pid}]` | ⚙️ sysload | every pane of the ref's SESSION (all windows), so the load panel can attribute each window to its agent; `[]` when the session is gone. A harness without it has no load rows |
 
 ## Invariants

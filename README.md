@@ -47,10 +47,17 @@ Per-workspace config lives in `.bridge-commander/config.json`:
 |---|---|---|
 | `port` | `4780` | server port (also `--port N` on `init`/`open`) |
 | `host` | `127.0.0.1` | bind address — see network exposure below |
-| `harness` | `claude` | default agent harness (`claude` \| `codex`) |
+| `harness` | `claude` | default agent harness: a built-in (`claude` \| `codex`) or a profile a plugin contributes (`plugins/deepseek`) |
 | `permissionMode` | `auto` | how agents launch: `auto` \| `default` \| `acceptEdits` \| `bypass`. Outside `bypass`, a prompt an agent would show lands on the board for you to approve or deny |
 | `voices` | — | UI text-to-speech voice filter |
 | `tts` | — | speak agent messages through an external TTS engine: `{"url": "http://127.0.0.1:8883", "lang": "pt", "voice": null, "params": {}}` (voxbench API). Absent = the board stays silent. The **server** reaches the engine: the browser talks to `/api/tts/*` on the board's own origin and the url only has to be reachable from the machine running the server (no CORS, no tailnet on the phone) |
+
+Two more files in `.bridge-commander/` shape the harnesses:
+
+| File | Meaning |
+|---|---|
+| `plugins.json` | the plugin overlay: `{"plugins": {"deepseek": {"enabled": true}}, "contributions": {"profile:codex": {"enabled": false}}}` turns a plugin, or one of its contributions, on or off. Shipped plugins live in `plugins/<id>/`; a workspace's own in `.bridge-commander/plugins/<id>/` replaces a shipped one of the same id. Read at server start |
+| `secrets.env` | `KEY=value` lines a profile's `env` may reference as `${KEY}` (the server's own environment wins). `bc-axi init` already keeps `.bridge-commander/` out of git. Values reach the agent through a mode-0600 file its launch sources — never argv, the tmux launch line or `spawn-args` |
 
 Per-browser settings live in the board's ⚙️ menu, not here. One of them, **terminal**, adds a ⌨
 to the 👁 drawer that opens the agent's tmux session in a real terminal: `iTerm2 (macOS)` hands an
