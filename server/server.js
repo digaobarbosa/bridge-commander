@@ -87,6 +87,8 @@ const gitrev = require(path.join(__dirname, 'gitrev.js'));
 const { makeProxy, engineUrl } = require(path.join(__dirname, 'proxy.js'));
 const { createFileGate } = require(path.join(__dirname, 'filegate.js'));
 const { createClock } = require(path.join(__dirname, 'clock.js'));
+const { createWatchers } = require(path.join(__dirname, 'watchers.js'));
+const { createPrWatch } = require(path.join(__dirname, 'prwatch.js'));
 const { createConversation, parseTarget, CAPTAIN } = require(path.join(__dirname, 'conversation.js'));
 const { permissionMode, summarize, createPermissions } = require(path.join(__dirname, 'permissions.js'));
 const { readJsonl, sealJsonl } = require(path.join(__dirname, 'jsonl.js'));
@@ -2478,101 +2480,97 @@ function planStart(card, body, project) {
 const SUPERVISE_MS = process.env.BC_SUPERVISE_INTERVAL_MS !== undefined
   ? parseInt(process.env.BC_SUPERVISE_INTERVAL_MS, 10) : 30000;
 const respawnAttempts = new Map(); // lieutenant id -> consecutive failed respawns
-let supervising = false;
+// One skeleton for every periodic job (guard, catch, unref). Kept in a const so
+// the plugin host can hand it to plugins as ctx.watchers.
+const watchers = createWatchers({ log: (msg) => console.error(now() + ' ' + msg) });
 async function superviseTick() {
-  if (supervising) return; // never overlap ticks
-  supervising = true;
-  try {
-    let changed = false;
-    for (const lt of board.lieutenants) {
-      if (!isHarnessRef(lt.ref)) continue;
-      let impl = null;
-      try { impl = harnessFor(lt.ref); } catch (e) { impl = null; }
-      // A lieutenant's session is shared with its worker windows, so its ref
-      // must name its own window (names.LIEUTENANT_WINDOW) — a session-granular
-      // one would kill every worker on revive and read liveness off whichever
-      // window has focus. Refs registered before that (founders, older boards)
-      // are migrated here, in place: the running lieutenant is renamed into its
-      // window, never restarted. Best-effort — a tick on the old ref is fine.
-      if (impl && !lt.ref.window && typeof impl.adoptWindow === 'function') {
-        try {
-          const taken = board.workers
-            .filter((w) => w.ref.session === lt.ref.session && w.ref.window)
-            .map((w) => w.ref.window);
-          const ref = await impl.adoptWindow(lt.ref, names.LIEUTENANT_WINDOW, taken);
-          if (ref) { lt.ref = ref; changed = true; }
-        } catch (e) { /* keep the old ref; the next tick tries again */ }
-      }
-      // /reset is restarting this lieutenant right now: between its kill and
-      // its spawn it is legitimately down, and respawning here would race that
-      // spawn for the same pane.
-      if (cyclingLieutenants.has(lt.id)) continue;
-      let up = false;
-      try { up = impl ? await impl.alive(lt.ref) : false; } catch (e) { up = false; }
-      if (up) {
-        respawnAttempts.delete(lt.id);
-        // Alive but possibly deaf: a wake that landed in a busy pane never
-        // became a turn, yet was recorded as sent. Re-run scheduleWake — it
-        // no-ops while the last nudge is within WAKE_TTL_MS or nothing is
-        // pending, so only a genuinely stuck wake re-fires.
-        if (pendingItems(lt.id).length) scheduleWake(lt.id);
-        continue;
-      }
-      // Asked again on the way out: the kill can land DURING the alive()
-      // round-trip, so a tick that passed the check above still gets down=true
-      // from a lieutenant /reset is legitimately restarting.
-      if (cyclingLieutenants.has(lt.id)) continue;
-      const n = (respawnAttempts.get(lt.id) || 0) + 1;
-      if (n > 3) continue; // already flagged needs-captain; a manual revival resets via alive
-      respawnAttempts.set(lt.id, n);
+  let changed = false;
+  for (const lt of board.lieutenants) {
+    if (!isHarnessRef(lt.ref)) continue;
+    let impl = null;
+    try { impl = harnessFor(lt.ref); } catch (e) { impl = null; }
+    // A lieutenant's session is shared with its worker windows, so its ref
+    // must name its own window (names.LIEUTENANT_WINDOW) — a session-granular
+    // one would kill every worker on revive and read liveness off whichever
+    // window has focus. Refs registered before that (founders, older boards)
+    // are migrated here, in place: the running lieutenant is renamed into its
+    // window, never restarted. Best-effort — a tick on the old ref is fine.
+    if (impl && !lt.ref.window && typeof impl.adoptWindow === 'function') {
       try {
-        // Resume when memory is recoverable; else relaunch a fresh session with
-        // charter + owned cards + pending queue as the prompt (the DNA's
-        // auto-respawn side effect) — a bare agent with no context helps nobody.
-        // The model rides both halves: a resume replays the recorded --model,
-        // and passing it explicitly keeps a lieutenant repinned since its last
-        // launch from coming back on the old one.
-        const opts = ltLaunchOpts(lt);
-        let ref;
-        if (await impl.resumable(lt.ref, opts)) {
-          ref = await impl.resume(lt.ref, opts);
-        } else {
-          ref = await respawnFresh(lt); // kills the dead pane, relaunches on the digest prompt
-        }
-        lt.ref = ref;
-        respawnAttempts.delete(lt.id);
+        const taken = board.workers
+          .filter((w) => w.ref.session === lt.ref.session && w.ref.window)
+          .map((w) => w.ref.window);
+        const ref = await impl.adoptWindow(lt.ref, names.LIEUTENANT_WINDOW, taken);
+        if (ref) { lt.ref = ref; changed = true; }
+      } catch (e) { /* keep the old ref; the next tick tries again */ }
+    }
+    // /reset is restarting this lieutenant right now: between its kill and
+    // its spawn it is legitimately down, and respawning here would race that
+    // spawn for the same pane.
+    if (cyclingLieutenants.has(lt.id)) continue;
+    let up = false;
+    try { up = impl ? await impl.alive(lt.ref) : false; } catch (e) { up = false; }
+    if (up) {
+      respawnAttempts.delete(lt.id);
+      // Alive but possibly deaf: a wake that landed in a busy pane never
+      // became a turn, yet was recorded as sent. Re-run scheduleWake — it
+      // no-ops while the last nudge is within WAKE_TTL_MS or nothing is
+      // pending, so only a genuinely stuck wake re-fires.
+      if (pendingItems(lt.id).length) scheduleWake(lt.id);
+      continue;
+    }
+    // Asked again on the way out: the kill can land DURING the alive()
+    // round-trip, so a tick that passed the check above still gets down=true
+    // from a lieutenant /reset is legitimately restarting.
+    if (cyclingLieutenants.has(lt.id)) continue;
+    const n = (respawnAttempts.get(lt.id) || 0) + 1;
+    if (n > 3) continue; // already flagged needs-captain; a manual revival resets via alive
+    respawnAttempts.set(lt.id, n);
+    try {
+      // Resume when memory is recoverable; else relaunch a fresh session with
+      // charter + owned cards + pending queue as the prompt (the DNA's
+      // auto-respawn side effect) — a bare agent with no context helps nobody.
+      // The model rides both halves: a resume replays the recorded --model,
+      // and passing it explicitly keeps a lieutenant repinned since its last
+      // launch from coming back on the old one.
+      const opts = ltLaunchOpts(lt);
+      let ref;
+      if (await impl.resumable(lt.ref, opts)) {
+        ref = await impl.resume(lt.ref, opts);
+      } else {
+        ref = await respawnFresh(lt); // kills the dead pane, relaunches on the digest prompt
+      }
+      lt.ref = ref;
+      respawnAttempts.delete(lt.id);
+      store.boardEvent({
+        text: 'lieutenant ' + lt.name + ' session died — respawned as ' + ref.harness + ':' + ref.session,
+        actor: 'server',
+      }, { kind: 'respawned' });
+      changed = true;
+      delivery.resetNudge(lt.id); // the reincarnated session owes a drain: queue is truth, its memory is a cache
+      if (pendingItems(lt.id).length) scheduleWake(lt.id);
+      else {
+        const target = lt.ref;
+        Promise.resolve()
+          .then(() => harnessFor(target).send(target, '[bridge-commander] session respawned — run: bc-axi drain'))
+          .catch(() => {});
+      }
+    } catch (e) {
+      console.error(now() + ' respawn failed for ' + lt.id + ' (attempt ' + n + '/3): ' + String((e && e.message) || e));
+      if (n === 3) {
         store.boardEvent({
-          text: 'lieutenant ' + lt.name + ' session died — respawned as ' + ref.harness + ':' + ref.session,
+          text: 'lieutenant ' + lt.name + ' is down and 3 respawn attempts failed — needs the captain (session ' + lt.ref.session + ')',
           actor: 'server',
-        }, { kind: 'respawned' });
+        }, { kind: 'needs-captain' });
+        respawnAttempts.set(lt.id, 4);
         changed = true;
-        delivery.resetNudge(lt.id); // the reincarnated session owes a drain: queue is truth, its memory is a cache
-        if (pendingItems(lt.id).length) scheduleWake(lt.id);
-        else {
-          const target = lt.ref;
-          Promise.resolve()
-            .then(() => harnessFor(target).send(target, '[bridge-commander] session respawned — run: bc-axi drain'))
-            .catch(() => {});
-        }
-      } catch (e) {
-        console.error(now() + ' respawn failed for ' + lt.id + ' (attempt ' + n + '/3): ' + String((e && e.message) || e));
-        if (n === 3) {
-          store.boardEvent({
-            text: 'lieutenant ' + lt.name + ' is down and 3 respawn attempts failed — needs the captain (session ' + lt.ref.session + ')',
-            actor: 'server',
-          }, { kind: 'needs-captain' });
-          respawnAttempts.set(lt.id, 4);
-          changed = true;
-        }
       }
     }
-    if (await workers.tick()) changed = true; // died / stalled workers
-    if (changed) store.commit();
-  } finally {
-    supervising = false;
   }
+  if (await workers.tick()) changed = true; // died / stalled workers
+  if (changed) store.commit();
 }
-if (Number.isInteger(SUPERVISE_MS) && SUPERVISE_MS > 0) setInterval(superviseTick, SUPERVISE_MS).unref();
+watchers.register({ id: 'supervise', intervalMs: SUPERVISE_MS, tick: superviseTick });
 
 // ---------- PR watch (F6: merged PR ⇒ archive + release, no agent turn) ----------
 // Every ~2min: for every card whose `prs` attribute holds an open URL, ask gh.
@@ -2583,63 +2581,17 @@ if (Number.isInteger(SUPERVISE_MS) && SUPERVISE_MS > 0) setInterval(superviseTic
 // the state and tell the owner; the card stays. gh failures leave state untouched.
 const PRWATCH_MS = process.env.BC_PRWATCH_INTERVAL_MS !== undefined
   ? parseInt(process.env.BC_PRWATCH_INTERVAL_MS, 10) : 120000;
-const GH_CMD = process.env.BC_GH_CMD || 'gh'; // injectable for tests
-function ghPrState(url) {
-  return new Promise((resolve) => {
-    execFile(GH_CMD, ['pr', 'view', url, '--json', 'state,mergedAt'], { timeout: 30000 }, (err, stdout) => {
-      if (err) return resolve(null);
-      try { resolve(JSON.parse(stdout)); } catch (e) { resolve(null); }
-    });
-  });
-}
-let prWatching = false;
-async function prWatchTick() {
-  if (prWatching) return;
-  prWatching = true;
-  try {
-    for (const card of [...board.cards]) {
-      const prs = card.attributes && card.attributes.prs;
-      if (!Array.isArray(prs) || !prs.some((p) => p && p.state === 'open' && p.url)) continue;
-      const merged = []; // every PR of this card that landed in THIS tick
-      let changed = false;
-      for (const pr of prs) {
-        if (!pr || pr.state !== 'open' || !pr.url) continue;
-        const st = await ghPrState(pr.url);
-        if (!st || !st.state) continue;
-        if (st.state === 'MERGED') { pr.state = 'merged'; merged.push(pr); changed = true; }
-        else if (st.state === 'CLOSED') {
-          pr.state = 'closed';
-          changed = true;
-          store.cardEvent(card, { text: 'PR closed without merge: ' + pr.url, actor: 'server', level: 2 });
-          queuePush(card.owner, { kind: 'pr-closed', card: card.id, text: pr.url });
-        }
-      }
-      if (!changed) continue;
-      // one signal per PR that landed — a stack can flip several between polls
-      for (const pr of merged) {
-        store.cardEvent(card, { text: 'PR merged: ' + pr.url, actor: 'server' }, { kind: 'pr-merged' });
-        queuePush(card.owner, { kind: 'pr-merged', card: card.id, text: pr.url });
-      }
-      // a stack card only finishes when nothing is left open: a partial merge
-      // keeps the card on the board, the worktree alive and the hooks unfired.
-      const anyOpenLeft = prs.some((p) => p && p.state === 'open');
-      if (merged.length && !anyOpenLeft) {
-        // Ended BEFORE the archive, awaited: the release's refusal must ride the
-        // archive note, the one place a merged card's refusal stays readable.
-        const out = await workers.end(card, 'merge');
-        let note = merged.map((p) => p.url).join(' ');
-        if (out.release && !out.release.released) note += ' (worktree NOT released: ' + out.release.reason + ')';
-        // archiveCard stamps the worker's address: a record the kill could not
-        // verify is kept, and the snapshot still names its run.
-        archiveCard(card, { reason: 'merged', note, actor: 'server' }); // landed — the level-1 bell
-      }
-      store.commit();
-    }
-  } finally {
-    prWatching = false;
-  }
-}
-if (Number.isInteger(PRWATCH_MS) && PRWATCH_MS > 0) setInterval(prWatchTick, PRWATCH_MS).unref();
+// The loop lives in server/prwatch.js; the board reaches it only through these.
+const prWatch = createPrWatch({
+  cards: () => board.cards,
+  ghCmd: process.env.BC_GH_CMD || 'gh', // injectable for tests
+  cardEvent: (card, ev, opts) => store.cardEvent(card, ev, opts),
+  queuePush,
+  endWorker: (card, trigger) => workers.end(card, trigger),
+  archiveCard,
+  commit: store.commit,
+});
+watchers.register({ id: 'prwatch', intervalMs: PRWATCH_MS, tick: prWatch.tick });
 
 // ---------- the clock (schedules; server/clock.js runs them) ----------
 // A schedule fires a NAMED hook through `hook run`, and a failed firing lands
