@@ -1,6 +1,16 @@
 # RFC: a plugin system where the built-ins are plugins too
 
-Status: **partly implemented**. Base: `kiss/all` (`1a4e73b`). Built: agent profiles (Slice 1), the plugin host, tracked runs, commands, watchers, checks and the ACP adapter (wave A), and the server wiring — HTTP routes, board payload, lifecycle events, the `bc-axi` plugin verbs (wave B1). The spec for what shipped is [docs/api/overview.md](../api/overview.md) § plugin; the exact shapes are in [plugins-contracts.md](plugins-contracts.md). The UI slots and the view registry are still proposals.
+Status: **implemented** on branch `rfc/plugins` (base `kiss/all` `1a4e73b`). The spec for what shipped is [docs/api/overview.md](../api/overview.md) § plugins; the exact shapes are in [plugins-contracts.md](plugins-contracts.md); how to write one is [docs/examples/plugins/README.md](../examples/plugins/README.md).
+
+| Part | Where | Verified |
+|---|---|---|
+| Manifests, overlay, `when`, fields | `server/manifests.js`, `ui/js/when.js`, `ui/js/fields.js` | unit tests |
+| Agent profiles, DeepSeek derived profile, typed options, leaks out of core | `harness/profiles.js`, `harness/*-tmux.js`, `plugins/{claude,codex,deepseek}` | conformance suite; real Claude Code launched against DeepSeek's API (401 with a dummy key: the env reached it; the key never in `ps` or `spawn-args`) |
+| ACP adapter family + acp-host sidecar | `harness/acp-*.js`, `harness/ACP.md` | real `claude-agent-acp` lieutenant answered on the board chat, survived a BC server restart (same session, no respawn); ACP worker on a card, killed on archive |
+| Plugin host, tracked runs (activities), commands, watchers, checks | `server/plugins.js`, `runs.js`, `commands.js`, `watchers.js`, `checks.js`, `prwatch.js`, `pluginapi.js` | server tests; browser e2e |
+| UI: views registry (`main/v1`), card command table, badges, detail actions/sections, modal, taskbar, plugins settings, topbar, palette, settings sections, sidebar | `ui/js/views.js`, `cardactions.js`, `plugins.js`, `modal.js`, `commandui.js`, `activities.js`, `pluginsettings.js`, `topbar.js`, `palette.js`, `settingstabs.js`, `sidebar.js` | headless-Chromium e2e against the real server (29 + 31 checks), 390px mobile |
+| Shipped plugins | `plugins/{github,local-git,open-in-editor,core-checks}`; examples `docs/examples/plugins/{rfslot,repo-link}` | browser e2e (deploy through a fake `rfslot` on PATH) |
+
 
 ## Why
 
@@ -252,34 +262,32 @@ A **pure card view model** (candidate 3 below) is the prerequisite. The card con
 
 ## Migration of built-ins
 
-| Built-in | Becomes |
-|---|---|
-| claude and codex profiles, fake | agent plugins (Slice 1) |
-| statusline, status readers | part of the claude and codex profiles |
-| PR watch (`gh`) | `github` plugin: a watcher, the "Open on GitHub" command, PR badges |
-| treehouse and git worktrees | worktree-provider plugins |
-| workspace hooks and the schedules UI | a `shell-hooks` plugin; the clock stays kernel |
-| TTS/STT proxies, voice, music, bridge3d | optional plugins (routes + UI) |
-| kanban, table, archive, files, automation, settings | view plugins in `main/v1` |
-| chat | the `sidebar/v1` plugin |
-| init checks | a `core-checks` plugin |
+| Built-in | Became | Status |
+|---|---|---|
+| claude and codex profiles, fake | agent plugins `plugins/claude`, `plugins/codex` (declared, disable-able); fake stays a test harness | done |
+| statusline, status readers | part of the claude and codex profiles | done |
+| PR watch (`gh`) | `github` plugin (boot): the watcher through the internal tier, "Open PR on GitHub", a GitHub detail section. Disabling the plugin stops the PR watch | done |
+| init checks | `core-checks` plugin; `bc-axi init` and boot run them | done |
+| kanban, table, archive, automation (+ file, settings screens) | views in the `main/v1` registry; `view:kanban` can be switched off in the overlay | done |
+| chat | the built-in `sidebar:chat` of `sidebar/v1`; a plugin sidebar replaces it when the overlay disables it | done |
+| treehouse and git worktrees | still `server/worktrees.js` | **not done** — two providers, no third in sight; a seam with no new adapter is speculative |
+| workspace hooks and the schedules UI | still kernel | **not done, on purpose** — `workers.end()` awaits the `card-archived` hooks before the release, so the hook runner is part of the lifecycle ordering, and the DNA keeps plugin events observe-only |
+| TTS/STT proxies, voice, music, bridge3d | still built in | **not done** — moving them buys no new capability; they are the next candidates if a second implementation ever appears |
 
 ## Deepening work this RFC depends on
 
-This comes from an architecture review (deep vs shallow modules, seams, locality). The review first ran on `0ada4c6` and was then re-checked on `kiss/all`. Status is as of `1a4e73b`.
+This comes from an architecture review (deep vs shallow modules, seams, locality). The review first ran on `0ada4c6`, was re-checked on `kiss/all` (`1a4e73b`), and the table below is the state after the implementation.
 
-| # | Deepening | Plugin seam it enables | Status on `kiss/all` | Still open |
-|---|---|---|---|---|
-| 1 | Harness adapter owns all harness knowledge | agent profiles, ACP | **Partial**: `tmuxAdapter(profile)`, one relay, conformance suite, bound port | The leaks and the typed options listed in Slice 1 |
-| 2 | Worker lifecycle | lifecycle events | **Mostly done** (`6e8bc64`): `workers.end(card, trigger)` driven by the `END_OF_LIFE` table; `transition()` as the only flag writer; `createWorkers(deps)` tested in-process | Start and resume still kill fire-and-forget when an archive races them (`workers.js:574`, `:670`). A supervised death flags the worker but leaves its window open (`:903-909`). Hooks fire from 3 places (`workers.js:449`, `:908`, `server.js:3114`), not one emission point |
-| 3 | Pure card view model (`cardview.js`): derived facts, badges, predicates | the `when` context, `card.badges` | **Open**. Only filtering and sorting are shared (`69bf237`: `cardMatches`, `cardSearchText` in `state.js`) | The tile, table row, archive row and detail each derive owed, stale, worker, approval and order on their own. The table has already drifted |
-| 4 | Card command table `{id, label, when, run}` | commands, menus | **Open** | The tile, move menu, detail, bulk bar and table each re-implement their actions. The move menu archives without the refusal pre-check. The bulk move skips the order comment |
-| 5 | Tracked-run module (export `runOne`, trace, run id, streaming, lock key) | activities, the taskbar | **Open** | `runOne` is private (`hooks.js:132`). Teardown is untraced (`hooks.js:562`), which contradicts the trace section of the DNA. The lock is keyed by name. Output is capped at 4 KB and only available at the end |
-| 6 | View registry `{id, btn, label, el, enter, render}` + render listeners | `main/v1` | **Partial** (`359becd`: `ui/js/modes.js`) | `setBoardMode` toggles, `MODE_LABEL` and the if/else dispatch are still in `main.js`. `onRender` is single-slot (`state.js:30`) |
-| 7 | Overlay/popover host | `modal` | **Partial** (`cb4cc4b`: `ui/js/popover.js`, used by 5 menus) | 8 hand-rolled click-away listeners, a 17-branch Escape chain (`main.js:250-267`), a 16-selector exclusion list (`detail.js:132-155`), and 2 hand-rolled viewport clamps |
-| 8 | Watcher module (guard, catch, save policy) | watcher plugins (`github`) | **Partial** (`03eb577`: the schedule tick moved to `clock.js`, with a catch) | `superviseTick` and `prWatchTick` are still copy-pasted in `server.js` with no `catch` |
-
-Suggested order: 1 (Slice 1) → 5 → 3 + 4 → 6 + 7 → 8. Each one is independently shippable.
+| # | Deepening | Status on `rfc/plugins` |
+|---|---|---|
+| 1 | Harness adapter owns all harness knowledge | **Done**: profiles own permissions, model/effort args, requirements, install hints, diagnose, workspace install, skills dir, context windows; `no-cli-names.test.js` pins `server/`, `cli/`, `ui/` |
+| 2 | Worker lifecycle | **Mostly done** (on `kiss/all`); still open: start/resume kill fire-and-forget when an archive races them, a supervised death leaves the window open, hooks fire from 3 places |
+| 3 | Pure card view model | **Done**: `ui/js/cardview.js` (`cardContext`, `cardFacts`); the table's missing ⚠/⏳ fixed |
+| 4 | Card command table | **Done**: `ui/js/cardactions.js`; the move menu's archive refusal fixed |
+| 5 | Tracked-run module | **Done**: `server/runs.js` over the exported `runOne`; teardown traced |
+| 6 | View registry + render listeners | **Done**: `ui/js/views.js`; `onRender` is a listener set |
+| 7 | Overlay/popover host | **Partial**: `modal.js` stacks with `popover.js`; the Escape chain in `main.js` and several click-away listeners are still hand-written |
+| 8 | Watcher module | **Done**: `server/watchers.js`; supervise and the PR watch register through it, with a catch |
 
 ## Open questions
 
