@@ -202,7 +202,7 @@ function harnesses() {
     require(path.join(SELF_DIR, '..', 'harness', 'profiles.js')).loadProfiles({
       profiles: manifests.contributions(manifests.resolveCatalog({
         workspaceDir: path.join(STATE_DIR, 'plugins'), stateDir: STATE_DIR, log })).profiles,
-      stateDir: STATE_DIR, log,
+      stateDir: STATE_DIR, harnessStateDir: harnessStateDir(STATE_DIR), log,
     });
   }
   return port;

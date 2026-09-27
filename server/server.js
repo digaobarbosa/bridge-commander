@@ -290,6 +290,7 @@ function getHarness(name) { return port.getHarness(name, HARNESS_ENV); }
   require(path.join(__dirname, '..', 'harness', 'profiles.js')).loadProfiles({
     profiles: manifests.contributions(catalog).profiles,
     stateDir: STATE_DIR, // where secrets.env lives
+    harnessStateDir: HARNESS_STATE_DIR,
     log,
   });
 }

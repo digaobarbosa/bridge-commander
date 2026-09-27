@@ -157,14 +157,16 @@ function envSources(secretsFile) {
   return [process.env, secretsFile ? readEnvFile(secretsFile) : {}];
 }
 
-function buildAdapter(profile) {
+function buildAdapter(profile, harnessStateDir) {
   if (profile.adapter === 'acp') {
     let mod;
     try { mod = require('./acp-adapter.js'); } catch (e) {
       if (e && e.code === 'MODULE_NOT_FOUND' && /acp-adapter/.test(String(e.message))) fail('acp adapter not available');
       throw e;
     }
-    return mod.acpAdapter(profile);
+    // Handing the ACP family its state dir keeps alive/send/kill after a
+    // restart inside the workspace, not on the global pointer fallback.
+    return mod.acpAdapter(profile, harnessStateDir ? { stateDir: harnessStateDir } : {});
   }
   return require('./tmux-adapter.js').tmuxAdapter(profile);
 }
@@ -179,12 +181,13 @@ function builtinBases() {
 }
 
 /**
- * loadProfiles({profiles, stateDir, log}) -> [{name, plugin, ok, error?}]
+ * loadProfiles({profiles, stateDir, harnessStateDir?, log}) -> [{name, plugin, ok, error?}]
  * `profiles` is contributions(catalog).profiles. `stateDir` is where
- * secrets.env lives (the workspace's .bridge-commander). One bad profile is
+ * secrets.env lives (the workspace's .bridge-commander); `harnessStateDir` is
+ * the bound harness state dir, handed to adapter families that need it (acp). One bad profile is
  * recorded and logged, never fatal.
  */
-function loadProfiles({ profiles, stateDir, log } = {}) {
+function loadProfiles({ profiles, stateDir, harnessStateDir, log } = {}) {
   const say = typeof log === 'function' ? log : () => {};
   const bases = builtinBases();
   const secretsFile = stateDir ? path.join(stateDir, SECRETS_FILE) : '';
@@ -208,7 +211,7 @@ function loadProfiles({ profiles, stateDir, log } = {}) {
       const profile = resolveProfile(json, (n) => bases.get(n));
       profile.plugin = plugin;
       profile.secretsFile = secretsFile;
-      const impl = buildAdapter(profile);
+      const impl = buildAdapter(profile, harnessStateDir);
       if (!impl.profile) impl.profile = profile;
       port.registerHarness(name, impl, { plugin });
       seen.add(name);
