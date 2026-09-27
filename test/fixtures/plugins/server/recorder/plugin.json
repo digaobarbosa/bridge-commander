@@ -17,14 +17,26 @@
       { "id": "recorder.fail", "title": "Fail", "tracked": true, "run": { "exec": "echo about to fail; exit 3" } },
       { "id": "recorder.slow", "title": "Slow", "tracked": true, "run": { "exec": "echo started; sleep 30" } },
       { "id": "recorder.quick", "title": "Quick", "run": { "exec": "echo quick" } },
-      { "id": "recorder.link", "title": "Link", "run": { "open": "https://example.com/c/${card.id}?t=${card.title}" } }
+      { "id": "recorder.link", "title": "Link", "run": { "open": "https://example.com/c/${card.id}?t=${card.title}" } },
+      { "id": "recorder.home", "title": "Home", "icon": "🏠", "run": { "open": "https://example.com/home" } },
+      { "id": "recorder.where", "title": "Where", "run": { "exec": "echo ws ${workspace.name}" } },
+      { "id": "recorder.hello", "title": "Hello", "run": "server", "prepare": "server",
+        "form": { "who": { "type": "string", "default": "nobody" } } },
+      { "id": "recorder.needs-card", "title": "Needs a card", "run": { "exec": "echo ${card.id}" } },
+      { "id": "recorder.review-only", "title": "Review only", "run": { "exec": "echo review" } }
     ],
     "menus": {
       "card.menu/v1": [
         { "command": "recorder.greet", "when": { "card.column": "backlog" } },
         { "command": "recorder.link" }
       ],
-      "detail.actions/v1": [{ "command": "recorder.fail", "when": { "card.labels": "failable" } }]
+      "detail.actions/v1": [{ "command": "recorder.fail", "when": { "card.labels": "failable" } }],
+      "topbar/v1": [{ "command": "recorder.home", "rank": 10 }, { "command": "recorder.where" }],
+      "palette/v1": [
+        { "command": "recorder.hello" },
+        { "command": "recorder.needs-card" },
+        { "command": "recorder.review-only", "when": { "card.column": "review" } }
+      ]
     },
     "checks": [
       { "id": "fine", "phase": "boot", "exec": "echo all fine", "title": "always fine" },

@@ -98,7 +98,7 @@ test('a server command: prepare merges the plugin\'s defaults, run answers its m
   assert.deepStrictEqual(r.body, { ok: true, message: 'hello Ada on greet-1' });
 });
 
-test('run refuses: 403 when no menu `when` matches, 400 on bad input, 404 unknown command or card', async () => {
+test('run refuses: 403 when no menu `when` matches, 400 on bad input, 404 unknown command or card, 403 card-less', async () => {
   await card('greet-2');
   // a lieutenant move lands only in review: out of backlog, the greet menu entry no longer matches
   assert.strictEqual((await s.api('POST', '/api/cards/greet-2/move', { column: 'review' })).status, 200);
@@ -111,7 +111,53 @@ test('run refuses: 403 when no menu `when` matches, 400 on bad input, 404 unknow
   assert.strictEqual(bad.body.field, 'name');
   assert.strictEqual((await s.api('POST', '/api/commands/recorder.nope/run', { card: 'greet-3' })).status, 404);
   assert.strictEqual((await s.api('POST', '/api/commands/recorder.greet/run', { card: 'no-such' })).status, 404);
-  assert.strictEqual((await s.api('POST', '/api/commands/recorder.greet/run', {})).status, 400);
+  // no card = a card-less call, and greet sits on cards only
+  const cardless = await s.api('POST', '/api/commands/recorder.greet/run', { input: { name: 'x' } });
+  assert.strictEqual(cardless.status, 403);
+  assert.match(cardless.body.error, /needs a card/);
+  assert.strictEqual((await s.api('POST', '/api/commands/recorder.greet/run', { card: '  ' })).status, 400);
+});
+
+test('card-less commands: a topbar link, a server handler with card null, an exec in the workspace', async () => {
+  const home = await s.api('POST', '/api/commands/recorder.home/run', {});
+  assert.deepStrictEqual(home.body, { ok: true, url: 'https://example.com/home' });
+  // prepare and run both see card: null
+  const p = await s.api('POST', '/api/commands/recorder.hello/prepare', {});
+  assert.deepStrictEqual(p.body, { values: { who: 'the bridge' } });
+  const r = await s.api('POST', '/api/commands/recorder.hello/run', { input: { who: 'Ada' } });
+  assert.deepStrictEqual(r.body, { ok: true, message: 'hello Ada with no card' });
+  // the same palette command still runs on a card when one is given
+  await card('hello-1');
+  const onCard = await s.api('POST', '/api/commands/recorder.hello/run', { card: 'hello-1', input: { who: 'Bo' } });
+  assert.deepStrictEqual(onCard.body, { ok: true, message: 'hello Bo on hello-1' });
+  // an exec with no card runs in the workspace, and its run names no card
+  const w = await s.api('POST', '/api/commands/recorder.where/run', {});
+  assert.strictEqual(w.status, 200, JSON.stringify(w.body));
+  assert.strictEqual(w.body.run.card, '');
+  const log = await until('where log', async () => {
+    const l = (await s.api('GET', '/api/activities/' + w.body.run.id + '/log')).body;
+    return l && l.done ? l : null;
+  });
+  assert.strictEqual(log.text.trim(), 'ws ' + path.basename(s.dir));
+});
+
+test('card-less refusals: a card template is 422 missing; a card-only or card-`when` command is 403', async () => {
+  const miss = await s.api('POST', '/api/commands/recorder.needs-card/run', {});
+  assert.strictEqual(miss.status, 422);
+  assert.deepStrictEqual(miss.body.missing, ['card.id']);
+  // placed in the palette, but its `when` asks about a card: the empty context fails it
+  const rev = await s.api('POST', '/api/commands/recorder.review-only/run', {});
+  assert.strictEqual(rev.status, 403);
+  // …and on a card in review it runs
+  await card('rev-only-1');
+  assert.strictEqual((await s.api('POST', '/api/cards/rev-only-1/move', { column: 'review' })).status, 200);
+  assert.strictEqual((await s.api('POST', '/api/commands/recorder.review-only/run', { card: 'rev-only-1' })).status, 200);
+  // placed on cards only (card.menu/v1): no card-less run, no card-less prepare
+  assert.strictEqual((await s.api('POST', '/api/commands/recorder.link/run', {})).status, 403);
+  assert.strictEqual((await s.api('POST', '/api/commands/recorder.greet/prepare', {})).status, 403);
+  // the topbar entries reach the browser under their slot
+  const menus = (await s.api('GET', '/api/plugins')).body.contributions.menus;
+  assert.deepStrictEqual(menus['topbar/v1'].map((m) => m.command), ['recorder.home', 'recorder.where']);
 });
 
 test('an open command: the URL, expanded without quoting', async () => {

@@ -26,9 +26,12 @@ const CONTRIBUTION_KINDS = ['profiles', 'commands', 'menus', 'badges', 'views', 
 // Menu slots are versioned: a slot that changes shape gets a new id, and a
 // plugin written for the old one keeps working against the old one or fails
 // loudly — never half-renders.
-const MENU_SLOTS = ['card.menu/v1', 'card.actions/v1', 'detail.actions/v1', 'palette/v1'];
+const MENU_SLOTS = ['card.menu/v1', 'card.actions/v1', 'detail.actions/v1', 'palette/v1', 'topbar/v1'];
+// The slots whose entries can run with no card: a command placed only on
+// cards never runs card-less (pluginapi.js asks this list).
+const CARDLESS_SLOTS = ['topbar/v1', 'palette/v1'];
 const SECTION_SLOTS = ['detail.sections/v1', 'settings.sections/v1'];
-const VIEW_SLOTS = ['main/v1'];
+const VIEW_SLOTS = ['main/v1', 'sidebar/v1'];
 const CHECK_PHASES = ['init', 'boot', 'card-start'];
 const FIELD_TYPES = ['string', 'text', 'number', 'boolean', 'enum'];
 
@@ -307,7 +310,7 @@ function contributions(catalog) {
 }
 
 module.exports = {
-  PLUGIN_ID_RE, OVERLAY_FILE, SHIPPED_DIR, MENU_SLOTS, SECTION_SLOTS, VIEW_SLOTS, CHECK_PHASES, FIELD_TYPES,
+  PLUGIN_ID_RE, OVERLAY_FILE, SHIPPED_DIR, MENU_SLOTS, CARDLESS_SLOTS, SECTION_SLOTS, VIEW_SLOTS, CHECK_PHASES, FIELD_TYPES,
   validateManifest, validateFields, readManifest, discover, readOverlay, writeOverlay,
   effectiveConfig, contributionKey, resolveCatalog, contributions,
 };

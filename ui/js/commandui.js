@@ -9,10 +9,14 @@
 // A tracked run answers with an activity: a toast says so and the activity
 // panel opens on its log.
 //
+// A null card is a card-less run (a topbar button, the palette with no card
+// open): the empty context fills a link, and the posts carry no `card`, which
+// the server allows only for commands placed in topbar/v1 or palette/v1.
+//
 // The server re-checks every `when` before it runs anything; the checks here
 // are for the captain, not for safety.
 import { S, card as cardById, render } from './state.js';
-import { cardContext } from './cardview.js';
+import { cardContext, EMPTY_CONTEXT } from './cardview.js';
 import { command } from './plugins.js';
 import { expandUrl } from './template.js';
 import { validateValues, defaultsFor } from './fields.js';
@@ -31,7 +35,7 @@ export function configureCommands(d) { Object.assign(deps, d); }
 // "cmd|card" pairs posted and not yet answered: the tile and detail buttons
 // draw themselves busy from this, so a double click is one run.
 const busy = new Set();
-export function isBusy(cmdId, cardId) { return busy.has(cmdId + '|' + cardId); }
+export function isBusy(cmdId, cardId) { return busy.has(cmdId + '|' + (cardId || '')); }
 
 /** Which way a command runs: 'open', 'form' or 'run'. Pure. */
 export function commandKind(cmd) {
@@ -47,7 +51,7 @@ async function post(path, body) {
   try { json = await r.json(); } catch (e) { json = null; }
   if (!r.ok || (json && json.ok === false)) {
     const msg = (json && (json.error || json.message)) || 'HTTP ' + r.status;
-    const err = new Error(r.status === 403 ? 'not available for this card: ' + msg : msg);
+    const err = new Error(r.status === 403 ? 'not available here: ' + msg : msg);
     err.status = r.status;
     err.body = json;
     throw err;
@@ -56,27 +60,31 @@ async function post(path, body) {
 }
 const cmdPath = (id, verb) => '/api/commands/' + encodeURIComponent(id) + '/' + verb;
 
+// The body of a prepare/run: a card-less one names no card.
+function bodyFor(c, extra) { return Object.assign(c ? { card: c.id } : {}, extra); }
+
 /**
- * Run command `cmdId` for card `cardId`. Resolves when the command has been
- * handed over (the link opened, the modal shown, or the run answered).
+ * Run command `cmdId` for card `cardId` — or with no card when `cardId` is
+ * null/''. Resolves when the command has been handed over (the link opened,
+ * the modal shown, or the run answered).
  */
 export async function runCommand(cmdId, cardId) {
   const cmd = command(cmdId);
-  const c = cardById(cardId);
-  if (!cmd || !c) { deps.toast('⚠ ' + (cmd ? 'card ' + cardId + ' is gone' : 'command ' + cmdId + ' is not available')); return; }
+  const c = cardId ? cardById(cardId) : null;
+  if (!cmd || (cardId && !c)) { deps.toast('⚠ ' + (cmd ? 'card ' + cardId + ' is gone' : 'command ' + cmdId + ' is not available')); return; }
   const kind = commandKind(cmd);
   if (kind === 'open') {
-    const url = expandUrl(cmd.open, cardContext(c, S.doc));
-    if (!url) { deps.toast('⚠ ' + (cmd.title || cmdId) + ': this card has nothing to open'); return; }
+    const url = expandUrl(cmd.open, c ? cardContext(c, S.doc) : EMPTY_CONTEXT);
+    if (!url) { deps.toast('⚠ ' + (cmd.title || cmdId) + ': ' + (c ? 'this card has nothing to open' : 'it needs a card to open')); return; }
     deps.openUrl(url);
     return;
   }
   if (kind === 'form') return openCommandForm(cmd, c);
-  const key = cmdId + '|' + cardId;
+  const key = cmdId + '|' + (c ? c.id : '');
   if (busy.has(key)) return;
   busy.add(key);
   render();
-  try { finish(cmd, c, await post(cmdPath(cmdId, 'run'), { card: cardId, input: {} })); }
+  try { finish(cmd, c, await post(cmdPath(cmdId, 'run'), bodyFor(c, { input: {} }))); }
   catch (e) { deps.toast('⚠ ' + (cmd.title || cmdId) + ' — ' + e.message); }
   finally { busy.delete(key); render(); }
 }
@@ -84,13 +92,14 @@ export async function runCommand(cmdId, cardId) {
 // What a successful run answered: an activity to follow, a url, a message.
 function finish(cmd, c, res) {
   const act = res.activity && (typeof res.activity === 'string' ? { id: res.activity } : res.activity);
+  const sub = c ? c.title || c.id : '';
   if (act && act.id) {
-    deps.toast((cmd.icon ? cmd.icon + ' ' : '') + (cmd.title || cmd.id) + ' started', c.title || c.id);
+    deps.toast((cmd.icon ? cmd.icon + ' ' : '') + (cmd.title || cmd.id) + ' started', sub);
     deps.openActivity(act.id);
   } else if (res.message) {
-    deps.toast((cmd.icon ? cmd.icon + ' ' : '') + res.message, c.title || c.id);
+    deps.toast((cmd.icon ? cmd.icon + ' ' : '') + res.message, sub);
   } else {
-    deps.toast('✓ ' + (cmd.title || cmd.id), c.title || c.id);
+    deps.toast('✓ ' + (cmd.title || cmd.id), sub);
   }
   if (res.url && /^https?:\/\//i.test(String(res.url))) deps.openUrl(String(res.url));
 }
@@ -102,7 +111,7 @@ function openCommandForm(cmd, c) {
   const fields = cmd.form || {};
   const idPrefix = 'cmd-' + String(cmd.id).replace(/[^A-Za-z0-9_-]/g, '_');
   const title = (cmd.icon ? cmd.icon + ' ' : '') + (cmd.title || cmd.id);
-  const intro = '<div class="bc-cmd-card">' + esc(c.title || c.id) + ' <span class="bc-cmd-id">' + esc(c.id) + '</span></div>' +
+  const intro = (c ? '<div class="bc-cmd-card">' + esc(c.title || c.id) + ' <span class="bc-cmd-id">' + esc(c.id) + '</span></div>' : '') +
     (cmd.description ? '<div class="bc-cmd-desc">' + esc(cmd.description) + '</div>' : '');
   const m = openModal({
     title,
@@ -122,7 +131,7 @@ function openCommandForm(cmd, c) {
   (async () => {
     let values = defaultsFor(fields);
     if (cmd.prepare) {
-      try { values = defaultsFor(fields, (await post(cmdPath(cmd.id, 'prepare'), { card: c.id })).values); }
+      try { values = defaultsFor(fields, (await post(cmdPath(cmd.id, 'prepare'), bodyFor(c, {}))).values); }
       catch (e) { m.setError('could not prefill: ' + e.message); }
     }
     if (m.isOpen()) paint(values);
@@ -147,7 +156,7 @@ function openCommandForm(cmd, c) {
     h.setError('');
     h.setBusy(true, 'running…');
     try {
-      const res = await post(cmdPath(cmd.id, 'run'), { card: c.id, input: v.values });
+      const res = await post(cmdPath(cmd.id, 'run'), bodyFor(c, { input: v.values }));
       h.close();
       finish(cmd, c, res);
     } catch (e) {

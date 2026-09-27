@@ -24,6 +24,11 @@ module.exports = {
       prepare: (req) => ({ name: req.card.title }),
       run: (req) => ({ ok: true, message: ctx.plugin.config.greeting + ' ' + req.input.name + ' on ' + req.card.id }),
     });
+    // card-less: req.card is null when the topbar or the palette runs it
+    ctx.commands.handle('recorder.hello', {
+      prepare: (req) => ({ who: req.card ? req.card.id : 'the bridge' }),
+      run: (req) => ({ ok: true, message: 'hello ' + req.input.who + (req.card ? ' on ' + req.card.id : ' with no card') }),
+    });
     ctx.routes.handle('GET', 'hello', () => ({ hi: true, cards: ctx.api.board().cards.length }));
     ctx.routes.handle('POST', 'echo', (req, res, body) => ({ got: body }));
   },

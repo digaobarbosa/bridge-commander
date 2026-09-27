@@ -38,6 +38,10 @@
        (views.js), in rank order — ▦ kanban, ☰ table, 🧊 archived, ⚡ automation,
        then any plugin view. main.js builds the buttons. -->
   <span id="view-seg" role="group" aria-label="board view"></span>
+  <!-- topbar/v1: plugin command buttons (topbar.js), card-less; hidden while
+       there are none. Then the ⌘ that opens the command palette (palette.js). -->
+  <span id="topbar-cmds" role="group" aria-label="plugin commands" hidden></span>
+  <button id="palette-btn" type="button" title="commands (⌘K / Ctrl+K)" aria-label="command palette">⌘</button>
   <span id="status-dot" title="connecting…"></span>
   <button id="bell" title="notifications">🔔<span id="bell-n" class="badge-n" hidden></span></button>
   <button id="gear" title="settings">⚙️</button>
@@ -112,7 +116,10 @@
 </div>
 
 <main id="layout">
-  <!-- chat: left, full height, always open on desktop -->
+  <!-- chat: left, full height, always open on desktop. It is the built-in
+       filler of the sidebar/v1 slot (sidebar.js): a plugin sidebar gets a
+       .bc-sidebar sibling here and shows instead when the overlay switches
+       `sidebar:chat` off. -->
   <section id="chat">
     <div id="chat-head">
       <button id="chat-back" hidden>←</button>

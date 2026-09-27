@@ -29,6 +29,13 @@ function deepFreeze(o) {
 }
 function clone(v) { return v === undefined ? undefined : JSON.parse(JSON.stringify(v)); }
 
+/**
+ * The context of a card-less command (the topbar, the palette with no card
+ * open). The same shape with nothing in it, so a `when` or a template that
+ * needs a card reads "missing" rather than throwing — here and on the server.
+ */
+export const EMPTY_CONTEXT = deepFreeze({ card: null, project: null, worker: null, harness: null });
+
 // Same card object + same doc = same context: `when` is asked of every card for
 // every contribution on every render, and a board push brings new objects anyway.
 const ctxCache = new WeakMap();

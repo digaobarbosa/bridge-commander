@@ -25,6 +25,10 @@ import { configureCardActions } from './cardactions.js';
 import { configureCommands } from './commandui.js';
 import { initActivities, renderTaskbar, openActivity } from './activities.js';
 import { initPluginSettings, renderPluginSettings } from './pluginsettings.js';
+import { configureSidebar, registerSidebar, renderSidebar, activeSidebar } from './sidebar.js';
+import { initTopbar, renderTopbar } from './topbar.js';
+import { configurePalette, togglePalette } from './palette.js';
+import { initSettingsTabs, syncSettingsTabs, isPluginTab, renderSettingsTab } from './settingstabs.js';
 import { push as toastPush } from './toast.js';
 import { closePane, paneOpen, openCardPane } from './pane.js';
 import { openMonitor, closeMonitor, monitorOpen } from './monitor.js';
@@ -56,6 +60,17 @@ toastOnOpenLieutenant(openLieutenantChat); // card-less chat toast → the lieut
   configureCommands({ openActivity, toast });
   configureCardActions({ openPane: openCardPane, talk: talkOnCard });
   initActivities({ bar: taskbar, openCard: openDetail });
+  initTopbar({ el: document.getElementById('topbar-cmds') });
+  // the palette's context: the card the detail panel shows (not a schedule or a hook)
+  configurePalette({ openCardId: () => (auxDetailKey() ? null : S.openCardId) });
+  document.getElementById('palette-btn').onclick = (e) => { e.stopPropagation(); togglePalette(); };
+  // sidebar/v1: the chat is its built-in filler, registered with its own
+  // element so nothing of it is rebuilt; a plugin sidebar gets a sibling
+  // section and shows when the overlay switches `sidebar:chat` off.
+  const layout = document.getElementById('layout');
+  configureSidebar({ host: layout, before: document.getElementById('board-wrap') });
+  registerSidebar({ id: 'chat', key: 'sidebar:chat', title: 'Chat', icon: '💬', rank: 100,
+    el: document.getElementById('chat'), render: renderChat });
   // the lieutenant harness dropdowns list what the server can run
   const fillHarnesses = () => {
     for (const id of ['lt-harness', 'ls-harness']) {
@@ -154,21 +169,38 @@ document.getElementById('config-open').onclick = () => {
 // the source afresh on the way in), the render loop repaints it without. A new
 // section is a <section data-sec>, a <button data-tab> and one entry here; the
 // switching below never learns its name.
+// A plugin's settings.sections/v1 entry is one more tab after "plugins"
+// (settingstabs.js makes its button and box; `p:<key>` is its tab id).
 const WS_RENDER = { labels: renderLabelManager, playbooks: renderPlaybooks, projects: renderProjects,
   lieutenants: renderLieutenants, plugins: renderPluginSettings };
 let wsTab = 'labels';
+initSettingsTabs({ tabs: document.getElementById('ss-tabs'), screen: document.getElementById('settings-screen') });
+function paintWsTab(fresh) {
+  if (WS_RENDER[wsTab]) WS_RENDER[wsTab](fresh);
+  else renderSettingsTab(wsTab);
+}
 function setWsTab(tab) {
-  wsTab = tab;
+  const pluginTabs = syncSettingsTabs(tab);
+  // a plugin tab switched off (or never there) lands on the plugins list
+  wsTab = WS_RENDER[tab] || pluginTabs.includes(tab) ? tab : 'plugins';
   for (const el of document.querySelectorAll('#settings-screen [data-sec]')) {
-    el.classList.toggle('on', el.dataset.sec === tab);
+    el.classList.toggle('on', el.dataset.sec === wsTab);
   }
   for (const b of document.querySelectorAll('#ss-tabs button')) {
-    b.classList.toggle('on', b.dataset.tab === tab);
+    b.classList.toggle('on', b.dataset.tab === wsTab);
   }
-  WS_RENDER[tab](true);
+  paintWsTab(true);
 }
-for (const b of document.querySelectorAll('#ss-tabs button')) {
-  b.onclick = () => setWsTab(b.dataset.tab);
+// delegated: plugin tabs come and go with the catalog
+document.getElementById('ss-tabs').onclick = (e) => {
+  const b = e.target.closest('button[data-tab]');
+  if (b) setWsTab(b.dataset.tab);
+};
+// the screen's repaint: keep the plugin tabs in step, then the tab on show
+function renderSettingsScreen() {
+  const pluginTabs = syncSettingsTabs(wsTab);
+  if (isPluginTab(wsTab) && !pluginTabs.includes(wsTab)) { setWsTab('plugins'); return; }
+  paintWsTab(false);
 }
 // ---- board region: the main/v1 view registry ----
 // Which views exist, which one is on screen and which one a reload restores is
@@ -194,7 +226,7 @@ registerView({ id: 'auto', title: 'automation', icon: '⚡', tip: 'hooks & sched
 // under the captain's cursor would eat what he is typing.
 registerView({ id: 'file', title: 'file', icon: '📄', el: $id('filepane'), screen: true, remember: false, render: () => {} });
 registerView({ id: 'settings', title: 'config', icon: '🗂', el: $id('settings-screen'), screen: true, remember: false,
-  render: () => WS_RENDER[wsTab]() });
+  render: renderSettingsScreen });
 
 // What changing the view does beyond the registry: the ⚡ screen's panel
 // belongs to that screen, and anything but the file screen leaves the file.
@@ -276,6 +308,9 @@ function renderTabs() {
   document.body.dataset.view = S.view;
   // The board tab IS the main area, so when that area holds a file it says so.
   tabBoard.firstChild.nodeValue = fileOpen() ? '📄 ' + fileName() : '▦ Board';
+  // …and the chat tab is whatever fills the sidebar
+  const sb = activeSidebar();
+  tabChat.firstChild.nodeValue = !sb || sb.id === 'chat' ? '💬 Chat' : (sb.icon || '◧') + ' ' + sb.title;
   tabChat.classList.toggle('on', S.view === 'chat');
   tabBoard.classList.toggle('on', S.view === 'board');
   // chat tab badge: unread across every lieutenant chat + all card threads;
@@ -294,6 +329,13 @@ function renderTabs() {
 document.addEventListener('keydown', (e) => {
   const active = document.activeElement;
   const inField = /^(INPUT|TEXTAREA|SELECT)$/.test((active && active.tagName) || '');
+  // ⌘K / Ctrl+K: the command palette, from anywhere (a field included — it
+  // is the one chord no text box here wants)
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && (e.key === 'k' || e.key === 'K')) {
+    e.preventDefault();
+    togglePalette();
+    return;
+  }
   if (e.key === '/' && !inField) {
     e.preventDefault();
     if (matchMedia('(max-width: 760px)').matches) topbarEl.classList.add('searching');
@@ -351,7 +393,8 @@ onRender(() => {
   renderBulkBar();
   renderCurrent(); // the view on screen (views.js) paints itself
   renderTaskbar();
-  renderChat();
+  renderTopbar();
+  renderSidebar(); // the chat, unless the overlay put a plugin sidebar there
   renderLtSwitcher();
   renderDetail();
   renderNotifications();
