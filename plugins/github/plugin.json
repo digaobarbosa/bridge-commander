@@ -1,0 +1,37 @@
+{
+  "id": "github",
+  "name": "GitHub",
+  "description": "The PR watch (a merged PR archives its card and releases the worktree), \"Open PR on GitHub\", and a GitHub section on the card detail. Disabling this plugin stops the PR watch.",
+  "version": "1.0.0",
+  "activation": "boot",
+  "server": "server.js",
+  "ui": "ui.js",
+  "contributes": {
+    "commands": [
+      {
+        "id": "github.open-pr",
+        "title": "Open PR on GitHub",
+        "icon": "↗",
+        "description": "Open the card's first pull request in the browser.",
+        "run": { "open": "${card.attributes.prs[0].url}" }
+      }
+    ],
+    "menus": {
+      "card.menu/v1": [
+        { "command": "github.open-pr", "rank": 300, "when": { "card.attributes.prs": { "$exists": true } } }
+      ],
+      "detail.actions/v1": [
+        { "command": "github.open-pr", "rank": 300, "when": { "card.attributes.prs": { "$exists": true } } }
+      ]
+    },
+    "sections": [
+      {
+        "id": "prs",
+        "slot": "detail.sections/v1",
+        "title": "GitHub",
+        "rank": 500,
+        "when": { "card.attributes.prs": { "$exists": true } }
+      }
+    ]
+  }
+}

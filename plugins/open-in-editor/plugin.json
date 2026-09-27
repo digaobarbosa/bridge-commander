@@ -1,0 +1,45 @@
+{
+  "id": "open-in-editor",
+  "name": "Open in editor",
+  "description": "Open a card's worktree in your editor, or reveal it in the file manager. Pick the editor in the plugin's config; its command-line launcher must be on the server's PATH.",
+  "version": "1.0.0",
+  "config": {
+    "editor": {
+      "title": "Editor",
+      "description": "The launcher the board runs with the worktree path: cursor, code (VS Code), zed, idea (IntelliJ) or subl (Sublime Text).",
+      "enum": ["cursor", "code", "zed", "idea", "subl"],
+      "default": "cursor"
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "id": "open-in-editor.open",
+        "title": "Open in editor",
+        "icon": "🖥",
+        "description": "Open the card's worktree in the configured editor.",
+        "run": { "exec": "${config.editor} ${card.worktree}", "timeoutMs": 30000 }
+      },
+      {
+        "id": "open-in-editor.reveal",
+        "title": "Reveal in Finder",
+        "icon": "📂",
+        "description": "Show the card's worktree in the file manager (open on macOS, xdg-open elsewhere).",
+        "run": {
+          "exec": "case \"$(uname -s)\" in Darwin) exec open \"$BC_WORKTREE\" ;; *) exec xdg-open \"$BC_WORKTREE\" ;; esac",
+          "timeoutMs": 30000
+        }
+      }
+    ],
+    "menus": {
+      "card.menu/v1": [
+        { "command": "open-in-editor.open", "rank": 400, "when": { "card.worktree": { "$exists": true } } },
+        { "command": "open-in-editor.reveal", "rank": 410, "when": { "card.worktree": { "$exists": true } } }
+      ],
+      "detail.actions/v1": [
+        { "command": "open-in-editor.open", "rank": 400, "when": { "card.worktree": { "$exists": true } } },
+        { "command": "open-in-editor.reveal", "rank": 410, "when": { "card.worktree": { "$exists": true } } }
+      ]
+    }
+  }
+}
