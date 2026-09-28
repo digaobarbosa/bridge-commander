@@ -208,3 +208,38 @@ test('codex: the ready UI and the trust prompt are not fatal', () => {
   assert.ok(codexSettle.trustRe.test(trust));
   assert.ok(!codexSettle.fatalRe.test(trust));
 });
+
+// codex 0.157.1 reworded the trust screen, and its menu cursor is the composer glyph.
+test('codex: the 0.157 folder-access screen is the trust prompt, not the ready UI', () => {
+  const trust = '  Folder access\n  /private/tmp/x\n\n  Trust this folder? Codex can read, edit, and run files here.\n\n'
+    + '› 1. Trust and continue\n  2. Quit\n\n  enter continue · esc quit';
+  assert.ok(codexSettle.trustRe.test(trust));
+  assert.ok(!codexSettle.readyRe.test(trust), 'a menu cursor is not the composer');
+  assert.ok(!codexSettle.fatalRe.test(trust));
+  assert.ok(codexSettle.readyRe.test('some output\n› '), 'the bare composer glyph still reads as ready');
+});
+
+// codex 0.157 flashes a composer-like frame (~200ms) before its trust screen.
+// A loop that trusts one read types the brief into the menu that follows.
+test('codex: a ready frame that does not hold is not ready — the trust screen after it is answered', async () => {
+  const codex = require(path.join(__dirname, '..', 'codex-tmux.js'));
+  const { mockTmux } = require('./tmux-mock.js');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-settle-'));
+  const FLASH = '\n›\n';
+  const TRUST = '  Folder access\n\n  Trust this folder? Codex can read, edit, and run files here.\n\n› 1. Trust and continue\n  2. Quit';
+  const m = mockTmux({ readyTail: [FLASH, TRUST, TRUST, CODEX_READY] });
+  try {
+    await codex.spawn(dir, 'go', { session: 'bc-flash', window: 'w-1', stateDir: dir });
+    const enters = m.calls.filter((c) => c.fn === 'sendKey' && c.args[1] === 'Enter');
+    assert.ok(enters.length >= 2, `the trust screen was never answered (${enters.length} Enter sent)`);
+    const typedBrief = m.calls.findIndex((c) => c.fn === 'submit');
+    const answeredTrust = m.calls.findIndex((c, i) => i > 0 && c.fn === 'sendKey' && c.args[1] === 'Enter'
+      && m.calls.slice(0, i).some((x) => x.fn === 'sendLiteral'));
+    assert.ok(answeredTrust > -1 && typedBrief > answeredTrust, 'the brief goes in after the trust screen, not into it');
+  } finally {
+    m.restore();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

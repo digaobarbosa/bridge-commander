@@ -222,6 +222,8 @@ async function adoptWindow(ref, window, taken = []) {
 // (composer + footer are the screen's last rows), so the tail is behavior-
 // preserving there.
 const SETTLE_TAIL_LINES = 15;
+const SETTLE_CONFIRM_MS = Number(process.env.BC_SETTLE_CONFIRM_MS) >= 0 && process.env.BC_SETTLE_CONFIRM_MS !== undefined
+  ? Number(process.env.BC_SETTLE_CONFIRM_MS) : 700;
 
 function paneTail(pane) {
   return pane.replace(/\s+$/, '').split('\n').slice(-SETTLE_TAIL_LINES).join('\n');
@@ -261,7 +263,14 @@ async function launchAndSettle(target, launchCmd, sig) {
       await t.sleep(1000);
       continue;
     }
-    if (sig.readyRe.test(tail)) return;
+    if (sig.readyRe.test(tail)) {
+      // Ready only if it holds: codex 0.157 flashes a composer-like frame for
+      // ~200ms BEFORE its trust screen, and a brief typed then lands in the menu.
+      await t.sleep(SETTLE_CONFIRM_MS);
+      const again = paneTail(await t.capture(target, 40));
+      if (sig.readyRe.test(again) && !menus.some((re) => re.test(again))
+        && !(sig.fatalRe && sig.fatalRe.test(again))) return;
+    }
   }
   const tail = await t.capture(target, 20);
   throw new Error(`${sig.label} did not start at ${target} within 45s; pane tail:\n${tail}`);

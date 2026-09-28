@@ -27,13 +27,15 @@ const { codexStatus } = require('./agent-status.js');
 const { tmuxAdapter } = require('./tmux-adapter.js');
 
 const NOTIFY_SCRIPT = path.join(__dirname, 'codex-notify.js');
-const TRUST_RE = /Do you trust the contents of this directory|Yes, continue/;
+// 0.155 asked "Do you trust the contents of this directory"; 0.157 asks
+// "Trust this folder?" under a "Folder access" header. Both preselect yes.
+const TRUST_RE = /Do you trust the contents of this directory|Yes, continue|Trust this folder\?|Trust and continue/;
 
 // UI_READY_RE matches signatures only the codex main UI renders: the intro
 // box (">_ OpenAI Codex (vX.Y.Z)"), the YOLO-mode permissions line, or the
-// composer glyph '›' at a line start. The trust screen shows none of these as
-// a line of its own — and trustRe is checked first anyway.
-const UI_READY_RE = /OpenAI Codex \(v|YOLO mode|\n›/;
+// composer glyph '›' at a line start. A numbered menu uses the same glyph as
+// its cursor ("› 1. Trust and continue"), so '›' before "N." is not the composer.
+const UI_READY_RE = /OpenAI Codex \(v|YOLO mode|\n›(?! \d+\.)/;
 
 // FATAL_RE — screens a codex launch never gets past on its own (strings pinned
 // against the 0.155.1 binary): no binary, the first-run login picker, the
@@ -45,9 +47,12 @@ const FATAL_RE = /codex: command not found|command not found: codex|Sign in with
 const SETTLE = { trustRe: TRUST_RE, readyRe: UI_READY_RE, fatalRe: FATAL_RE, label: 'codex' };
 
 // The bypass + notify flags every codex launch (spawn AND resume) carries.
+// No update check: codex ships almost daily, and its update modal blocks an
+// unattended launch (updating codex is the captain's call, not a worker's).
 function launchFlags(ctx) {
   const notify = ['node', NOTIFY_SCRIPT, ctx.stateDir, ctx.key].concat(ctx.callbackUrl ? [ctx.callbackUrl] : []);
   return '--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust '
+    + '-c check_for_update_on_startup=false '
     + `-c ${s.shellQuote('notify=' + JSON.stringify(notify))}`
     + (ctx.extra ? ' ' + ctx.extra : '');
 }
