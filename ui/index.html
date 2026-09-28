@@ -12,28 +12,6 @@
 <header id="topbar">
   <h1 id="b-title">bridge command</h1>
   <div id="b-subtitle"></div>
-  <span id="filter-wrap">
-    <!-- mobile only: the text filter collapses to this 🔍; tapping it expands
-         the input over the whole row (desktop shows the input directly) -->
-    <button id="filter-open" title="search cards">
-      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
-           stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <circle cx="11" cy="11" r="7"></circle>
-        <line x1="21" y1="21" x2="16" y2="16"></line>
-      </svg>
-    </button>
-    <input id="filter" placeholder="filter ( / )" autocomplete="off">
-    <!-- the richer filters live in a popup; the badge counts what's active in there -->
-    <button id="filter-btn" title="filters">
-      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
-           stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
-      </svg>
-      <span id="filter-btn-n" class="badge-n" hidden></span>
-    </button>
-    <!-- mobile only: leaves search mode (the filter itself stays applied) -->
-    <button id="filter-close" title="done">✕</button>
-  </span>
   <!-- the view switcher: one button per switcher view in the main/v1 registry
        (views.js), in rank order — ▦ kanban, ☰ table, 🧊 archived, ⚡ automation,
        then any plugin view. main.js builds the buttons. -->
@@ -166,6 +144,32 @@
     <!-- every view below is a .bc-view: views.js marks the one on screen
          .view-on. Plugin views get a div of their own, inserted before the
          taskbar. -->
+    <!-- the filter row sits on top of every view, so it starts where the
+         kanban's first column starts whatever the chat pane's width -->
+    <div id="filter-wrap">
+      <!-- mobile only: the text filter collapses to this 🔍; tapping it expands
+           the input over the whole filter row (desktop shows the input directly) -->
+      <button id="filter-open" title="search cards">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="7"></circle>
+          <line x1="21" y1="21" x2="16" y2="16"></line>
+        </svg>
+      </button>
+      <input id="filter" placeholder="filter ( / )" autocomplete="off">
+      <!-- the richer filters live in a popup; the badge counts what's active in there -->
+      <button id="filter-btn" title="filters">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
+        </svg>
+        <span id="filter-btn-n" class="badge-n" hidden></span>
+      </button>
+      <!-- one removable chip per active filter (filterpop.js) -->
+      <div id="filter-chips"></div>
+      <!-- mobile only: leaves search mode (the filter itself stays applied) -->
+      <button id="filter-close" title="done">✕</button>
+    </div>
     <div id="board" class="bc-view"><div class="empty">waiting for board…</div></div>
     <div id="table" class="bc-view"></div>
     <div id="archive" class="bc-view"></div>

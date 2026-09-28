@@ -64,9 +64,11 @@ input, textarea, select { font: inherit; color: var(--text); }
 }
 #topbar h1 { font-size: 15px; font-weight: 650; letter-spacing: .4px; white-space: nowrap; }
 #b-subtitle { color: var(--faint); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; }
-#filter-wrap { display: flex; align-items: center; gap: 6px; flex: 1 1 auto; justify-content: flex-end; min-width: 0; }
+/* the filter row tops the board region; its left padding matches #board's so
+   the input starts on the first column's edge */
+#filter-wrap { display: flex; align-items: center; gap: 6px; flex: none; min-width: 0; padding: 10px 14px 0; }
 #filter {
-  width: min(240px, 100%); background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  width: min(240px, 100%); flex: none; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
   font-size: 13px; padding: 6px 11px; outline: none; transition: border-color .15s, width .2s;
 }
 #filter:focus { border-color: var(--accent2); }
@@ -75,15 +77,21 @@ input, textarea, select { font: inherit; color: var(--text); }
   font-size: 11.5px; padding: 6px 4px; max-width: 105px; cursor: pointer; outline: none; flex: none;
 }
 #filter-age:hover, #filter-age:focus { border-color: var(--accent2); }
-#filter-chips { display: flex; gap: 5px; align-items: center; flex: none; max-width: 40%; overflow: hidden; }
+#filter-chips { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; flex: 1 1 auto; min-width: 0; }
 .fchip {
   display: inline-flex; align-items: center; gap: 5px; font-size: 11px; padding: 2px 9px;
   border-radius: 10px; background: var(--accent2); color: #eaf6ff; cursor: pointer; white-space: nowrap;
 }
 .fchip:hover { background: var(--accent); color: #06222f; }
 .fchip .x { font-size: 10px; opacity: .8; }
-#filter-clear { display: none; color: var(--dim); font-size: 12px; padding: 0 2px; }
-#filter-clear:hover { color: var(--text); }
+/* in the row only the ✕ removes, so the label stays safe to read and select */
+#filter-chips .fchip { cursor: default; }
+#filter-chips .fchip:hover { background: var(--accent2); color: #eaf6ff; }
+#filter-chips .fchip.ex:hover { background: #7c2f2e; color: #ffe3e2; }
+#filter-chips .x { color: inherit; padding: 0 0 0 2px; cursor: pointer; }
+#filter-chips .x:hover { opacity: 1; }
+#filter-clear-all { color: var(--dim); font-size: 11.5px; padding: 2px 4px; white-space: nowrap; }
+#filter-clear-all:hover { color: var(--text); }
 #status-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--danger); transition: background .3s; }
 #status-dot.ok { background: var(--ok); }
 #status-dot.busy { background: var(--warn); }
@@ -1598,17 +1606,17 @@ a.a-uri { color: var(--accent); }
   #topbar h1[data-load="ok"] { text-decoration-color: var(--ok); }
   #topbar h1[data-load="busy"] { text-decoration-color: var(--warn); }
   #status-dot { display: none; }
-  /* the text filter collapses to the 🔍; the row is title + icon buttons only */
-  #filter-wrap { flex: none; gap: 4px; }
+  /* the text filter collapses to the 🔍; the row is 🔍, funnel and chips.
+     The chips scroll sideways in one line so the page never does. */
+  #filter-wrap { gap: 4px; padding: 8px 10px 0; }
   #filter { display: none; }
   #filter-age { display: none; }
-  /* search mode (🔍 tapped): the input takes the whole row — title, mode
-     switcher, dot, bell, gear step aside until ✕ */
-  #topbar.searching h1, #topbar.searching #view-seg, #topbar.searching #status-dot,
-  #topbar.searching #bell, #topbar.searching #gear, #topbar.searching #filter-open { display: none; }
-  #topbar.searching #filter-wrap { flex: 1 1 auto; }
-  #topbar.searching #filter { display: block; flex: 1 1 auto; width: auto; min-width: 0; padding: 5px 9px; }
-  #topbar.searching #filter-close { display: inline-flex; }
+  #filter-chips { flex-wrap: nowrap; overflow-x: auto; }
+  /* search mode (🔍 tapped): the input takes the whole row — the chips step
+     aside until ✕ */
+  #filter-wrap.searching #filter-open, #filter-wrap.searching #filter-chips { display: none; }
+  #filter-wrap.searching #filter { display: block; flex: 1 1 auto; width: auto; min-width: 0; padding: 5px 9px; }
+  #filter-wrap.searching #filter-close { display: inline-flex; }
   /* compact the icon cluster so everything sits in one calm row at 390px
      (the #view-seg / #filter-open sizing lives in the mobile block at the end
      of this file — their base rules are declared below this one) */
@@ -1753,8 +1761,6 @@ table.tv { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 8
 }
 .fp-opt:hover { border-color: var(--accent2); color: var(--accent); }
 .fp-opt.on { color: var(--accent); border-color: var(--accent2); background: var(--accent-soft); }
-.fp-chips { display: flex; flex-wrap: wrap; gap: 5px; }
-.fp-chips .fchip { cursor: pointer; }
 .fp-row { display: flex; align-items: center; gap: 8px; }
 .fp-lbl { flex: none; width: 74px; font-size: 10.5px; font-weight: 650; text-transform: uppercase; letter-spacing: .8px; color: var(--faint); }
 .fp-row select {
@@ -1833,7 +1839,7 @@ table.tv { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 8
    #filter-open/#filter-close base rules declared above. */
 @media (max-width: 760px) {
   #filter-open { display: inline-flex; }
-  #topbar.searching #filter-open { display: none; }
+  #filter-wrap.searching #filter-open { display: none; }
   /* fatter tri-state rows + switch targets for thumbs */
   .fp-tri { padding: 6px 12px; font-size: 13px; }
   .fp-sw button { padding: 8px 12px; font-size: 13px; }
@@ -2100,7 +2106,6 @@ button.tb-act:hover { border-color: var(--accent2); color: var(--text); }
   .tb-cmd .tb-label { display: none; }
   #topbar-cmds { gap: 4px; }
   #palette-btn { padding: 4px 8px; font-size: 13px; }
-  #topbar.searching #topbar-cmds, #topbar.searching #palette-btn { display: none; }
   /* the plugin sidebar is the Chat tab's content, as the chat is */
   .bc-sidebar { width: 100%; flex: 1; border-right: none; display: none; }
   body[data-view="chat"] .bc-sidebar { display: flex; }

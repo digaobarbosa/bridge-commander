@@ -121,6 +121,42 @@ test('clearFilters wipes includes and excludes', () => {
   assert.strictEqual(visible(), 'abcd');
 });
 
+// ---------- filterChips: the filter row's removable chips ----------
+
+const CHIP_DOC = { lieutenants: [{ id: 'lt-iris', name: 'Iris' }], columns: [{ id: 'working', title: 'Working' }] };
+const chipText = (chips) => chips.map((c) => (c.exclude ? '⊘' : '') + c.label);
+
+test('filterChips: no filter, no chips — and text alone never makes one', () => {
+  assert.deepStrictEqual(St.filterChips(RESET(), CHIP_DOC, false), []);
+  assert.deepStrictEqual(St.filterChips({ ...RESET(), text: 'bug' }, CHIP_DOC, false), []);
+});
+
+test('filterChips: one chip per value, named for what it filters', () => {
+  setFilter('owner', 'lt-iris', 'in');
+  setFilter('label', 'bug', 'out');
+  S.filters.types.push('plan');
+  S.filters.columns.push('working', 'gone');
+  S.filters.age = 'today';
+  assert.deepStrictEqual(chipText(St.filterChips(S.filters, CHIP_DOC, false)), [
+    'owner: Iris', '⊘label: bug', 'type: 🧠 plan', 'status: Working', 'status: gone', 'updated: today',
+  ]);
+});
+
+test('filterChips: each chip carries the kind and value that remove it', () => {
+  setFilter('label', 'bug', 'in');
+  S.filters.age = '3600';
+  assert.deepStrictEqual(St.filterChips(S.filters, CHIP_DOC, false).map((c) => [c.kind, c.value]),
+    [['label', 'bug'], ['age', '3600']]);
+});
+
+test('filterChips: archived mode drops status and updated, keeps owner/label/type', () => {
+  setFilter('owner', 'ghost', 'in');
+  S.filters.types.push('investigation');
+  S.filters.columns.push('working');
+  S.filters.age = 'today';
+  assert.deepStrictEqual(chipText(St.filterChips(S.filters, null, true)), ['owner: ghost', 'type: 🕵️ invest']);
+});
+
 // ---------- lieutenantByActor ----------
 // The seam behind notification/toast click routing for card-less chat items.
 

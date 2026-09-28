@@ -16,7 +16,7 @@ export const S = {
   view: 'chat',            // mobile tab: 'chat' | 'board'
   boardMode: 'board',      // the board region's view id (views.js registry): 'board' (kanban), 'table', …
   // The ONE filter state, shared by every board-region mode. `text` lives in
-  // the topbar input; the rest is configured in the filter popup (filterpop.js).
+  // the filter row's input; the rest is configured in the filter popup (filterpop.js).
   // Every dimension is MULTI: sel holds {kind:'label'|'owner', value} chips,
   // types/columns hold toggled values. Semantics: OR within a dimension, AND
   // across dimensions.
@@ -318,6 +318,36 @@ export function filtersActive() {
 export function activeFilterCount() {
   const f = S.filters;
   return f.sel.length + (f.age ? 1 : 0) + f.types.length + f.columns.length;
+}
+// the popup's "updated" windows; a chip names the picked one
+export const AGES = [
+  { v: '', t: 'any time' }, { v: '3600', t: 'last hour' }, { v: 'today', t: 'today' },
+  { v: '259200', t: 'last 3 days' }, { v: '604800', t: 'last week' },
+];
+const TYPE_NAMES = { plan: '🧠 plan', implementation: '🔥 impl', investigation: '🕵️ invest' };
+/**
+ * One removable chip per active filter value — {kind, value, label, exclude}.
+ * No chip for text: the input already shows it. `archived` drops status and
+ * updated, which frozen snapshots ignore; `doc` names owners and columns.
+ */
+export function filterChips(f, doc, archived) {
+  const lts = (doc && doc.lieutenants) || [];
+  const cols = (doc && doc.columns) || [];
+  const chips = f.sel.map((s) => {
+    const lt = s.kind === 'owner' && lts.find((l) => l.id === s.value);
+    return { kind: s.kind, value: s.value, exclude: s.mode === 'out', label: s.kind + ': ' + (lt ? lt.name || lt.id : s.value) };
+  });
+  for (const t of f.types) chips.push({ kind: 'types', value: t, exclude: false, label: 'type: ' + (TYPE_NAMES[t] || t) });
+  if (archived) return chips;
+  for (const c of f.columns) {
+    const k = cols.find((x) => x.id === c);
+    chips.push({ kind: 'columns', value: c, exclude: false, label: 'status: ' + (k ? k.title : c) });
+  }
+  if (f.age) {
+    const a = AGES.find((x) => x.v === f.age);
+    chips.push({ kind: 'age', value: f.age, exclude: false, label: 'updated: ' + (a ? a.t : f.age) });
+  }
+  return chips;
 }
 // toggle a value in a multi dimension array (types / columns)
 export function toggleDim(dim, value) {

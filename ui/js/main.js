@@ -87,14 +87,14 @@ toastOnOpenLieutenant(openLieutenantChat); // card-less chat toast → the lieut
 // (filterpop.js), behind the one button with the active-count badge.
 const filterInput = document.getElementById('filter');
 filterInput.oninput = () => { S.filters.text = filterInput.value; render(); };
-// Mobile collapses the input to a 🔍 button; tapping it puts the topbar in
+// Mobile collapses the input to a 🔍 button; tapping it puts the filter row in
 // "search mode" (the input over the whole row) until ✕. Desktop never shows
 // either button and the .searching class is inert there.
-const topbarEl = document.getElementById('topbar');
+const filterBarEl = document.getElementById('filter-wrap');
 const filterOpenBtn = document.getElementById('filter-open');
-document.getElementById('filter-close').onclick = () => topbarEl.classList.remove('searching');
-filterOpenBtn.onclick = () => { topbarEl.classList.add('searching'); filterInput.focus(); };
-function searchModeOn() { return topbarEl.classList.contains('searching'); }
+document.getElementById('filter-close').onclick = () => filterBarEl.classList.remove('searching');
+filterOpenBtn.onclick = () => { filterBarEl.classList.add('searching'); filterInput.focus(); };
+function searchModeOn() { return filterBarEl.classList.contains('searching'); }
 function syncFilterInputs() {
   if (filterInput.value !== S.filters.text) filterInput.value = S.filters.text;
   // collapsed 🔍 lights up while a text filter is applied
@@ -338,7 +338,7 @@ document.addEventListener('keydown', (e) => {
   }
   if (e.key === '/' && !inField) {
     e.preventDefault();
-    if (matchMedia('(max-width: 760px)').matches) topbarEl.classList.add('searching');
+    if (matchMedia('(max-width: 760px)').matches) filterBarEl.classList.add('searching');
     filterInput.focus();
     return;
   }
@@ -365,7 +365,7 @@ document.addEventListener('keydown', (e) => {
     else if (!spEl.hidden) { spEl.hidden = true; gearBtn.classList.remove('on'); }
     else if (escInterrupt(e)) return; // nothing on top: Esc in an empty composer stops the agent
     else if (detailOpen()) closeDetail();
-    else if (searchModeOn()) topbarEl.classList.remove('searching'); // collapse first, filters survive
+    else if (searchModeOn()) filterBarEl.classList.remove('searching'); // collapse first, filters survive
     else if (filtersActive()) { clearFilters(); syncFilterInputs(); }
   }
 });
