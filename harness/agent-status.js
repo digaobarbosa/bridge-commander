@@ -249,11 +249,16 @@ function codexThreadId(ref, opts = {}) {
   return (ref && ref.resumeId) || null;
 }
 
+/** codexSessionsDir() -> where codex writes its rollouts (BC_CODEX_SESSIONS_DIR overrides, for tests). */
+function codexSessionsDir() {
+  return process.env.BC_CODEX_SESSIONS_DIR
+    || path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions');
+}
+
 function codexStatus(ref, opts = {}) {
   const threadId = codexThreadId(ref, opts);
   if (!threadId) return null;
-  const sessionsDir = opts.sessionsDir || process.env.BC_CODEX_SESSIONS_DIR
-    || path.join(os.homedir(), '.codex', 'sessions');
+  const sessionsDir = opts.sessionsDir || codexSessionsDir();
   const file = codexRolloutFile(threadId, sessionsDir);
   if (!file) return null;
   const text = tailRead(file, TAIL_BYTES);
@@ -373,6 +378,7 @@ module.exports = {
   claudeSidecarStatus,
   claudeStatus,
   codexRolloutFile,
+  codexSessionsDir,
   codexThreadId,
   codexStatus,
   SLASH_COMMANDS,

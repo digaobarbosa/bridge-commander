@@ -19,6 +19,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { tmuxSession } = require('./util.js');
+const { codexRolloutFile, codexSessionsDir } = require('./agent-status.js');
 
 const TEXT_MAX = 300;
 
@@ -76,6 +77,10 @@ async function relay({ harness, stateDir, key, url, raw }) {
   if (!stateDir || !key) return null;
   const n = normalize(harness, raw);
   if (!n) return null;
+  // codex also notifies for its own side threads (e.g. the task-title one).
+  // Only the conversation writes a rollout; any other thread-id would replace
+  // the resume id and ring a false turn-end.
+  if (harness === 'codex' && n.session_id && !codexRolloutFile(n.session_id, codexSessionsDir())) return null;
   const event = { ts: new Date().toISOString(), session: key, ...n, tmux_session: tmuxSession() };
   record(stateDir, key, event);
   await post(url, event);

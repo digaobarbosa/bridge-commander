@@ -10,6 +10,12 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { normalize, TEXT_MAX } = require('../turnend-relay.js');
 
+// The relay trusts a codex thread only when it has a rollout (see relay()).
+const SESSIONS = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-codex-sessions-'));
+process.env.BC_CODEX_SESSIONS_DIR = SESSIONS;
+fs.mkdirSync(path.join(SESSIONS, '2026', '09', '28'), { recursive: true });
+fs.writeFileSync(path.join(SESSIONS, '2026', '09', '28', 'rollout-2026-09-28T08-00-00-thread-x.jsonl'), '');
+
 const CLAUDE = { hook_event_name: 'Stop', session_id: 'uuid-c', cwd: '/w', last_assistant_message: ' done, waiting on review ' };
 const CODEX = { type: 'agent-turn-complete', 'thread-id': 'thread-x', 'turn-id': 't1', cwd: '/w',
   'input-messages': ['go'], 'last-assistant-message': ' done, waiting on review ' };
