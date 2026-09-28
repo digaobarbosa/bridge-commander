@@ -233,3 +233,18 @@ test('the pane feed never stacks captures: the next poll is scheduled after the 
     m.restore();
   }
 });
+
+// The 👁 drawer scrolls back through what the frame carries, so the depth is
+// the feature: 500 lines of history, not just the 24 visible rows.
+test('pane frames carry 500 lines of scrollback by default', async () => {
+  const m = patchTmux();
+  const seen = [];
+  t.captureStyled = async (target, lines) => { seen.push(lines); return 'frame'; };
+  try {
+    const feed = s.openPane(REF, { onFrame: () => {} });
+    await sleep(20);
+    feed.close();
+    await s.paneSnapshot(REF);
+    assert.deepStrictEqual(seen, [500, 500]);
+  } finally { m.restore(); }
+});

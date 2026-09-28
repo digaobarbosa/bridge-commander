@@ -8,10 +8,11 @@
 //   resumeId — the claude session uuid, set at spawn via `--session-id <uuid>`
 //              (verified 2.1.202) and refreshed from Stop-hook payloads.
 //
-// Launch: `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude
-// --permission-mode <mode> --session-id <uuid>` (mined from firstmate's
-// fm-spawn.sh). <mode> is opts.permissionMode (default 'auto'); 'bypass' is the
-// old `--dangerously-skip-permissions` launch. Every other mode keeps claude's
+// Launch: `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false
+// CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude --permission-mode <mode>
+// --session-id <uuid>` (mined from firstmate's fm-spawn.sh). <mode> is
+// opts.permissionMode (default 'auto'); 'bypass' is the old
+// `--dangerously-skip-permissions` launch. Every other mode keeps claude's
 // permission prompts, and the PermissionRequest hook relays them to the board.
 // A fresh cwd shows the folder-trust dialog in every mode; the settle accepts it.
 //
@@ -104,13 +105,20 @@ function sandboxPrefix(allowRoot) {
 
 // launchPrefix(mode, allowRoot) — everything on a claude line before the
 // session flags: the sandbox consent, the switch that kills claude's dim
-// prompt-suggestion ghost text (it would read as pending composer input), and
-// the permission flags. Only bypass needs the root escape hatch: claude's uid-0
-// refusal is about skipping permissions, and no other mode skips them.
+// prompt-suggestion ghost text (it would read as pending composer input), the
+// classic-renderer switch, and the permission flags. Only bypass needs the root
+// escape hatch: claude's uid-0 refusal is about skipping permissions, and no
+// other mode skips them.
+//
+// CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1: claude's fullscreen renderer (the
+// `tui` setting, or claude's own default) draws on tmux's alternate screen,
+// which keeps no history, so the 👁 drawer could only show the visible rows.
+// The documented switch forces the classic renderer over any saved `tui`, and
+// the conversation lands in tmux history the drawer can scroll (BR2-6).
 function launchPrefix(mode, allowRoot) {
   const bypass = mode === 'bypass';
   return (bypass ? sandboxPrefix(allowRoot) : '')
-    + 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude '
+    + 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude '
     + (bypass ? '--dangerously-skip-permissions' : '--permission-mode ' + shellQuote(mode));
 }
 // A spawn without a mode, or a record from before modes existed, runs in 'auto'.

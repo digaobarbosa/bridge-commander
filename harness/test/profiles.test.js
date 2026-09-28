@@ -211,7 +211,7 @@ test('a secret never reaches the launch line, spawn-args or any tmux call; the e
     });
     assert.strictEqual(ref.harness, 'secret-derived');
     const [line] = lines(mock);
-    assert.match(line, /^\( set -a; \. '.*bc-sec\.env'; set \+a; exec env CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude /);
+    assert.match(line, /^\( set -a; \. '.*bc-sec\.env'; set \+a; exec env CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude /);
     assert.match(line, /'--model' 'deepseek-chat'/);
     for (const c of mock.calls) {
       const flat = JSON.stringify(c.args);

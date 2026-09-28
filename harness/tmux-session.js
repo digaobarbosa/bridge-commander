@@ -416,6 +416,9 @@ function onTurnEnd(ref, hook, opts = {}) {
 // object, so a close only ever removes ITS OWN entry (the server's pane hub
 // refcounts N viewers onto ONE feed per target, but identity beats assuming it).
 const feeds = new Map(); // tmux target -> { until: ms deadline for fast polling }
+// Scrollback depth of a pane frame. claude runs in the classic renderer (see
+// claude-tmux.js launchPrefix), so this is real history the drawer can scroll.
+const PANE_LINES = 500;
 const PANE_BURST_MS = 120; // fast poll while a burst is live
 const PANE_BURST_WINDOW_MS = 1500; // how long one keystroke keeps the feed fast
 
@@ -439,7 +442,7 @@ const PANE_BURST_WINDOW_MS = 1500; // how long one keystroke keeps the feed fast
 function openPane(ref, opts = {}) {
   const onFrame = typeof opts.onFrame === 'function' ? opts.onFrame : () => {};
   const intervalMs = opts.intervalMs > 0 ? opts.intervalMs : 1000;
-  const lines = opts.lines > 0 ? opts.lines : 200;
+  const lines = opts.lines > 0 ? opts.lines : PANE_LINES;
   const burstMs = opts.burstMs > 0 ? opts.burstMs : PANE_BURST_MS;
   const burstWindowMs = opts.burstWindowMs > 0 ? opts.burstWindowMs : PANE_BURST_WINDOW_MS;
   const target = paneTarget(ref.session, ref.window);
@@ -509,7 +512,7 @@ function openPane(ref, opts = {}) {
 // paneSnapshot(ref, { lines? }) -> Promise<string> — one-shot styled capture
 // (initial paint / non-streaming fallback). Empty string when unreadable.
 async function paneSnapshot(ref, opts = {}) {
-  const lines = opts.lines > 0 ? opts.lines : 200;
+  const lines = opts.lines > 0 ? opts.lines : PANE_LINES;
   const out = await t.captureStyled(paneTarget(ref.session, ref.window), lines);
   return out === null ? '' : out;
 }
