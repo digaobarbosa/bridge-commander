@@ -33,6 +33,9 @@ function createDelivery({ dir, send, clock = Date.now, wakeTtlMs = 90000, log = 
   const queues = new Map(); // lt -> { ack, drained, items } — items = pending only (seq > ack)
   const latestMsg = new Map(); // target -> { seq, lt } of its latest kind:'message' delivery
   const nudged = new Map(); // lt -> epoch ms of the last wake sent since its last drain/ack
+  // Lieutenants the captain interrupted: no wake until a NEW item arrives, or
+  // the next drain of the pending order would restart the stopped turn.
+  const hushed = new Set();
   let head = 0;
 
   const file = (lt, ext) => path.join(dir, lt + ext);
@@ -86,6 +89,7 @@ function createDelivery({ dir, send, clock = Date.now, wakeTtlMs = 90000, log = 
     const item = Object.assign({ seq: head + 1, ts: new Date(clock()).toISOString(), lieutenant: lt }, rec);
     fs.appendFileSync(file(lt, '.jsonl'), JSON.stringify(item) + '\n');
     index(lt, item);
+    hushed.delete(lt);
     nudge(lt);
     return item;
   }
@@ -152,10 +156,17 @@ function createDelivery({ dir, send, clock = Date.now, wakeTtlMs = 90000, log = 
    * @returns {boolean} true when a wake went out
    */
   function nudge(lt) {
-    const n = pending(lt).length;
-    if (!n) return false;
+    const items = pending(lt);
+    const n = items.length;
+    if (!n || hushed.has(lt)) return false;
     const last = nudged.get(lt);
-    if (last !== undefined && clock() - last <= wakeTtlMs) return false;
+    // The TTL re-fire heals a wake that never became a turn, so it is for
+    // items nobody has read. Once all are drained, the lieutenant is in its
+    // turn: one reminder per drain, not a pile of wake lines queued in its
+    // input (each Esc would submit them as a new turn).
+    const q = queues.get(lt);
+    const allSeen = !!q && items[n - 1].seq <= q.drained;
+    if (last !== undefined && (allSeen || clock() - last <= wakeTtlMs)) return false;
     let sent;
     try { sent = send(lt, wakeLine(n)); } catch (e) { sent = Promise.reject(e); }
     if (sent === false) return false;
@@ -166,7 +177,10 @@ function createDelivery({ dir, send, clock = Date.now, wakeTtlMs = 90000, log = 
   }
 
   /** Forget the last wake: a new session owes a drain; its predecessor's memory is gone. */
-  function resetNudge(lt) { nudged.delete(lt); }
+  function resetNudge(lt) { nudged.delete(lt); hushed.delete(lt); }
+
+  /** The captain stopped lt's turn: hold every wake until the next push(). Pending items stay unacked. */
+  function hush(lt) { hushed.add(lt); }
 
   /** Retire: delete lt's queue and cursors, on disk and in memory. */
   function forget(lt) {
@@ -175,6 +189,7 @@ function createDelivery({ dir, send, clock = Date.now, wakeTtlMs = 90000, log = 
     }
     queues.delete(lt);
     nudged.delete(lt);
+    hushed.delete(lt);
     for (const [target, m] of latestMsg) if (m.lt === lt) latestMsg.delete(target);
   }
 
@@ -191,7 +206,7 @@ function createDelivery({ dir, send, clock = Date.now, wakeTtlMs = 90000, log = 
     return m.seq > q.drained ? 'queued' : 'seen';
   }
 
-  return { push, pending, drain, ack, nudge, resetNudge, forget, owed, head: () => head };
+  return { push, pending, drain, ack, nudge, resetNudge, hush, forget, owed, head: () => head };
 }
 
 module.exports = { createDelivery, wakeLine };

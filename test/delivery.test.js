@@ -155,3 +155,36 @@ test('forget: a retired lieutenant leaves no queue, cursor or owed behind', () =
   assert.strictEqual(d.owed('lieutenant:ada'), null);
   assert.strictEqual(d.push('bob', { kind: 'message', text: 'x' }).seq, 3, 'the seq never goes back');
 });
+
+test('hush: after an interrupt no wake goes out until a NEW item arrives; the order stays pending', async () => {
+  const { d, sends, clock } = open(tmpDir());
+  d.push('ada', { kind: 'message', text: 'run the long thing' });
+  assert.strictEqual(sends.length, 1);
+  await tick();
+  d.hush('ada');
+  clock.t += 10 * 60 * 1000; // far past the wake TTL
+  assert.strictEqual(d.nudge('ada'), false, 'a turn-end or sweep re-nudge does not restart the stopped turn');
+  assert.strictEqual(sends.length, 1);
+  assert.deepStrictEqual(d.pending('ada').map((i) => i.text), ['run the long thing'], 'still unacked');
+  d.push('ada', { kind: 'message', text: 'now something else' });
+  assert.strictEqual(sends.length, 2, 'the next captain message wakes it again');
+  d.hush('ada');
+  d.resetNudge('ada'); // a new session owes a drain
+  clock.t += 10 * 60 * 1000;
+  assert.strictEqual(d.nudge('ada'), true);
+});
+
+test('wake: once every item is drained, one reminder per drain and no TTL re-fire pile-up', async () => {
+  const { d, sends, clock } = open(tmpDir());
+  d.push('ada', { kind: 'message', text: 'long job' });
+  await tick();
+  clock.t += 10 * 60 * 1000;
+  assert.strictEqual(d.nudge('ada'), true, 'undrained: the TTL heartbeat still heals a lost wake');
+  d.drain('ada'); // the turn started and read it
+  assert.strictEqual(d.nudge('ada'), true, 'one reminder after the drain');
+  await tick();
+  for (let i = 0; i < 5; i++) { clock.t += 10 * 60 * 1000; assert.strictEqual(d.nudge('ada'), false); }
+  assert.strictEqual(sends.length, 3);
+  d.push('ada', { kind: 'message', text: 'a new order' });
+  assert.strictEqual(sends.length, 4, 'an unread item wakes again');
+});

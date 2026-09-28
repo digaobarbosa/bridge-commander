@@ -1684,6 +1684,17 @@ async function cmdSay() {
   console.log('said -> ' + target);
 }
 
+// Stop the agent's running turn, like Esc in its terminal; the session stays
+// up for the next message. A card target stops its live worker.
+async function cmdInterrupt() {
+  const target = positional[0];
+  if (!target || !TARGET_RE.test(target)) die('usage: bc-axi interrupt <lieutenant:ID|card:ID> [--actor a]');
+  const [kind, id] = [target.slice(0, target.indexOf(':')), target.slice(target.indexOf(':') + 1)];
+  const r = await request('POST', '/api/' + (kind === 'card' ? 'cards' : 'lieutenants') + '/' + encodeURIComponent(id) + '/interrupt',
+    { actor: opts.actor || 'agent' });
+  console.log('interrupted -> ' + target + ' (' + r.session + ')');
+}
+
 // ---------- the line ----------
 // The captain's voice channel: one holder at a time, remembered by the SERVER
 // (his phone is not the only thing that talks to the board, so no local state
@@ -1938,7 +1949,7 @@ const commands = {
   'worker pause': cmdWorkerPause,
   show: cmdShow, // alias for card show
   event: cmdEvent, notify: cmdNotify,
-  say: cmdSay, drain: cmdDrain, ack: cmdAck,
+  say: cmdSay, interrupt: cmdInterrupt, drain: cmdDrain, ack: cmdAck,
   line: cmdLine, 'line pass': cmdLinePass,
   plugins: cmdPlugins, 'plugins enable': cmdPluginsEnable, 'plugins disable': cmdPluginsDisable,
   'command run': cmdCommandRun, activities: cmdActivities, 'activity log': cmdActivityLog, checks: cmdChecks,
@@ -2143,6 +2154,9 @@ if (!commands[cmd]) {
     '                                         the owning lieutenant (lieutenant-main says also notify).\n' +
     '                                         A card-thread say by anyone but the owner (e.g. its\n' +
     '                                         worker) also queues a worker-said item waking the owner\n' +
+    '  interrupt <lieutenant:ID|card:ID> [--actor a]\n' +
+    '                                         stop the agent\'s running turn (Esc in its terminal);\n' +
+    '                                         the session stays up. A card target stops its worker\n' +
     '\nthe line (the captain\'s voice channel — one holder, server-side):\n' +
     '  line [--json]                          who holds it now. The captain\'s voice shortcut posts\n' +
     '                                         {"target":"line"} and names nobody; the line follows\n' +

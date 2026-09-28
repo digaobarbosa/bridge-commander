@@ -401,6 +401,13 @@ async function paneInput(ref, input = {}) {
   logPane(keyOf(ref), 'input', key ? { key } : { text });
 }
 
+// interrupt lands in the same <key>.pane.jsonl as pane input, so a test can
+// assert the server reached the harness. BC_FAKE_NO_INTERRUPT hides the verb.
+async function interrupt(ref) {
+  if (!live(keyOf(ref))) throw new Error(`session ${keyOf(ref)} is not alive`);
+  logPane(keyOf(ref), 'interrupt');
+}
+
 // ---------- slash commands + status (OPTIONAL capability verbs — see port.js) ----------
 // Canned, deterministic, filesystem-free — the whole slash/status stack (server
 // routing, /api/commands, the composer autocomplete, context bars) tests
@@ -455,6 +462,7 @@ if (!process.env.BC_FAKE_NO_PANE) {
   impl.paneSnapshot = paneSnapshot;
   impl.paneInput = paneInput;
 }
+if (!process.env.BC_FAKE_NO_INTERRUPT) impl.interrupt = interrupt;
 // Slash commands + status are OPTIONAL too; BC_FAKE_NO_COMMANDS simulates a
 // harness that never implemented them.
 if (!process.env.BC_FAKE_NO_COMMANDS) {

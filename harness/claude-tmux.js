@@ -288,8 +288,47 @@ const CONTEXT_WINDOWS = [
   ['haiku', 200000],
 ];
 
+// ---------- interrupt: the queued input claude would submit after the Esc ----------
+// Messages typed into a busy claude wait in a queue, and an Esc submits every
+// one of them as a new turn (verified 2.1.283). The board's own wake lines are
+// what piles up there, and a lieutenant woken by one re-drains the order the
+// captain just stopped. So before the Esc: pull the queue into the composer
+// (Up, which claude offers only while the composer is EMPTY) and clear it when
+// every line is a board nudge. Anything else is someone's words: it stays in
+// the composer, where the Esc does not submit it.
+const QUEUED_HINT_RE = /Press up to edit queued messages/;
+// The lines server/delivery.js types (wakeLine, the respawn nudge).
+const NUDGE_RE = /^\[bridge-commander\] .* — run: bc-axi drain$/;
+const RULE_RE = /^─{10,}\s*$/;
+
+// composerLines(screen) -> the text lines inside the composer box: between the
+// last two horizontal rules, prompt glyph and indent stripped, blanks dropped.
+function composerLines(screen) {
+  const lines = String(screen || '').split('\n');
+  const rules = [];
+  lines.forEach((l, i) => { if (RULE_RE.test(l)) rules.push(i); });
+  if (rules.length < 2) return null;
+  return lines.slice(rules[rules.length - 2] + 1, rules[rules.length - 1])
+    .map((l) => l.replace(/^❯\s?/, '').trim()).filter(Boolean);
+}
+
+async function beforeInterrupt(target, t) {
+  const before = composerLines(await t.capture(target, 0));
+  if (!before || before.length !== 1 || !QUEUED_HINT_RE.test(before[0])) return;
+  await t.sendKey(target, 'Up');
+  await t.sleep(300);
+  const queued = composerLines(await t.capture(target, 0));
+  if (!queued || !queued.length || !queued.every((l) => NUDGE_RE.test(l))) return;
+  // C-u clears the cursor's line; BSpace then joins it to the one above.
+  for (let i = queued.length - 1; i >= 0; i--) {
+    await t.sendKey(target, 'C-u');
+    if (i) await t.sendKey(target, 'BSpace');
+  }
+}
+
 const profile = {
   name: 'claude',
+  beforeInterrupt,
   settle: SETTLE,
   // `--session-id <uuid>` makes the resume id known at birth (verified 2.1.202).
   idAtBirth: () => crypto.randomUUID(),
@@ -359,6 +398,7 @@ module.exports = { ...tmuxAdapter(profile),
   // Exported for the tests that pin the style list against a temp directory and
   // the built-ins against the binary.
   outputStyles, BUILTIN_OUTPUT_STYLES,
+  composerLines, NUDGE_RE,
   // Exported for the test that pins them against REAL captured screens. These
   // regexes decide whether an unattended revival works or sits on a menu until
   // it is given up on, and that is not a judgement to make by reading them.

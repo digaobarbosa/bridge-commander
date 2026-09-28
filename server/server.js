@@ -529,6 +529,7 @@ const BUILTIN_KINDS = {
   // an entry here they render on the timeline with no emoji.
   reset: { emoji: '🧹', level: 1 },
   'worker-send': { emoji: '📨', level: 2 },
+  interrupted: { emoji: '⏹️', level: 2 },
   'pr-merged': { emoji: '🟣', level: 2 },
   permission: { emoji: '🔐', level: 2 },
   // A tracked plugin command (an activity) that failed or timed out. Level 1,
@@ -843,7 +844,9 @@ async function respawnFresh(lt, harness) {
   const window = lt.ref.window || names.LIEUTENANT_WINDOW;
   try { await harnessFor(lt.ref).kill({ ...lt.ref, window }); }
   catch (e) { console.error(now() + ' kill failed relaunching ' + lt.id + ': ' + String((e && e.message) || e)); }
-  return impl.spawn(lt.ref.cwd, respawnPrompt(lt), ltLaunchOpts(lt, { session, window }, harness || lt.ref.harness));
+  const ref = await impl.spawn(lt.ref.cwd, respawnPrompt(lt), ltLaunchOpts(lt, { session, window }, harness || lt.ref.harness));
+  lt.lastInputAt = now(); // the respawn prompt is a turn (agentBusy)
+  return ref;
 }
 
 async function spawnLieutenant(body) {
@@ -890,10 +893,14 @@ async function spawnLieutenant(body) {
   }
   if (existing) {
     existing.ref = ref;
+    existing.lastInputAt = now(); // the launch prompt is a turn (agentBusy)
     if (model) existing.model = model; else delete existing.model;
     return { lieutenant: existing, spawned: true };
   }
-  return Object.assign({ spawned: true }, createLieutenant(Object.assign({}, body, { id, ref })));
+  const out = Object.assign({ spawned: true }, createLieutenant(Object.assign({}, body, { id, ref })));
+  const born = findLieutenant(id);
+  if (born && !out.error) born.lastInputAt = now();
+  return out;
 }
 
 // lieutenant.retire — explicit only (the DNA). Refuses while the lieutenant
@@ -1006,6 +1013,7 @@ const delivery = createDelivery({
     const ref = lt.ref;
     return Promise.resolve()
       .then(() => harnessFor(ref).send(ref, text))
+      .then(() => { lt.lastInputAt = now(); })
       .catch((e) => {
         console.error(now() + ' wake failed for ' + ltId + ' (' + ref.harness + ':' + ref.session + '): '
           + String((e && e.message) || e));
@@ -1159,7 +1167,8 @@ function publicBoard(user) {
     // conversation still names whoever a `target: "line"` post would reach.
     line: holder ? holder.id : null,
     cards: board.cards.map((c) => publicCard(c, user)),
-    workers: board.workers.map(withStatusAge),
+    workers: board.workers.map((w) => Object.assign({}, withStatusAge(w),
+      { busy: agentBusy(w), canInterrupt: canInterrupt(w.ref) })),
     // Held permission asks — in memory only, never in board.json (storedBoard
     // never sees them): a restart drops the held requests they stand for.
     permissions: permissions.list(),
@@ -1170,6 +1179,8 @@ function publicBoard(user) {
     // chatOwed/chatQueued mirror status.owed/owedState:'queued' for a
     // lieutenant's MAIN chat — both queue-derived, same rules as cards.
     lieutenants: board.lieutenants.map((l) => Object.assign({}, withStatusAge(l), {
+      busy: isHarnessRef(l.ref) && agentBusy(l),
+      canInterrupt: canInterrupt(l.ref),
       chatOwed: delivery.owed('lieutenant:' + l.id) !== null,
       chatQueued: delivery.owed('lieutenant:' + l.id) === 'queued',
     })),
@@ -1306,26 +1317,72 @@ function paneWindows(card) {
   }
   return out;
 }
-function resolvePaneRef(kind, id, want) {
+// resolveAgentRef(kind, id) -> { ref, reason, card?, worker?, lt? } — the
+// agent's OWN ref, before any pane window: what interrupt addresses.
+function resolveAgentRef(kind, id) {
   if (kind === 'cards') {
     const card = findCard(id);
     const w = card && findWorker(card.id);
     if (!card) return { ref: null, reason: 'unknown card: ' + id };
     if (card.column !== 'working') return { ref: null, reason: 'card is not Working' };
     if (!w) return { ref: null, reason: 'no worker bound to ' + id };
-    // `want` is the caller asking for one of the offered windows by name —
-    // honoured only if the CARD listed it, so a request can never name a window
-    // of its own. Unlisted or absent falls back to the card's first offer, then
-    // to the worker's own window.
-    const offered = paneWindows(card);
-    const win = want && offered.includes(want) ? want : offered[0];
-    if (win) return { ref: Object.assign({}, w.ref, { window: win }), reason: '' };
-    return { ref: w.ref, reason: '' };
+    return { ref: w.ref, reason: '', card, worker: w };
   }
   const lt = findLieutenant(id);
   if (!lt) return { ref: null, reason: 'unknown lieutenant: ' + id };
   if (!isHarnessRef(lt.ref)) return { ref: null, reason: 'lieutenant has no live session' };
-  return { ref: lt.ref, reason: '' };
+  return { ref: lt.ref, reason: '', lt };
+}
+function resolvePaneRef(kind, id, want) {
+  const r = resolveAgentRef(kind, id);
+  if (!r.card) return { ref: r.ref, reason: r.reason };
+  // `want` is the caller asking for one of the offered windows by name —
+  // honoured only if the CARD listed it, so a request can never name a window
+  // of its own. Unlisted or absent falls back to the card's first offer, then
+  // to the worker's own window.
+  const offered = paneWindows(r.card);
+  const win = want && offered.includes(want) ? want : offered[0];
+  if (win) return { ref: Object.assign({}, r.ref, { window: win }), reason: '' };
+  return { ref: r.ref, reason: '' };
+}
+// interruptAgent(kind, id, actor) -> { code, body } — stop the agent's running
+// turn through the harness's optional interrupt verb. The session stays up.
+//
+// Only a BUSY agent, and one request at a time: a second Escape on an idle
+// claude opens its Rewind menu, and on codex it enters backtrack mode, where
+// the next send's Enter rewinds the conversation.
+const interrupting = new Set();
+async function interruptAgent(kind, id, actor) {
+  const { ref, reason, card, worker, lt } = resolveAgentRef(kind, id);
+  if (!ref) return { code: 404, body: { error: reason } };
+  let impl;
+  try { impl = harnessFor(ref); }
+  catch (e) { return { code: 404, body: { error: String((e && e.message) || e) } }; }
+  if (typeof impl.interrupt !== 'function') {
+    return { code: 501, body: { error: 'harness "' + ref.harness + '" cannot interrupt', unsupported: true } };
+  }
+  const key = paneKey(ref);
+  if (interrupting.has(key) || !agentBusy(worker || lt)) {
+    return { code: 409, body: { error: keyOf(ref) + ' is not in a turn — nothing to stop', idle: true } };
+  }
+  interrupting.add(key);
+  try {
+    let up = false;
+    try { up = await impl.alive(ref); } catch { up = false; }
+    if (!up) return { code: 409, body: { error: 'no live session for ' + keyOf(ref) } };
+    try { await impl.interrupt(ref); }
+    catch (e) { return { code: 502, body: { error: String((e && e.message) || e) } }; }
+  } finally { interrupting.delete(key); }
+  if (worker) {
+    workers.transition(worker, 'interrupted', { interruptedAt: now() });
+    store.cardEvent(card, { text: 'worker ' + keyOf(ref) + ' interrupted', actor }, { kind: 'interrupted' });
+  } else {
+    lt.interruptedAt = now();
+    delivery.hush(lt.id); // the pending order must not restart the turn the captain just stopped
+  }
+  store.save();
+  broadcast();
+  return { code: 200, body: { ok: true, session: keyOf(ref) } };
 }
 const panes = new Map(); // paneKey -> { clients: Set<res>, handle, last }
 function paneKey(ref) { return ref.harness + '/' + keyOf(ref); }
@@ -1800,6 +1857,19 @@ const AGENT_STATUS_STALE_MS = 10 * 60 * 1000;
 // Derived at serialization, never stored: the same untouched record reads
 // fresh and later stale with no writer involved. The flag is all the server
 // says — how (or whether) to show an old reading is the UI's call.
+// agentBusy(rec) — is a lieutenant or worker in a turn? Busy from the last
+// time the board typed into it (brief, send, wake) until a turn-end or an
+// interrupt: claude's Stop hook skips an interrupted turn, so the interrupt
+// stamp has to close it.
+function agentBusy(rec) {
+  if (!rec || rec.done || rec.paused) return false;
+  const at = (k) => (rec[k] ? Date.parse(rec[k]) || 0 : 0);
+  return Math.max(at('lastInputAt'), at('spawnedAt')) > Math.max(at('lastTurnEnd'), at('interruptedAt'));
+}
+// canInterrupt(ref) — its harness offers the optional interrupt verb (the UI hides ⏹ otherwise).
+function canInterrupt(ref) {
+  try { return isHarnessRef(ref) && typeof harnessFor(ref).interrupt === 'function'; } catch { return false; }
+}
 function withStatusAge(rec) {
   const st = rec && rec.agentStatus;
   const at = st && st.ts ? Date.parse(st.ts) : NaN;
@@ -3838,6 +3908,17 @@ const server = http.createServer(async (req, res) => {
       try { await impl.paneInput(ref, { key: body.key, text: body.text }); }
       catch (e) { return sendJson(res, 502, { error: String((e && e.message) || e) }); }
       return sendJson(res, 200, { ok: true });
+    }
+
+    // ----- interrupt (⏹ — stop the agent's running turn, like Esc in its terminal) -----
+    // The card target is its live WORKER, never a sibling pane window.
+    // 404 nothing to stop, 409 idle or no live session, 501 the harness cannot, 502 it refused.
+    const interruptRoute = /^\/api\/(cards|lieutenants)\/([^/]+)\/interrupt$/.exec(p);
+    if (interruptRoute && req.method === 'POST') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const r = await interruptAgent(interruptRoute[1], decodeURIComponent(interruptRoute[2]),
+        String(body.actor || 'user').slice(0, 60));
+      return sendJson(res, r.code, r.body);
     }
 
     // ----- sysload stream (⚙️ → monitoring; see the sysload section above) -----
