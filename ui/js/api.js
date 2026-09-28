@@ -124,6 +124,8 @@ export const api = {
   // a keystroke into a live pane. `url` is the pane's own input door (pane.js
   // builds it with the window query), bounded so a stalled key cannot wedge
   // the ones queued behind it.
+  // stop the agent's running turn (⏹ / Esc); kind is 'cards' or 'lieutenants'
+  interrupt: (kind, id) => j('POST', '/api/' + kind + '/' + encodeURIComponent(id) + '/interrupt', { actor: 'user' }),
   paneInput: (url, payload, timeoutMs) => j('POST', url, payload, timeoutMs),
   // slash commands the current chat target's harness answers (composer autocomplete)
   commands: (target) => j('GET', '/api/commands?target=' + encodeURIComponent(target)),

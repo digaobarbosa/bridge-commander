@@ -199,7 +199,7 @@ verbs for features not every harness can honor. The port never validates them (r
 one would force every harness, `fake` included, to implement it); the server
 capability-checks at the call site (`typeof impl.openPane === 'function'`) and degrades
 gracefully when the verb is absent. Current optional verbs (pane viewing, slash commands,
-session status, window adoption, the brief file, pane pids):
+session status, window adoption, the brief file, pane pids, interrupt):
 
 | Verb | Signature | Called by | Purpose |
 |---|---|---|---|
@@ -212,6 +212,7 @@ session status, window adoption, the brief file, pane pids):
 | `harness.adoptWindow` | `ref, window, taken? → HarnessRef\|null` | ⚙️ supervision | migrate a session-granular ref to window granularity without restarting the agent — the tmux adapters rename the session's first window (the lieutenants registered before their ref carried a window) — `taken` names windows that belong to someone else and must never be adopted; `null` = the agent's window cannot be identified, keep the old ref |
 | `harness.brief` | `ref → path\|null` | ⚙️ card.start | the file the brief was persisted to at spawn, attached to the card as its `brief` artifact on start and resume (deduped by uri); `null` = none, nothing attached |
 | `harness.profileInfo` | `→ {name, adapter, options, permissionModes, requirements, installHint, contextWindows}` | ⚙️ · `bc-axi init` | the profile's DATA, so the core reads a CLI's facts without naming it: the typed options it honors, its permission modes, what it needs on the machine (`bins`, `tmux`, `rootBypass`), its install line and context windows. Not an opts verb, so a binding passes it through; a harness without it honors no typed option |
+| `harness.interrupt` | `ref → void` | ⏹ interrupt | stop the RUNNING TURN and leave the session up for the next message — what Esc does in the agent's terminal. The tmux adapters send the profile's `interruptKeys` (Escape by default); acp sends `session/cancel` through the host. Served over `POST /api/lieutenants/:id/interrupt` and `POST /api/cards/:id/interrupt` (the card's live WORKER, never a sibling pane window): 404 nothing to stop, 409 no live session or not in a turn (`idle: true` — a second Escape on an idle claude opens Rewind, and on codex it arms a backtrack whose Enter rewinds the conversation, so the route never sends one), 501 harness lacks the verb (`unsupported: true`), 502 the harness refused. A worker interrupt lands a level-2 `interrupted` event on the card. A lieutenant interrupt holds every wake line until a NEW queue item arrives (its pending items stay unacked), and claude's `beforeInterrupt` first clears board wake lines queued in its input, which the Esc would otherwise submit as a new turn. The board payload carries `busy` (typed into since the last turn-end or interrupt) and `canInterrupt` on each lieutenant and worker; the UI shows ⏹ only when both hold. CLI: `bc-axi interrupt <lieutenant:ID\|card:ID>` |
 | `harness.panePids` | `ref\|session → [{window, pid}]` | ⚙️ sysload | every pane of the ref's SESSION (all windows), so the load panel can attribute each window to its agent; `[]` when the session is gone. A harness without it has no load rows |
 
 ## Invariants

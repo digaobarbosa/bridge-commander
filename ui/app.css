@@ -276,6 +276,8 @@ body.resizing { user-select: none; cursor: col-resize; }
 }
 .composer-attach:hover { color: var(--accent); border-color: var(--accent2); }
 .composer-attach:disabled { opacity: .4; pointer-events: none; }
+.composer .composer-stop { background: var(--danger); color: #fff; }
+.composer .composer-stop:hover { background: var(--danger); color: #fff; opacity: .85; }
 #chat-send-err {
   flex: none; padding: 6px 12px 0; font-size: 12px; color: var(--danger);
 }

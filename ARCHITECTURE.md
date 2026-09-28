@@ -28,7 +28,9 @@ them drift.
   first, then the server wakes the owning lieutenant — one coalesced
   `[bridge-commander] N pending item(s) — run: bc-axi drain` line typed into its live session,
   with the turn-end hook (`POST /api/turn-end`) re-nudging a lieutenant that ends a turn with
-  items still unacked. Only ack removes; a dead session loses nothing; a server restart is a
+  items still unacked. A busy lieutenant gets at most one wake line per turn, and one the
+  captain stopped (⏹, `POST /api/lieutenants/:id/interrupt`) gets none until a new item
+  arrives — a queued wake would restart the stopped turn. Only ack removes; a dead session loses nothing; a server restart is a
   non-event. `server/delivery.js` owns all of it — queues, cursors, wakes, the owed projection —
   reading the queue files once at boot; the server is their only writer. What a drained item
   says to its reader — a head and a next-action hint per kind — is `server/feedtext.js`,

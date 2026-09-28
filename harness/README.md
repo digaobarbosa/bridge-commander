@@ -126,7 +126,7 @@ The port also exports `keyOf(ref)` — the state key (`session` or
 `isSpawnableSession(name)`, the `bc-<id>` rule `spawn` enforces. Nothing outside
 the harness builds either.
 
-## Optional capability verbs (pane viewing, slash commands, session status, window adoption, brief, pane pids)
+## Optional capability verbs (pane viewing, slash commands, session status, window adoption, brief, pane pids, interrupt)
 
 Optional verbs are features not every harness can honor, so `port.js` never
 validates them — adding one to the required list would force every harness
@@ -137,7 +137,7 @@ and degrades gracefully when the verb is absent (the pane endpoints answer
 
 **The inventory lives in one place:** [`docs/api/overview.md`](../docs/api/overview.md), which
 lists every optional verb with its signature and the endpoint it serves — `openPane`,
-`paneSnapshot`, `paneInput`, `commands`, `runCommand`, `status`, `adoptWindow`, `brief`, `panePids`. Add a verb
+`paneSnapshot`, `paneInput`, `commands`, `runCommand`, `status`, `adoptWindow`, `brief`, `panePids`, `interrupt`. Add a verb
 there; what follows is how to implement them, not what they are.
 
 `brief(ref, opts?)` names the file the brief was persisted to at spawn
@@ -152,6 +152,12 @@ session — all its windows, not only the ref's — so the load panel
 cards. The tmux adapters read `list-panes -s` on the exact-match `=<session>:`
 target, like every other tmux call here; `[]` when tmux or the session is gone.
 The fake has no processes and does not offer it: its agents have no load rows.
+
+`interrupt(ref)` stops the running turn and leaves the session alive. The tmux
+adapters send the profile's `interruptKeys` (default `['Escape']`) to the pane
+and throw when the pane is gone; acp calls the host's `cancel`, which sends
+`session/cancel`. It is not `kill`: nothing ends, and the next `send` is a new
+turn. The fake logs an `interrupt` line to `<key>.pane.jsonl`.
 
 `runCommand(ref, line, opts?)` and `status(ref, opts?)` take the same `opts` bag;
 `stateDir` matters there, because codex resolves its thread-id from the

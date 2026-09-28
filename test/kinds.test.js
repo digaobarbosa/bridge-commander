@@ -39,6 +39,7 @@ const BUILTINS = {
   line: { emoji: '📞', level: 2 },
   reset: { emoji: '🧹', level: 1 },
   'worker-send': { emoji: '📨', level: 2 },
+  interrupted: { emoji: '⏹️', level: 2 },
   'pr-merged': { emoji: '🟣', level: 2 },
   permission: { emoji: '🔐', level: 2 },
   'activity-failed': { emoji: '🧯', level: 1 },

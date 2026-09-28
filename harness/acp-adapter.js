@@ -455,6 +455,19 @@ function acpAdapter(profile, deps = {}) {
     return back;
   }
 
+  /** interrupt(ref) — session/cancel for the running turn; the session stays open for the next prompt. */
+  async function interrupt(ref) {
+    const stateDir = stateDirOf(ref);
+    const key = keyOf(ref);
+    if (!stateDir) throw new Error(`session ${key} is not alive`);
+    try {
+      await host.call(stateDir, 'cancel', { key });
+    } catch (e) {
+      if (hostDown(e) || e.code === NOT_ALIVE) throw new Error(`session ${key} is not alive`);
+      throw e;
+    }
+  }
+
   /** kill(ref) — session/close when advertised, then end the agent process. Idempotent; state files stay. */
   async function kill(ref) {
     const stateDir = stateDirOf(ref);
@@ -567,7 +580,7 @@ function acpAdapter(profile, deps = {}) {
   }
 
   return {
-    spawn, send, alive, resumable, resume, kill, onTurnEnd,
+    spawn, send, alive, resumable, resume, kill, interrupt, onTurnEnd,
     openPane, paneSnapshot, commands, runCommand, status, brief, profileInfo,
   };
 }

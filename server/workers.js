@@ -43,6 +43,10 @@ const TRANSITIONS = {
   'kill-failed': [],
   killed: ['killFailed'],
   'teardown-ran': [],
+  // the board typed into the worker (busy until the next turn-end or interrupt)
+  input: [],
+  // its running turn was stopped; the session stays for the next message
+  interrupted: [],
 };
 
 /**
@@ -751,6 +755,7 @@ function createWorkers(deps) {
     } catch (e) {
       return { error: 'delivery to ' + refKey(w.ref) + ' failed: ' + errText(e), code: 502 };
     }
+    transition(w, 'input', { lastInputAt: iso() });
     const ev = note(card, { text: 'sent to worker: ' + text.slice(0, 1900), actor: (body && body.actor) || 'agent' }, { kind: 'worker-send' });
     return { ok: true, event: ev, session: refKey(w.ref) };
   }

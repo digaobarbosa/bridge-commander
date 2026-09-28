@@ -69,7 +69,7 @@ function promptFile(stateDir, key) {
 
 /**
  * tmuxAdapter(profile) -> harness impl (the seven verbs plus the optional
- * pane, command, status, brief, panePids and adoptWindow verbs).
+ * pane, command, status, brief, panePids, adoptWindow and interrupt verbs).
  */
 function tmuxAdapter(profile) {
   const callbackOf = (opts) => opts.callbackUrl || process.env.BC_TURNEND_URL || '';
@@ -226,6 +226,18 @@ function tmuxAdapter(profile) {
     await s.killPane(ref.session, ref.window);
   }
 
+  /**
+   * interrupt(ref) — stop the running turn the way a person would: the
+   * profile's interrupt keys (Escape unless it says otherwise). The session
+   * stays alive and ready for the next message. Throws when the pane is gone.
+   */
+  async function interrupt(ref) {
+    if (!(await s.paneExists(ref.session, ref.window))) throw new Error(`pane ${s.keyOf(ref)} is gone`);
+    const target = s.paneTarget(ref.session, ref.window);
+    if (profile.beforeInterrupt) await profile.beforeInterrupt(target, t);
+    for (const key of profile.interruptKeys || ['Escape']) await t.sendKey(target, key);
+  }
+
   /** brief(ref, opts?) -> path | null — the brief spawn persisted for this agent, when it is on disk. */
   function brief(ref, opts = {}) {
     const file = promptFile(s.stateDirOf(opts), s.keyOf(ref));
@@ -269,7 +281,7 @@ function tmuxAdapter(profile) {
   }
 
   return {
-    spawn, send, alive, resumable, resume, kill,
+    spawn, send, alive, resumable, resume, kill, interrupt,
     onTurnEnd: s.onTurnEnd,
     openPane: s.openPane, paneSnapshot: s.paneSnapshot, paneInput: s.paneInput,
     adoptWindow: s.adoptWindow, panePids: s.panePids,

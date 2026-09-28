@@ -13,6 +13,7 @@ import { isEchoOf, addPending, pendingFor } from './pending.js';
 import { fileContextBlock } from './filectx.js';
 import { CHAT_KEY, CLOSED, encodeChat, decodeChat } from './chatmem.js';
 import { slashOptions } from './slash.js';
+import { interruptTarget, escInterrupts } from './interrupt.js';
 import { cardPermissions, mainChatPermissions, permBlockHtml, capturePermFocus, hydratePermInputs } from './perms.js';
 
 const feedEl = document.getElementById('chat-feed');
@@ -392,6 +393,7 @@ function ltTriggerHtml(lt) {
 
 export function renderChat() {
   const target = currentTarget();
+  stopBtn.hidden = !interruptTarget(target, S.doc);
   if (!target) {
     backBtn.hidden = true;
     openBtn.hidden = true;
@@ -927,4 +929,30 @@ inputEl.onkeydown = (e) => {
   }
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
 };
+// ---------- stop (⏹ and Esc) ----------
+// The button is a tap target for a phone; Esc is the same verb from a keyboard.
+// Both stop the running turn only — the agent stays up for the next message.
+const stopBtn = document.getElementById('chat-stop');
+async function stopAgent(t) {
+  if (stopBtn.disabled) return;
+  stopBtn.disabled = true;
+  try { await api.interrupt(t.kind, t.id); }
+  catch (e) { setSendError('could not stop the agent: ' + e.message); }
+  finally { stopBtn.disabled = false; }
+}
+stopBtn.onclick = () => {
+  const t = interruptTarget(currentTarget(), S.doc);
+  if (t) stopAgent(t);
+};
+// escInterrupt(e) -> true when this Esc stopped the agent. main.js asks it
+// after every overlay had its turn, so an open menu still closes first.
+export function escInterrupt(e) {
+  if (e.target !== inputEl || inputEl.disabled) return false;
+  const t = escInterrupts({ value: inputEl.value, attachments: pendingAtts.length, menuOpen: slash.open,
+    target: currentTarget(), doc: S.doc });
+  if (!t) return false;
+  e.preventDefault();
+  stopAgent(t);
+  return true;
+}
 document.getElementById('chat-form').onsubmit = (e) => { e.preventDefault(); send(); };

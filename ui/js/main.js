@@ -13,7 +13,7 @@ import { renderBulkBar } from './bulk.js';
 import { selectionOn, exitSelection } from './selection.js';
 import { renderArchive } from './archtable.js';
 import { renderFilterUI, filterPanelOpen, closeFilterPanel } from './filterpop.js';
-import { renderChat, onOpenCard as chatOnOpenCard, openCardConversation, openLieutenantChat, onQuoteSource } from './chat.js';
+import { renderChat, onOpenCard as chatOnOpenCard, openCardConversation, openLieutenantChat, onQuoteSource, escInterrupt } from './chat.js';
 import { onModeSwitch, forgetFile, fileOpen, fileName, fileQuote } from './filepane.js';
 import { renderLtSwitcher, ltSwitcherOpen, closeLtSwitcher, ltSettingsOpen, closeLtSettings } from './ltswitcher.js';
 import { renderDetail, openDetail, closeDetail, detailOpen, auxDetailKey, closeArtifact, artifactOpen, onArtifactClose, artifactWritten, talkOnCard } from './detail.js';
@@ -363,6 +363,7 @@ document.addEventListener('keydown', (e) => {
     else if (S.notifOpen) { S.notifOpen = false; render(); }
     else if (selectionOn()) { exitSelection(); render(); } // leave selection mode
     else if (!spEl.hidden) { spEl.hidden = true; gearBtn.classList.remove('on'); }
+    else if (escInterrupt(e)) return; // nothing on top: Esc in an empty composer stops the agent
     else if (detailOpen()) closeDetail();
     else if (searchModeOn()) topbarEl.classList.remove('searching'); // collapse first, filters survive
     else if (filtersActive()) { clearFilters(); syncFilterInputs(); }
