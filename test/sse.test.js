@@ -141,3 +141,18 @@ test('boot id changes across a server restart on the same workspace+port', async
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// BR2-4: the browser's own retry after a drop comes in 1s, not Chrome's 3s
+// default — a shorter window for a retry to meet a server still booting.
+test('the board stream opens with retry: 1000', async () => {
+  const s = await startServer();
+  try {
+    const res = await fetch(s.base + '/api/events');
+    const reader = res.body.getReader();
+    const { value } = await reader.read();
+    reader.cancel().catch(() => {});
+    assert.match(new TextDecoder().decode(value), /^retry: 1000\nevent: board\n/);
+  } finally {
+    await s.stop();
+  }
+});

@@ -1,23 +1,24 @@
 // live.js — the board's SSE stream, shared by the flat board and the 3D room.
 //
-// A half-open connection after a server restart can sit silent forever without
-// ever firing onerror, leaving a zombie tab. Two defenses:
-//  - staleness watchdog: the server emits a named `ping` every 25s, so >STALE_MS
-//    of total silence means the stream is dead — tear it down and reconnect;
+// After a server restart the stream can be CLOSED for good (a proxy's 502) or
+// sit half-open and silent. Two defenses:
+//  - streamkeeper.js: reopen a CLOSED stream at once with backoff, and treat
+//    >STALE_MS of silence as dead (the server pings every 5s);
 //  - boot-id: the board payload carries the server instance id, so a restart is
 //    detected even on a fast auto-retry reconnect.
 // Every (re)open also refetches the full board: events missed while stale are
 // gone for good, and the refetch is what heals the tab.
 import { S, applyBoard, onBoard } from './state.js';
 import { api } from './api.js';
+import { keepStream } from './streamkeeper.js';
 
-const STALE_MS = 40000;
+const STALE_MS = 12000; // the server's 5s ping + margin
 let serverBoot = null;
 // Recorded on every doc, whichever path brought it in (SSE, refetch, chat echo).
 onBoard((doc) => { serverBoot = doc.boot || serverBoot; });
 
 function refetchBoard() {
-  api.board().then(applyBoard).catch(() => {}); // still down — the watchdog retries
+  api.board().then(applyBoard).catch(() => {}); // still down — the next reopen retries
 }
 
 /**
@@ -27,13 +28,14 @@ function refetchBoard() {
  */
 export function startLive({ onConnection = () => {}, onArtifact = null } = {}) {
   let es = null;
-  let lastEventAt = Date.now();
+  let keeper = null;
   const setConnected = (on) => { S.connected = on; onConnection(on); };
   function connect() {
     if (es) es.close();
+    if (keeper) setConnected(false); // a reopen: the old stream is gone
     es = new EventSource('/api/events');
     es.addEventListener('board', (e) => {
-      lastEventAt = Date.now();
+      keeper.alive();
       const doc = JSON.parse(e.data);
       const restarted = serverBoot && doc.boot && doc.boot !== serverBoot;
       applyBoard(doc);
@@ -41,22 +43,17 @@ export function startLive({ onConnection = () => {}, onArtifact = null } = {}) {
     });
     // Not a board payload: no re-render, nothing else reacts.
     es.addEventListener('artifact', (e) => {
-      lastEventAt = Date.now();
+      keeper.alive();
       if (onArtifact) try { onArtifact(JSON.parse(e.data)); } catch (err) {}
     });
-    es.addEventListener('ping', () => { lastEventAt = Date.now(); });
+    es.addEventListener('ping', () => keeper.alive());
     es.onopen = () => {
-      lastEventAt = Date.now();
+      keeper.opened();
       setConnected(true);
       refetchBoard(); // anything pushed while we were away is unrecoverable — resync
     };
-    es.onerror = () => setConnected(false);
+    const mine = es;
+    es.onerror = () => { setConnected(false); keeper.error(mine); };
   }
-  connect();
-  setInterval(() => {
-    if (Date.now() - lastEventAt <= STALE_MS) return;
-    lastEventAt = Date.now(); // one reconnect per stale window
-    setConnected(false);
-    connect();
-  }, 5000);
+  keeper = keepStream({ connect, staleMs: STALE_MS });
 }

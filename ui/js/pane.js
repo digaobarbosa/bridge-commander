@@ -17,6 +17,7 @@ import { keyForEvent } from './panekeys.js';
 import { terminalLink, cardTarget, lieutenantTarget } from './terminal.js';
 import { getTerminalMode, onTerminalMode } from './terminalsettings.js';
 import { push as toast } from './toast.js';
+import { keepStream } from './streamkeeper.js';
 
 const overlay = document.getElementById('pane-overlay');
 const titleEl = document.getElementById('pane-title');
@@ -26,6 +27,9 @@ const msgEl = document.getElementById('pane-msg');
 const hintEl = document.getElementById('pane-hint');
 const termEl = document.getElementById('pane-term');
 let es = null;
+let keeper = null;               // reopens es while the drawer is open
+// The server pings pane streams every 5s; longer silence means a dead stream.
+const STALE_MS = 12000;
 let inputUrl = null;
 let termTarget = null;          // { session, window } of what the drawer shows
 
@@ -47,7 +51,10 @@ termEl.onclick = (e) => {
 };
 onTerminalMode(drawTerm);
 
-function stop() { if (es) { es.close(); es = null; } }
+function stop() {
+  if (keeper) { keeper.stop(); keeper = null; }
+  if (es) { es.close(); es = null; }
+}
 function setLive(on) {
   liveEl.classList.toggle('on', on);
   liveEl.title = on ? 'live' : 'not streaming';
@@ -142,8 +149,19 @@ function open(url, title, inputAt) {
   setLive(false);
   overlay.hidden = false;
   setHint();
+  keeper = keepStream({ connect: () => connect(url), staleMs: STALE_MS });
+}
+
+function connect(url) {
+  if (es) es.close();
+  setLive(false);
   es = new EventSource(url);
+  const mine = es;
+  const alive = () => { if (keeper) keeper.alive(); };
+  es.addEventListener('ping', alive);
+  es.onopen = () => { if (keeper) keeper.opened(); };
   es.addEventListener('frame', (e) => {
+    alive();
     let frame;
     try { frame = JSON.parse(e.data); } catch (err) { return; }
     // Frames are whole-screen snapshots: replace, don't append. Stick to the
@@ -168,7 +186,8 @@ function open(url, title, inputAt) {
     try { reason = (JSON.parse(e.data) || {}).reason || ''; } catch (err) { /* plain message */ }
     showMsg('no live pane' + (reason ? ' — ' + reason : ''));
   });
-  es.onerror = () => setLive(false); // EventSource reconnects on its own
+  // EventSource retries only while CONNECTING; the keeper reopens a CLOSED stream.
+  es.onerror = () => { setLive(false); if (keeper) keeper.error(mine); };
 }
 
 // ---------- tabs ----------

@@ -1202,6 +1202,9 @@ function setStatus(card, body) {
 // Every stream the board serves (board, pane peek, sysload) opens the same way
 // and speaks the same named-event frame, so a proxy or client quirk is fixed once.
 const SSE_HEADERS = { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' };
+// A line that opens the first frame of the board and pane streams: the browser's
+// own retry after a dropped connection comes in 1s instead of 3s.
+const SSE_RETRY = 'retry: 1000\n';
 /** sseFrame(event, data) -> one named SSE frame; `data` defaults to {}. */
 function sseFrame(event, data) {
   return 'event: ' + event + '\ndata: ' + JSON.stringify(data === undefined ? {} : data) + '\n\n';
@@ -1332,6 +1335,7 @@ function paneKey(ref) { return ref.harness + '/' + keyOf(ref); }
 function paneWrite(res, event, data) { res.write(sseFrame(event, data)); }
 function paneStream(req, res, ref, reason) {
   res.writeHead(200, SSE_HEADERS);
+  res.write(SSE_RETRY);
   if (!ref) { paneWrite(res, 'no-pane', { reason }); return res.end(); }
   let impl;
   try { impl = harnessFor(ref); }
@@ -1432,11 +1436,13 @@ const sysload = createSampler({ workspace: WORKSPACE, targets: sysloadTargets, p
 // Named ping (not an SSE comment): comments are invisible to EventSource, so
 // the client's staleness watchdog couldn't see the stream is alive. Pane
 // streams piggyback on the same ping so proxies don't drop them either.
+// Every 5s so a half-open stream behind a proxy is caught in ~12s, without
+// waking a phone radio as often as a 1-2s ping would.
 setInterval(() => {
   const ping = sseFrame('ping');
   for (const res of sseClients) res.write(ping);
   for (const hub of panes.values()) for (const res of hub.clients) res.write(ping);
-}, 25000).unref();
+}, 5000).unref();
 
 // ---------- helpers ----------
 // Byte serve shared by the raw artifact and attachment routes. Honors a single
@@ -3856,7 +3862,7 @@ const server = http.createServer(async (req, res) => {
     // ----- SSE -----
     if (route === 'GET /api/events') {
       res.writeHead(200, SSE_HEADERS);
-      res.write(sseFrame('board', publicBoard('user')));
+      res.write(SSE_RETRY + sseFrame('board', publicBoard('user')));
       sseClients.add(res);
       req.on('close', () => sseClients.delete(res));
       return;

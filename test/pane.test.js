@@ -197,6 +197,15 @@ test('no live worker / card not Working / unknown targets → no-pane', async ()
   } finally { await teardown(); }
 });
 
+// BR2-4: the browser retries a dropped pane in 1s, not Chrome's 3s default.
+test('a pane stream opens with retry: 1000, guard events included', async () => {
+  const { s, teardown } = await boot();
+  try {
+    const text = await (await fetch(s.base + '/api/cards/never-was/pane/stream')).text();
+    assert.match(text, /^retry: 1000\nevent: no-pane\n/);
+  } finally { await teardown(); }
+});
+
 // ---------- ⌨️ pane input: the write half, same ref resolution ----------
 
 test('card pane input: keys and text reach the ref the stream would have watched', async () => {
