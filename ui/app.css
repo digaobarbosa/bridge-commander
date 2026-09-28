@@ -64,6 +64,8 @@ input, textarea, select { font: inherit; color: var(--text); }
 }
 #topbar h1 { font-size: 15px; font-weight: 650; letter-spacing: .4px; white-space: nowrap; }
 #b-subtitle { color: var(--faint); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; }
+/* the auto margin keeps the switcher and every control after it on the right edge */
+#view-seg { margin-left: auto; }
 /* the filter row tops the board region; its left padding matches #board's so
    the input starts on the first column's edge */
 #filter-wrap { display: flex; align-items: center; gap: 6px; flex: none; min-width: 0; padding: 10px 14px 0; }
