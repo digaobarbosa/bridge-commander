@@ -12,6 +12,17 @@ const { execFile } = require('node:child_process');
 
 const RELAY = path.join(__dirname, '..', 'codex-notify.js');
 
+// The relay only trusts a thread that has a rollout (codex's side threads have
+// none), so the conversations these tests speak for get one.
+const SESSIONS = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-codex-sessions-'));
+process.env.BC_CODEX_SESSIONS_DIR = SESSIONS;
+function rollout(threadId) {
+  const day = path.join(SESSIONS, '2026', '09', '28');
+  fs.mkdirSync(day, { recursive: true });
+  fs.writeFileSync(path.join(day, 'rollout-2026-09-28T08-00-00-' + threadId + '.jsonl'), '');
+}
+for (const id of ['019f49a7-81f4-7ad3-822d-3acf8cf81ed6', 'fresh-thread-id']) rollout(id);
+
 function runRelay(args, env = {}) {
   return new Promise((resolve, reject) => {
     execFile('node', [RELAY, ...args], { encoding: 'utf8', env: { ...process.env, ...env } },
@@ -146,4 +157,17 @@ test('codex-notify trims and caps the text, and omits it when codex said nothing
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('codex-notify ignores a side thread with no rollout (the task-title thread)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-codex-notify-'));
+  try {
+    await runRelay([dir, 'bc-x9', payload()]);
+    await runRelay([dir, 'bc-x9', payload({ 'thread-id': 'title-thread-id',
+      'input-messages': ['Generate a concise, single-line task title'], 'last-assistant-message': '{"title":"x"}' })]);
+    assert.strictEqual(fs.readFileSync(path.join(dir, 'bc-x9.session-id'), 'utf8'),
+      '019f49a7-81f4-7ad3-822d-3acf8cf81ed6\n', 'the conversation keeps its resume id');
+    const lines = fs.readFileSync(path.join(dir, 'bc-x9.turnend.jsonl'), 'utf8').trim().split('\n');
+    assert.strictEqual(lines.length, 1, 'no turn-end for the side thread');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
