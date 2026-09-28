@@ -37,7 +37,7 @@ test('launch line: both bypass flags and the notify relay wired to the state dir
     codex.spawn(cwd, 'go', { session: 'bc-cx', window: 'w-1', stateDir: sd, callbackUrl: 'http://127.0.0.1:1/api/turn-end', extraArgs: ['--model', 'm'] }));
   const notify = JSON.stringify(['node', path.join(__dirname, '..', 'codex-notify.js'), stateDir, 'bc-cx:w-1', 'http://127.0.0.1:1/api/turn-end']);
   assert.strictEqual(lines[0], 'codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust '
-    + `-c 'notify=${notify}' '--model' 'm'`);
+    + `-c check_for_update_on_startup=false -c 'notify=${notify}' '--model' 'm'`);
 });
 
 // codex has no board-relayed approval hook, so a board configured to ask
