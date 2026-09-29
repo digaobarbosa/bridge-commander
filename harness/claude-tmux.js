@@ -61,6 +61,8 @@ const PERMISSION_HOOK_SCRIPT = path.join(__dirname, 'permission-hook.js');
 // captain time to see the board. The hook's own fetch gives up a little sooner.
 const PERMISSION_HOOK_TIMEOUT_S = 3600;
 const TRUST_RE = /Yes, I trust this folder|Quick safety check/;
+// claude's permission dialog, cursor on "1. Yes" — where Enter means approve.
+const APPROVE_PRESELECTED_RE = /❯\s*1\.\s*Yes\b/;
 
 // RESUME_RE — the picker `claude --resume` shows when the transcript is big
 // enough to be worth warning about:
@@ -318,7 +320,13 @@ async function paneTailSafe(target) {
 async function send(ref, text) {
   const name = s.stateKey(ref.session, ref.window);
   if (!(await alive(ref))) throw new Error(`session ${name} is not alive`);
-  const verdict = await t.submit(s.paneTarget(ref.session, ref.window), text, {
+  const target = s.paneTarget(ref.session, ref.window);
+  // A permission dialog preselects "1. Yes": our text + Enter would approve it
+  // behind the captain's back. Wakes are retried by the supervisor tick.
+  if (APPROVE_PRESELECTED_RE.test(await paneTailSafe(target))) {
+    throw new Error(`${name} is on a permission prompt; not typing into it`);
+  }
+  const verdict = await t.submit(target, text, {
     retries: Number(process.env.BC_SEND_RETRIES || 3),
     enterSleep: Number(process.env.BC_SEND_SLEEP_MS || 400),
   });
