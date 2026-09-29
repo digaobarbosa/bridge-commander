@@ -38,11 +38,40 @@ export function terminalMode(stored) {
 // target: { session, window? } — null when the mode is off or the names are unsafe.
 export function terminalLink(mode, target) {
   const opener = OPENERS.find((o) => o.key === mode);
-  if (!opener || !opener.link || !target) return null;
+  const cmd = opener && opener.link ? safeAttach(target) : null;
+  return cmd ? opener.link(cmd) : null;
+}
+
+// safeAttach(target) -> the attach command, or null when the names are unsafe.
+export function safeAttach(target) {
+  if (!target) return null;
   const { session, window: win } = target;
   if (!session || !NAME_RE.test(session)) return null;
   if (win && !NAME_RE.test(win)) return null;
-  return opener.link(attachCommand(session, win || null));
+  return attachCommand(session, win || null);
+}
+
+// POSIX single quotes: nothing inside them expands, and a quote closes, gets
+// escaped, and reopens.
+export function shellQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// The prefix is profile data, but it still lands unquoted in a shell line.
+const CLI_RE = /^[A-Za-z0-9_./-]+( [A-Za-z0-9_./-]+)*$/;
+
+// resumeCommand(cli, cwd, id) -> the command that reopens a conversation
+// outside the board, or null. The CLI finds a conversation by project dir, so
+// the cd is part of the address, not a convenience.
+export function resumeCommand(cli, cwd, id) {
+  if (!cli || !CLI_RE.test(cli) || !cwd || !UUID_RE.test(String(id || ''))) return null;
+  return `cd ${shellQuote(cwd)} && ${cli} ${id}`;
+}
+
+// refResume(ref, cli) — cli is the ref's harness profile handResume ('' = none).
+export function refResume(ref, cli) {
+  return ref ? resumeCommand(cli, ref.cwd, ref.resumeId) : null;
 }
 
 // Where an agent lives, from what the board payload already carries: a

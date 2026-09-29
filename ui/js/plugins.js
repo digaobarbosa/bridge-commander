@@ -129,6 +129,12 @@ export function harnesses() {
   const names = Array.isArray(list) ? list.map((h) => (typeof h === 'string' ? h : h && h.name)).filter(Boolean) : [];
   return names.length ? names : FALLBACK_HARNESSES.slice();
 }
+/** The harness's by-hand resume prefix (profile data), or '' when it has none. */
+export function handResumeOf(name) {
+  const list = P.payload && P.payload.harnesses;
+  const h = Array.isArray(list) ? list.find((x) => x && x.name === name) : null;
+  return (h && h.handResume) || '';
+}
 /** The harness a new lieutenant starts on: the server's word, else the first fallback it lists, else its first. */
 export function defaultHarness() {
   const names = harnesses();

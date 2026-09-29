@@ -51,3 +51,39 @@ test('targets: lieutenant ref, card worker ref first, else the card session attr
   assert.deepStrictEqual(cardTarget({ attributes: { session: 'ext' } }, null, 'orch'), { session: 'ext', window: 'orch' });
   assert.strictEqual(cardTarget({ attributes: {} }, null, null), null);
 });
+
+test('safeAttach: the attach command for plain names, null for anything else', async () => {
+  const { safeAttach, attachCommand } = await mod;
+  assert.strictEqual(safeAttach({ session: 'bc-x-lt-ada', window: 'lt' }), attachCommand('bc-x-lt-ada', 'lt'));
+  assert.strictEqual(safeAttach({ session: 'x; rm -rf ~' }), null);
+  assert.strictEqual(safeAttach({ session: 'ok', window: '$(id)' }), null);
+  assert.strictEqual(safeAttach(null), null);
+});
+
+const ID = '0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b';
+const CLI = 'agent --resume'; // any profile prefix; the real one is harness data
+
+test('resumeCommand: cd into the quoted cwd, then the profile prefix and the uuid', async () => {
+  const { resumeCommand } = await mod;
+  assert.strictEqual(resumeCommand(CLI, '/Users/me/dev/proj', ID), `cd '/Users/me/dev/proj' && agent --resume ${ID}`);
+  // a quote in the path closes, is escaped, and reopens; $() and spaces stay literal
+  assert.strictEqual(resumeCommand(CLI, "/tmp/it's $(id) here", ID), `cd '/tmp/it'\\''s $(id) here' && agent --resume ${ID}`);
+});
+
+test('resumeCommand: a non-uuid id, a missing cwd or an unsafe prefix gives null', async () => {
+  const { resumeCommand } = await mod;
+  assert.strictEqual(resumeCommand(CLI, '/p', 'abc; rm -rf ~'), null);
+  assert.strictEqual(resumeCommand(CLI, '/p', ID + ' x'), null);
+  assert.strictEqual(resumeCommand(CLI, '/p', ''), null);
+  assert.strictEqual(resumeCommand(CLI, '', ID), null);
+  assert.strictEqual(resumeCommand('', '/p', ID), null);
+  assert.strictEqual(resumeCommand('x; rm -rf ~ #', '/p', ID), null);
+});
+
+test('refResume: a ref resumes only when its harness has a by-hand prefix', async () => {
+  const { refResume, resumeCommand } = await mod;
+  assert.strictEqual(refResume({ cwd: '/p', resumeId: ID }, CLI), resumeCommand(CLI, '/p', ID));
+  assert.strictEqual(refResume({ cwd: '/p', resumeId: ID }, ''), null);
+  assert.strictEqual(refResume({ cwd: '/p' }, CLI), null);
+  assert.strictEqual(refResume(null, CLI), null);
+});

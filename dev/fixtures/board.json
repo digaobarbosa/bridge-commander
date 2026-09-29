@@ -35,7 +35,7 @@
     {
       "id": "monica", "name": "Monica", "color": "#7c5cff", "avatar": 12, "prefix": "MON", "cardSeq": 14,
       "created": "T-864000", "lastTurnEnd": "T-120", "turns": 342,
-      "ref": { "harness": "claude", "session": "bc-lt-monica", "cwd": "/fake/ws" },
+      "ref": { "harness": "claude", "session": "bc-lt-monica", "cwd": "/fake/ws", "resumeId": "5d1f0a2e-7c3b-4e8a-9f61-2b4c8d0e3a17" },
       "chat": [
         { "author": "user", "text": "monica, auth week: you own the oauth refresh and the hooks polish. Small PRs, as always.", "ts": "T-140500" },
         { "author": "monica", "text": "Copy. Sequencing: hooks polish first (it unblocks the CI hook rex needs), oauth right behind it.", "ts": "T-140400" },
@@ -78,7 +78,7 @@
   "workers": [
     {
       "card": "oauth-token-refresh", "project": "bridge-commander", "branch": "bc/oauth-refresh",
-      "ref": { "harness": "claude", "session": "bc-w-oauth", "cwd": "/fake/wt/oauth" },
+      "ref": { "harness": "claude", "session": "bc-w-oauth", "cwd": "/fake/wt/oauth", "resumeId": "a3e9c4b1-0d52-4f7e-8c36-91b7f2d5e604" },
       "worktree": { "path": "/fake/wt/oauth", "tool": "git" },
       "spawnedAt": "T-80000", "turns": 41, "lastTurnEnd": "T-600",
       "agentStatus": { "model": "claude-fable-5", "contextUsed": 88000, "contextWindow": 200000, "ts": "T-600" }

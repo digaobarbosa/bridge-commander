@@ -365,6 +365,9 @@ const profile = {
   requirements: { bins: ['claude'], tmux: true, rootBypass: true },
   installHint: onboard.INSTALL_HINT,
   contextWindows: CONTEXT_WINDOWS,
+  // What a human types to reopen a conversation by hand: none of the board's
+  // launch flags, since the captain runs it in their own terminal.
+  handResume: 'claude --resume',
 
   // ---- first run (cli/firstrun.js frames these) ----
   handRunLine: onboard.handRunLine,

@@ -1349,6 +1349,12 @@ a.a-uri { color: var(--accent); }
 #pane-close:hover { color: var(--text); }
 #pane-term { flex: none; color: var(--dim); font-size: 15px; padding: 2px 6px; cursor: pointer; text-decoration: none; }
 #pane-term:hover { color: var(--accent); }
+#pane-copy { flex: none; color: var(--dim); font-size: 14px; padding: 2px 6px; }
+#pane-copy:hover { color: var(--accent); }
+/* the drawer sits at z 92, above the popover default of 80 */
+#pane-copy-pop { z-index: 95; }
+/* the 📋 confirmation must read over the drawer, not dimmed behind it */
+body:has(#pane-overlay:not([hidden])) #toast-stack { z-index: 94; }
 /* window tabs: rendered only when a card offers more than one, so a single
    window is the drawer exactly as it was before they existed */
 .pane-tabs {

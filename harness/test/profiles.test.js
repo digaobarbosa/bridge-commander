@@ -103,7 +103,8 @@ test('loadProfiles: registers a derived profile, records failures, never throws'
   assert.strictEqual(impl.profileInfo().name, 'lp-derived');
   assert.strictEqual(port.profileOf('lp-derived').extends, 'claude');
   const listed = port.listHarnesses().find((h) => h.name === 'lp-derived');
-  assert.deepStrictEqual(listed, { name: 'lp-derived', adapter: 'tmux', plugin: 'lp' });
+  // same binary, same transcripts: a derived profile resumes by hand like its base
+  assert.deepStrictEqual(listed, { name: 'lp-derived', adapter: 'tmux', plugin: 'lp', handResume: 'claude --resume' });
 });
 
 test('an acp profile without the acp adapter records a clear error instead of crashing', () => {
@@ -279,4 +280,12 @@ test('detectSelf and skillsDir: each profile answers for its own CLI only', () =
   assert.strictEqual(codex.profile.detectSelf({ CLAUDECODE: '1' }), null);
   assert.strictEqual(claude.profile.skillsDir('/h'), path.join('/h', '.claude', 'skills'));
   assert.strictEqual(codex.profile.skillsDir('/h'), path.join('/h', '.codex', 'skills'));
+});
+
+// The 👁 drawer's "resume" item reads this from GET /api/plugins; a harness
+// without it offers attach only.
+test('listHarnesses carries a profile\'s by-hand resume prefix, and only when it has one', () => {
+  const byName = Object.fromEntries(port.listHarnesses().map((h) => [h.name, h]));
+  assert.strictEqual(byName.claude.handResume, 'claude --resume');
+  assert.ok(!('handResume' in byName.codex));
 });

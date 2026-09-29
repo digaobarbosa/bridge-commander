@@ -29,6 +29,7 @@
 //   env?                         { NAME: '${VAR}' | literal } — expanded at every
 //                                launch into <stateDir>/<key>.env (mode 0600)
 //   permissions?, requirements?, installHint?, contextWindows?  data for profileInfo()
+//   handResume?                  the by-hand resume prefix (`<it> <resumeId>`), for the UI
 //
 // ctx = { opts, stateDir, key, callbackUrl, resumeId, extra, allowRoot, permissionMode, model, effort }:
 // `extra` is the already shell-quoted extra flags (the typed options' flags
@@ -266,6 +267,7 @@ function tmuxAdapter(profile) {
       requirements: { bins: (req.bins || []).slice(), tmux: req.tmux !== false, rootBypass: !!req.rootBypass },
       installHint: profile.installHint || '',
       contextWindows: (profile.contextWindows || []).map((p) => p.slice()),
+      handResume: profile.handResume || '',
     };
   }
 

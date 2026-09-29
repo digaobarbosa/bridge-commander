@@ -14,7 +14,9 @@ import { card, lieutenant, workerFor } from './state.js';
 import { api } from './api.js';
 import { ansiToHtml } from './ansi.js';
 import { keyForEvent } from './panekeys.js';
-import { terminalLink, cardTarget, lieutenantTarget } from './terminal.js';
+import { terminalLink, safeAttach, refResume, cardTarget, lieutenantTarget } from './terminal.js';
+import { openPopover, closePopover } from './popover.js';
+import { handResumeOf } from './plugins.js';
 import { getTerminalMode, onTerminalMode } from './terminalsettings.js';
 import { push as toast } from './toast.js';
 import { keepStream } from './streamkeeper.js';
@@ -26,12 +28,14 @@ const preEl = document.getElementById('pane-body');
 const msgEl = document.getElementById('pane-msg');
 const hintEl = document.getElementById('pane-hint');
 const termEl = document.getElementById('pane-term');
+const copyEl = document.getElementById('pane-copy');
 let es = null;
 let keeper = null;               // reopens es while the drawer is open
 // The server pings pane streams every 5s; longer silence means a dead stream.
 const STALE_MS = 12000;
 let inputUrl = null;
 let termTarget = null;          // { session, window } of what the drawer shows
+let resume = null;              // { cmd, cli } when the harness can be resumed by hand
 
 // ---------- ⌨ open in a real terminal ----------
 // Off (the default) or no known session: the button is not there at all.
@@ -50,6 +54,38 @@ termEl.onclick = (e) => {
     () => toast({ emoji: '⌨', text: 'could not copy: ' + cmd }));
 };
 onTerminalMode(drawTerm);
+
+// ---------- 📋 copy a command ----------
+// Independent of the ⌨ setting: copying needs no terminal choice, and it is the
+// way in when the board's own session is gone.
+function copyItems() {
+  const attach = safeAttach(termTarget);
+  const items = [];
+  if (attach) items.push({ label: 'attach tmux', cmd: attach,
+    title: 'join the live session as a grouped session — the agent\'s own view never moves' });
+  if (resume) items.push({ label: 'resume ' + resume.cli, cmd: resume.cmd,
+    title: 'use only when the board\'s session is gone — two ' + resume.cli + ' processes on one conversation conflict' });
+  return items;
+}
+function resumeOf(ref) {
+  const prefix = handResumeOf(ref && ref.harness);
+  const cmd = refResume(ref, prefix);
+  return cmd ? { cmd, cli: prefix.split(' ')[0] } : null;
+}
+function drawCopy() {
+  copyEl.hidden = overlay.hidden || !copyItems().length;
+  if (copyEl.hidden) closePopover('pane-copy-pop');
+}
+function copy(cmd) {
+  navigator.clipboard.writeText(cmd).then(
+    () => toast({ emoji: '📋', text: 'copied — paste it in a terminal' }),
+    () => toast({ emoji: '📋', text: 'could not copy: ' + cmd }));
+}
+copyEl.onclick = () => {
+  if (closePopover('pane-copy-pop')) return; // a second click is a toggle
+  const items = copyItems().map((it) => ({ label: it.label, title: it.title + '\n\n' + it.cmd, onClick: () => copy(it.cmd) }));
+  openPopover(copyEl, items, { id: 'pane-copy-pop', align: 'right' });
+};
 
 function stop() {
   if (keeper) { keeper.stop(); keeper = null; }
@@ -177,7 +213,7 @@ function connect(url) {
     try { c = JSON.parse(e.data); } catch (err) { /* keep the default */ }
     if (c.input === false) { inputUrl = null; setHint(); }
     // No tmux session behind an event-log pane: nothing for a terminal to attach to.
-    if (c.attach === false) { termTarget = null; drawTerm(); }
+    if (c.attach === false) { termTarget = null; drawTerm(); drawCopy(); }
   });
   es.addEventListener('unsupported', () => showMsg('this harness has no live pane view'));
   es.addEventListener('busy', () => showMsg('too many live panes open — close one and try again'));
@@ -233,26 +269,33 @@ export function openCardPane(cardId, window_) {
   const base = '/api/cards/' + encodeURIComponent(cardId) + '/pane/';
   const q = pick ? '?window=' + encodeURIComponent(pick) : '';
   drawTabs(names, pick, (name) => openCardPane(cardId, name));
-  termTarget = cardTarget(c, workerFor(cardId), pick);
+  const w = workerFor(cardId);
+  termTarget = cardTarget(c, w, pick);
+  resume = resumeOf(w && w.ref);
   open(base + 'stream' + q, String(at.session || (c && c.title) || cardId), base + 'input' + q);
   drawTerm();
+  drawCopy();
 }
 export function openLieutenantPane(id) {
   const l = lieutenant(id);
   const base = '/api/lieutenants/' + encodeURIComponent(id) + '/pane/';
   drawTabs([], null, () => {}); // a lieutenant is one session, never tabbed
   termTarget = lieutenantTarget(l);
+  resume = resumeOf(l && l.ref);
   open(base + 'stream', String((l && l.ref && l.ref.session) || (l && l.name) || id), base + 'input');
   drawTerm();
+  drawCopy();
 }
 export function closePane() {
   stop();
   inputUrl = null;
   drawTabs([], null, () => {});
   termTarget = null;
+  resume = null;
   preEl.blur();
   overlay.hidden = true;
   drawTerm();
+  drawCopy();
 }
 export function paneOpen() { return !overlay.hidden; }
 
