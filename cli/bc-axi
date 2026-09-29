@@ -909,11 +909,11 @@ async function cmdLtCreate() {
 }
 
 const LT_PATCH_USAGE = 'usage: bc-axi lieutenant patch <id> [--avatar N|none] [--color #rrggbb] [--prefix ABC]'
-  + ' [--harness h] [--model m|none]\n'
+  + ' [--harness h] [--model m|none] [--effort e|none]\n'
   + '  --harness KILLS the current session and respawns the lieutenant on the other harness with\n'
   + '  charter + owned cards + pending queue as its prompt; the conversation does not survive.\n'
   + '  --model is stored and rides --model on every later spawn/resume; `none` clears it back to\n'
-  + '  the harness default.';
+  + '  the harness default. --effort (low, high, …) is stored and applied the same way.';
 async function cmdLtPatch() {
   const id = positional[0];
   if (!id) die(LT_PATCH_USAGE);
@@ -922,6 +922,7 @@ async function cmdLtPatch() {
   if (opts.color) body.color = opts.color;
   if (opts.prefix) body.prefix = opts.prefix;
   if (opts.model !== null) body.model = opts.model === 'none' ? null : opts.model;
+  if (opts.effort !== null) body.effort = opts.effort === 'none' ? null : opts.effort;
   if (opts.harness) body.harness = opts.harness;
   if (!Object.keys(body).length) die(LT_PATCH_USAGE);
   // A prefix another lieutenant already holds is refused (409) — say whose it
@@ -934,14 +935,14 @@ async function cmdLtPatch() {
   console.log('lieutenant ' + id + ' updated (avatar=' + (lt.avatar != null ? lt.avatar : 'none')
     + ' color=' + lt.color + ' prefix=' + lt.prefix
     + ' harness=' + (lt.ref ? lt.ref.harness : 'none')
-    + ' model=' + (lt.model || 'default') + ')');
+    + ' model=' + (lt.model || 'default') + ' effort=' + (lt.effort || 'default') + ')');
   if (body.harness) {
     console.log(r.switched
       ? 'respawned on ' + lt.ref.harness + ' — session ' + lt.ref.session
         + '; it opens on charter + owned cards + pending queue'
       : 'already on ' + body.harness + ' — session left alone');
-  } else if (body.model !== undefined) {
-    console.log('the model applies to the NEXT spawn or resume of this lieutenant'
+  } else if (body.model !== undefined || body.effort !== undefined) {
+    console.log('the model and effort apply to the NEXT spawn or resume of this lieutenant'
       + (lt.ref ? ' (bc-axi lieutenant patch ' + id + ' --harness <another> respawns it now)' : ''));
   }
 }
@@ -2000,14 +2001,15 @@ if (!commands[cmd]) {
     '                                         the agent is launched on — --charter-file creates it when\n' +
     '                                         absent and never replaces one)\n' +
     '  lieutenant patch <id> [--avatar N|none] [--color #rrggbb] [--prefix ABC]\n' +
-    '                        [--harness h] [--model m|none]\n' +
+    '                        [--harness h] [--model m|none] [--effort e|none]\n' +
     '                                         lieutenant.update: cosmetics + the card-id prefix (refused\n' +
     '                                         when another lieutenant holds it) — name/id stay immutable.\n' +
     '                                         --harness MOVES a living lieutenant: kills its session and\n' +
     '                                         respawns it on the other harness with charter + owned cards\n' +
     '                                         + pending queue as the prompt (the conversation is lost, the\n' +
     '                                         queue is not). --model is stored and rides --model on every\n' +
-    '                                         later spawn/resume; `none` = the harness default\n' +
+    '                                         later spawn/resume; `none` = the harness default; --effort\n' +
+    '                                         (low, high, …) is stored the same way\n' +
     '  lieutenant retire <id>                 lieutenant.retire: refuses while the lieutenant owns\n' +
     '                                         non-archived cards; else kills its session, removes it\n' +
     '                                         and its queue, level-1 event\n' +

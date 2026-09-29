@@ -352,6 +352,8 @@ body.resizing { user-select: none; cursor: col-resize; }
 }
 .clt-model { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .clt-effort { color: var(--faint); }
+.clt-last, .lts-last { color: var(--warn); }
+.lts-last { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .clt-caret { color: var(--faint); font-size: 10px; flex: none; }
 #chat-lt:hover .clt-caret { color: var(--accent); }
 #chat-lt .badge-n { top: -3px; right: -3px; }
@@ -1311,11 +1313,22 @@ a.a-uri { color: var(--accent); }
   box-shadow: var(--shadow); animation: pop-in .15s ease-out;
 }
 #ls-color { width: 38px; height: 34px; padding: 2px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); cursor: pointer; flex: none; }
-#ls-voice, #ls-prefix {
+#ls-voice, #ls-prefix, #ls-harness, #ls-model, #ls-effort {
   background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
   padding: 8px 11px; font-size: 13px; outline: none; width: 100%; min-width: 0;
 }
-#ls-voice:focus, #ls-prefix:focus { border-color: var(--accent2); }
+#ls-voice:focus, #ls-prefix:focus, #ls-harness:focus, #ls-model:focus, #ls-effort:focus { border-color: var(--accent2); }
+/* harness/model/effort carry captions: without them three bare boxes read as one
+   disabled widget. Model takes the slack. */
+.ls-run { align-items: flex-end; }
+.ls-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 0 1 8.5em;
+  font-size: 11px; color: var(--dim); letter-spacing: .03em; }
+.ls-field.ls-grow { flex: 1 1 12em; }
+#ls-model, #ls-effort { font-family: var(--mono); }
+#ls-harness { cursor: pointer; }
+/* soft: a name outside the harness's list may still be real (a new model, a proxy) */
+#ls-model-warn { margin-top: -4px; font-size: 11.5px; color: var(--warn); }
+#ls-harness:disabled { opacity: .55; cursor: not-allowed; }
 /* the card-id prefix is three characters — sized to them, not to the row */
 #ls-prefix { flex: none; width: 5.5em; font-family: var(--mono); text-transform: uppercase; }
 #ls-voice { cursor: pointer; }
@@ -1633,7 +1646,7 @@ body:has(#pane-overlay:not([hidden])) #toast-stack { z-index: 94; }
      blows up the whole layout. Force every focusable text input to 16px on
      mobile so focus never triggers a zoom (the accessible fix; the viewport
      maximum-scale is only a secondary guard). */
-  #filter, .composer textarea, #lp-input, #nc-name, #nc-body, #nc-type, #nc-owner, #lt-name, #ls-voice, #ls-prefix, #dt-body-input { font-size: 16px; }
+  #filter, .composer textarea, #lp-input, #nc-name, #nc-body, #nc-type, #nc-owner, #lt-name, #ls-voice, #ls-prefix, #ls-harness, #ls-model, #ls-effort, #dt-body-input { font-size: 16px; }
   #layout { flex-direction: column; min-height: 0; }
   /* each view fills the space above the tab bar and owns its own scroll region */
   #chat { width: 100%; flex: 1; min-height: 0; border-right: none; display: none; }

@@ -142,3 +142,23 @@ test('no playbook reads as a card that cannot start, editable or not', async () 
   // a plan card never starts, so it has no playbook to show at all
   assert.strictEqual(playbookAttrHtml({ id: 'MNC-2', type: 'plan', column: 'backlog', playbook: '' }, true), '');
 });
+
+// runsOn — the header/switcher model line. The pin wins (it is what the next
+// launch runs); a live status from an older or failing turn is named, not shown
+// as the truth (the captain read "gpt-6-astra" while codex ran on another model).
+test('runsOn: the pin wins over the live status, and a mismatch is named as the last turn', async () => {
+  const { runsOn, lastTurnHtml } = await utilMod;
+  const live = { model: 'gpt-6-astra', effort: 'high' };
+  assert.deepStrictEqual(runsOn({ agentStatus: live }), { model: 'gpt-6-astra', effort: 'high', last: '' });
+  assert.deepStrictEqual(runsOn({ model: 'gpt-6-astra', effort: 'high', agentStatus: live }),
+    { model: 'gpt-6-astra', effort: 'high', last: '' }, 'agreement is no hint');
+  assert.deepStrictEqual(runsOn({ model: 'gpt-6-terra', agentStatus: live }),
+    { model: 'gpt-6-terra', effort: 'high', last: 'gpt-6-astra (high)' });
+  assert.deepStrictEqual(runsOn({ effort: 'low', agentStatus: live }),
+    { model: 'gpt-6-astra', effort: 'low', last: 'gpt-6-astra (high)' });
+  assert.deepStrictEqual(runsOn({ model: 'm', effort: 'low' }), { model: 'm', effort: 'low', last: '' },
+    'no live status yet: the pin alone');
+  assert.strictEqual(lastTurnHtml('x', ''), '');
+  assert.match(lastTurnHtml('x', 'a <b>'), /class="x".*>last turn: a &lt;b&gt;</);
+  assert.match(lastTurnHtml('x', 'gpt-6-astra', true), /title="last turn: gpt-6-astra[^"]*">⚠</);
+});

@@ -21,6 +21,7 @@
 // A fresh cwd shows "Do you trust the contents of this directory?" even with
 // both flags ("Yes, continue" preselected); the settle accepts it.
 
+const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const s = require('./tmux-session.js');
@@ -50,6 +51,31 @@ const SETTLE = { trustRe: TRUST_RE, readyRe: UI_READY_RE, fatalRe: FATAL_RE, lab
 // The bypass + notify flags every codex launch (spawn AND resume) carries.
 // No update check: codex ships almost daily, and its update modal blocks an
 // unattended launch (updating codex is the captain's call, not a worker's).
+// codexModels(file?) -> [{slug, efforts[]}] | null: the models codex itself
+// offers, from the cache it keeps of its own model list. A suggestion list, not
+// a gate — a missing or foreign-shaped cache is null, never an error. Parsed
+// once per mtime: the file is a few hundred KB and the settings modal asks on
+// every open.
+let modelsMemo = { file: '', mtimeMs: 0, list: null };
+function codexModels(file) {
+  const f = file || path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'models_cache.json');
+  try {
+    const { mtimeMs } = fs.statSync(f);
+    if (modelsMemo.file === f && modelsMemo.mtimeMs === mtimeMs) return modelsMemo.list;
+    const raw = JSON.parse(fs.readFileSync(f, 'utf8'));
+    const list = (Array.isArray(raw && raw.models) ? raw.models : [])
+      // `hide` is codex's own "not for pickers" (its internal review model and the like)
+      .filter((m) => m && typeof m.slug === 'string' && m.slug && m.visibility !== 'hide')
+      .map((m) => ({
+        slug: m.slug,
+        efforts: (Array.isArray(m.supported_reasoning_levels) ? m.supported_reasoning_levels : [])
+          .map((l) => l && l.effort).filter((e) => typeof e === 'string' && e),
+      }));
+    modelsMemo = { file: f, mtimeMs, list: list.length ? list : null };
+    return modelsMemo.list;
+  } catch (e) { return null; }
+}
+
 function launchFlags(ctx) {
   const notify = ['node', NOTIFY_SCRIPT, ctx.stateDir, ctx.key].concat(ctx.callbackUrl ? [ctx.callbackUrl] : []);
   return '--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust '
@@ -106,6 +132,7 @@ const profile = {
   options: ['model', 'effort'],
   modelArgs: ({ model, effort } = {}) => [].concat(model ? ['-m', model] : [],
     effort ? ['-c', 'model_reasoning_effort=' + effort] : []),
+  models: () => codexModels(),
 
   // No board-relayed approval hook, so no permission modes and no root refusal to plan for.
   permissions: { modes: [] },
@@ -125,4 +152,4 @@ module.exports = { ...tmuxAdapter(profile),
   // The JS base a derived JSON profile `extends` (harness/profiles.js).
   profile,
   // Exported for settle-screens.test.js, which pins them against real screens.
-  SETTLE };
+  SETTLE, codexModels };

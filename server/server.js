@@ -577,6 +577,15 @@ function validModel(m) {
   if (!t || /[\s\u0000-\u001f]/.test(t) || t.length > 100) return null;
   return t;
 }
+// lieutenant effort: the reasoning level (low, high, …). No list here either, for
+// the same reason as the model. Tighter than a model token because codex splices
+// it into a TOML override (`-c model_reasoning_effort=<e>`), where only a bare
+// word parses. Absent = the harness default.
+function validEffort(e) {
+  if (typeof e !== 'string') return null;
+  const t = e.trim();
+  return /^[A-Za-z0-9_-]{1,30}$/.test(t) ? t : null;
+}
 function labelIndex(name) { return board.labels.findIndex((l) => l && l.name === name); }
 function registerCardLabels() {
   for (const c of board.cards) {
@@ -641,6 +650,8 @@ function nextCardId(l) { return l.prefix + '-' + ((Number.isInteger(l.cardSeq) ?
 const BAD_PREFIX = 'bad prefix (1-8 letters/digits starting with a letter — it heads every card id this lieutenant mints)';
 const BAD_MODEL = 'bad model (one token, no spaces or control characters, max 100 chars — '
   + 'it is handed straight to the harness CLI as --model; null clears it back to the harness default)';
+const BAD_EFFORT = 'bad effort (one word of letters, digits, _ or -, max 30 chars — e.g. low, high; '
+  + 'null clears it back to the harness default)';
 function prefixOwner(p, exceptId) {
   return board.lieutenants.find((l) => l.id !== exceptId && l.prefix === p) || null;
 }
@@ -730,6 +741,7 @@ function createLieutenant(body) {
   if (validAvatar(body.avatar)) lt.avatar = body.avatar;
   if (validVoice(body.voice)) lt.voice = validVoice(body.voice);
   if (validModel(body.model)) lt.model = validModel(body.model);
+  if (validEffort(body.effort)) lt.effort = validEffort(body.effort);
   if (isHarnessRef(body.ref)) lt.ref = body.ref; // the live-session address, persisted with the board
   board.lieutenants.push(lt);
   store.boardEvent({ text: 'lieutenant ' + lt.name + ' joined the bridge', actor: body.actor || 'user', level: 2 });
@@ -811,7 +823,10 @@ function ltLaunchOpts(lt, extra, harness) {
   const name = harness || (lt && lt.ref && lt.ref.harness) || readConfig().harness || port.defaultHarness();
   let impl = null;
   try { impl = getHarness(name); } catch (e) { return opts; } // the spawn names the unknown harness itself
-  const { opts: typed, ignored } = port.splitOptions(impl, { model: lt && validModel(lt.model) });
+  const { opts: typed, ignored } = port.splitOptions(impl, {
+    model: lt && validModel(lt.model),
+    effort: lt && validEffort(lt.effort),
+  });
   Object.assign(opts, typed);
   for (const opt of ignored) {
     const once = (lt && (lt.id || lt.name)) + '|' + name + '|' + opt;
@@ -870,6 +885,9 @@ async function spawnLieutenant(body) {
   if (body.model !== undefined && body.model !== null && body.model !== '' && !validModel(body.model)) {
     return { error: BAD_MODEL, code: 400 };
   }
+  if (body.effort !== undefined && body.effort !== null && body.effort !== '' && !validEffort(body.effort)) {
+    return { error: BAD_EFFORT, code: 400 };
+  }
   // Checked before the spawn, not after it in createLieutenant: a refusal
   // there would leave a live session behind with no lieutenant to own it.
   if (body.avatar !== undefined && body.avatar !== null && !validAvatar(body.avatar)) {
@@ -878,10 +896,11 @@ async function spawnLieutenant(body) {
   // A revived lieutenant keeps the model it was pinned to unless this call
   // names another; a new one is born on whatever it was given.
   const model = validModel(body.model) || (existing && validModel(existing.model)) || null;
+  const effort = validEffort(body.effort) || (existing && validEffort(existing.effort)) || null;
   const session = names.lieutenantSession(WORKSPACE, id);
   let ref;
   try {
-    ref = await impl.spawn(WORKSPACE, lieutenantPrompt(name, id), ltLaunchOpts({ id, name, model }, {
+    ref = await impl.spawn(WORKSPACE, lieutenantPrompt(name, id), ltLaunchOpts({ id, name, model, effort }, {
       session,
       window: names.LIEUTENANT_WINDOW, // its own window in its own session — see layout.js
       // Only the first run sends this, and only when the person said so out
@@ -895,6 +914,7 @@ async function spawnLieutenant(body) {
     existing.ref = ref;
     existing.lastInputAt = now(); // the launch prompt is a turn (agentBusy)
     if (model) existing.model = model; else delete existing.model;
+    if (effort) existing.effort = effort; else delete existing.effort;
     return { lieutenant: existing, spawned: true };
   }
   const out = Object.assign({ spawned: true }, createLieutenant(Object.assign({}, body, { id, ref })));
@@ -962,6 +982,9 @@ function patchLieutenant(lt, body) {
   const clearModel = body.model === null || body.model === '';
   const model = body.model !== undefined && !clearModel ? validModel(body.model) : null;
   if (body.model !== undefined && !clearModel && !model) return { error: BAD_MODEL, code: 400 };
+  const clearEffort = body.effort === null || body.effort === '';
+  const effort = body.effort !== undefined && !clearEffort ? validEffort(body.effort) : null;
+  if (body.effort !== undefined && !clearEffort && !effort) return { error: BAD_EFFORT, code: 400 };
   const harness = body.harness !== undefined && body.harness !== null ? String(body.harness) : '';
   if (harness) {
     try { getHarness(harness); } catch (e) { return { error: String((e && e.message) || e), code: 400 }; }
@@ -992,6 +1015,8 @@ function patchLieutenant(lt, body) {
   // captain who moves harness and model in one call lands on both.
   if (clearModel) delete lt.model;
   else if (model) lt.model = model;
+  if (clearEffort) delete lt.effort;
+  else if (effort) lt.effort = effort;
   return { ok: true, harness };
 }
 
@@ -3209,6 +3234,18 @@ const server = http.createServer(async (req, res) => {
       // `spawned` is how a re-run of `init --onboard` tells "I revived her" from
       // "she was already up" — the second is not worth a line of anyone's output.
       return respond(res, r, () => ({ ok: true, lieutenant: r.lieutenant, spawned: r.spawned }));
+    }
+    // The models a harness can list cheaply, for the settings modal's suggestions
+    // (codex: its own models cache). `models: null` = this harness cannot say, so
+    // the UI suggests nothing and warns about nothing.
+    const hmRoute = /^\/api\/harnesses\/([^/]+)\/models$/.exec(p);
+    if (hmRoute && req.method === 'GET') {
+      let profile = null;
+      try { profile = port.profileOf(decodeURIComponent(hmRoute[1])); } catch (e) { /* unknown = cannot say */ }
+      let models = null;
+      try { models = profile && typeof profile.models === 'function' ? profile.models() || null : null; }
+      catch (e) { models = null; }
+      return sendJson(res, 200, { models });
     }
     const ltRoute = /^\/api\/lieutenants\/([^/]+)$/.exec(p);
     if (ltRoute && req.method === 'DELETE') { // lieutenant.retire — explicit only

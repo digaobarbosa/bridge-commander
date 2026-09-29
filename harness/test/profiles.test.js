@@ -178,6 +178,41 @@ test('typed options ride the profile\'s own flags and a resume replays them from
   }
 });
 
+// A lieutenant's pinned effort reaches claude the same way: spelled --effort on
+// the spawn, and replayed from spawn-args on a resume that names none.
+test('claude spells a typed effort as --effort on spawn and resume', async () => {
+  const mock = await withLaunches(claude, async (cwd, stateDir) => {
+    const ref = await claude.spawn(cwd, 'go', { session: 'bc-typed-c', stateDir, installHooks: false, effort: 'high' });
+    await claude.resume({ ...ref, resumeId: '11111111-2222-3333-4444-555555555555' }, { stateDir });
+  });
+  const [spawnLine, resumeLine] = lines(mock);
+  for (const l of [spawnLine, resumeLine]) {
+    assert.match(l, /'--effort' 'high'/);
+    assert.doesNotMatch(l, /model_reasoning_effort/, 'codex\'s key never reaches claude');
+  }
+});
+
+// The settings modal suggests codex's own model names from its models cache.
+// Hidden entries stay out, and anything unreadable is null, never a throw.
+test('codexModels lists the cache\'s visible slugs with their effort levels, null when unreadable', () => {
+  const dir = tmpdir('bc-codex-models-');
+  try {
+    const f = path.join(dir, 'models_cache.json');
+    fs.writeFileSync(f, JSON.stringify({ models: [
+      { slug: 'gpt-6-astra', visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }] },
+      { slug: 'codex-auto-review', visibility: 'hide', supported_reasoning_levels: [{ effort: 'low' }] },
+      { slug: 'gpt-5.5' },
+    ] }));
+    assert.deepStrictEqual(codex.codexModels(f), [
+      { slug: 'gpt-6-astra', efforts: ['low', 'high'] },
+      { slug: 'gpt-5.5', efforts: [] },
+    ]);
+    assert.strictEqual(codex.codexModels(path.join(dir, 'missing.json')), null);
+    fs.writeFileSync(path.join(dir, 'bad.json'), '{not json');
+    assert.strictEqual(codex.codexModels(path.join(dir, 'bad.json')), null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 // ---------- env and secrets ----------
 
 function derived(name, secretsDir) {

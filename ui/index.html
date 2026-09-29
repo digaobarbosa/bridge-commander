@@ -397,13 +397,26 @@
     <!-- What this lieutenant RUNS ON. Changing the harness is not cosmetic: it
          kills the session and respawns it, so it asks first. The model is a
          free-text box on purpose — the board keeps no list of model names, the
-         string goes straight to the harness CLI. -->
-    <div class="lt-row">
-      <!-- options: the harnesses GET /api/plugins lists (plugins.js fills them) -->
-      <select id="ls-harness" title="agent harness — changing this respawns the lieutenant"></select>
-      <input id="ls-model" placeholder="model (harness default)" autocomplete="off" spellcheck="false"
-             title="passed to the harness as --model on every spawn and resume; empty = the harness default">
+         string goes straight to the harness CLI. Effort is free text for the
+         same reason. -->
+    <div class="lt-row ls-run">
+      <label class="ls-field">harness
+        <!-- options: the harnesses GET /api/plugins lists (plugins.js fills them) -->
+        <select id="ls-harness" title="agent harness — changing this respawns the lieutenant"></select>
+      </label>
+      <label class="ls-field ls-grow">model
+        <input id="ls-model" list="ls-models" placeholder="harness default" autocomplete="off" spellcheck="false"
+               title="passed to the harness as its model flag on every spawn and resume; empty = the harness default">
+      </label>
+      <label class="ls-field">effort
+        <input id="ls-effort" list="ls-efforts" placeholder="default" autocomplete="off" spellcheck="false"
+               title="reasoning effort (low, medium, high, …) passed to the harness on every spawn and resume; empty = the harness default">
+      </label>
+      <!-- suggestions only, from the harness's own model list when it keeps one -->
+      <datalist id="ls-models"></datalist>
+      <datalist id="ls-efforts"></datalist>
     </div>
+    <div id="ls-model-warn" hidden></div>
     <div id="ls-grid"></div>
     <div class="nc-actions">
       <button type="button" id="ls-cancel">close</button>

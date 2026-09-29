@@ -206,6 +206,27 @@ export function fmtTokens(n) {
 // harness port's status(), refreshed at turn-end). Green → yellow (≥60%) →
 // red (≥80% — auto-compact territory). No/partial status → no bar (graceful
 // absence, like avatars).
+// What a lieutenant runs on: the pinned model/effort when set (the next launch
+// uses them), else the live status. The live status is the last SUCCESSFUL
+// turn, so it lags a repin and hides failing turns; `last` names a mismatch.
+export function runsOn(l) {
+  const st = (l && l.agentStatus) || {};
+  const differs = (l.model && st.model && st.model !== l.model)
+    || (l.effort && st.effort && st.effort !== l.effort);
+  return {
+    model: l.model || st.model || '',
+    effort: l.effort || st.effort || '',
+    last: differs ? [st.model, st.effort && '(' + st.effort + ')'].filter(Boolean).join(' ') : '',
+  };
+}
+// `compact` is for the chat header, where the full hint clips: a ⚠ that
+// carries it in its tooltip. The switcher gives the full hint its own line.
+export function lastTurnHtml(cls, last, compact) {
+  if (!last) return '';
+  const title = 'last turn: ' + last + ' — the live status comes from the last successful turn, and it disagrees with the pinned setting';
+  return ' <span class="' + cls + '" title="' + esc(title) + '">' + (compact ? '⚠' : 'last turn: ' + esc(last)) + '</span>';
+}
+
 export function ctxBarHtml(st) {
   if (!st || !(st.contextUsed > 0) || !(st.contextWindow > 0)) return '';
   const pct = Math.min(100, Math.round((st.contextUsed / st.contextWindow) * 100));

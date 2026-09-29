@@ -6,7 +6,7 @@
 // terminal, ⋯ actions (settings / retire), and the ＋ lieutenant row.
 import { S, cards, lieutenants, lieutenantsByRecent, lieutenant, lieutenantColor, lieutenantAvatar, lieutenantUnread, targetOwedState, targetOwedStale } from './state.js';
 import { api } from './api.js';
-import { esc, setHtmlIfChanged, ctxBarHtml, owedIndHtml } from './util.js';
+import { esc, setHtmlIfChanged, ctxBarHtml, owedIndHtml, runsOn, lastTurnHtml } from './util.js';
 import { avatarHtml, avatarGridHtml, wireAvatarGrid } from './avatars.js';
 import { openLieutenantChat } from './chat.js';
 import { openLieutenantPane } from './pane.js';
@@ -62,8 +62,9 @@ function rowHtml(l) {
   const owed = targetOwedState('lieutenant:' + l.id);
   const ind = owedIndHtml(owed, owed && targetOwedStale('lieutenant:' + l.id));
   const st = l.agentStatus || {};
-  const model = st.model
-    ? '<span class="lts-model">' + esc(st.model) + (st.effort ? ' (' + esc(st.effort) + ')' : '') + '</span>'
+  const on = runsOn(l);
+  const model = on.model
+    ? '<span class="lts-model">' + esc(on.model) + (on.effort ? ' (' + esc(on.effort) + ')' : '') + '</span>'
     : '';
   const av = lieutenantAvatar(l.id);
   const face = av != null
@@ -79,6 +80,7 @@ function rowHtml(l) {
     '<span class="lts-meta">' + model +
     '<span class="lts-counts">' + mine.length + (working ? ' · 🔨' + working : '') + '</span>' +
     ctxBarHtml(st) + '</span>' +
+    lastTurnHtml('lts-last', on.last) +
     '</span>' +
     (cur ? '<span class="lts-cur" title="current conversation">✓</span>' : '') +
     '<button class="lts-peek" type="button" title="watch this lieutenant\'s terminal live">👁</button>' +
@@ -160,6 +162,13 @@ const lsVoice = document.getElementById('ls-voice');
 const lsGrid = document.getElementById('ls-grid');
 const lsHarness = document.getElementById('ls-harness');
 const lsModel = document.getElementById('ls-model');
+const lsEffort = document.getElementById('ls-effort');
+const lsModels = document.getElementById('ls-models');
+const lsEfforts = document.getElementById('ls-efforts');
+const lsModelWarn = document.getElementById('ls-model-warn');
+// The open lieutenant's harness model list ([{slug, efforts}]), or null when
+// the harness cannot list its models: then nothing is suggested or warned.
+let lsKnown = null;
 let lsLtId = null;
 // Exported for the config screen's lieutenants tab: its ⚙ is THIS modal, not a
 // second form over the same four fields.
@@ -174,7 +183,10 @@ export function openLtSettings(ltId) {
   wireAvatarGrid(lsGrid, (idx) => patch({ avatar: idx }));
   fillVoices(l.voice || '');
   fillHarness(l);
-  lsModel.value = l.model || '';
+  const st = l.agentStatus || {};
+  fillPin(lsModel, l.model, st.model, 'harness default');
+  fillPin(lsEffort, l.effort, st.effort, 'default'); // the narrow box: "harness default" clips
+  loadModels(ltId, l.ref && l.ref.harness);
   lsEl.hidden = false;
   lsPrefix.focus();
 }
@@ -237,19 +249,58 @@ lsHarness.onchange = async () => {
     + 'This kills the current session and respawns it with charter + cards + queue.'
     + ' The conversation does not survive; the delivery queue does.')
     || !(await patch({ harness: want }))) lsHarness.value = cur;
+  else loadModels(lsLtId, want); // another harness, another model list
 };
-// Free text, committed on change: the board keeps no list of model names — the
-// string is handed straight to the harness CLI. Empty clears it back to the
-// harness default. It applies to the NEXT spawn or resume, not to the live
-// session, so nothing is killed here.
-lsModel.onchange = async () => {
+// With nothing pinned, the session runs on the harness default, so its live
+// status is the cheapest honest answer to "what does empty mean".
+function fillPin(input, pinned, live, fallback) {
+  input.value = pinned || '';
+  input.placeholder = !pinned && live ? 'default: ' + live : fallback;
+}
+async function loadModels(ltId, harness) {
+  lsKnown = null;
+  refreshSuggestions();
+  if (!harness) return;
+  let models = null;
+  try { ({ models } = await api.harnessModels(harness)); } catch (e) { /* no suggestions */ }
+  if (lsLtId !== ltId) return; // the modal moved on while we asked
+  lsKnown = Array.isArray(models) && models.length ? models : null;
+  refreshSuggestions();
+}
+// Effort suggestions follow the model in the box (or the one it defaults to):
+// codex models differ in which levels they take. The warning waits for a
+// committed name (`judge`): mid-typing, every prefix is "not in the list".
+function refreshSuggestions(judge = true) {
+  const opts = (list) => list.map((v) => '<option value="' + esc(v) + '"></option>').join('');
+  lsModels.innerHTML = lsKnown ? opts(lsKnown.map((m) => m.slug)) : '';
+  const typed = lsModel.value.trim();
+  const shown = typed || lsModel.placeholder.replace(/^default: /, '');
+  const m = lsKnown && lsKnown.find((x) => x.slug === shown);
+  const efforts = m ? m.efforts : lsKnown ? [...new Set(lsKnown.flatMap((x) => x.efforts))] : [];
+  lsEfforts.innerHTML = opts(efforts);
+  const unknown = judge && !!(lsKnown && typed && !lsKnown.some((x) => x.slug === typed));
   const l = lieutenant(lsLtId);
-  const want = lsModel.value.trim();
-  if (!l || want === (l.model || '')) return;
-  if (!(await patch({ model: want || null }))) lsModel.value = l.model || '';
-  else lsModel.value = want;
-};
-lsModel.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); lsModel.blur(); } };
+  lsModelWarn.textContent = unknown
+    ? '“' + typed + '” is not in ' + ((l && l.ref && l.ref.harness) || 'the harness') + '’s model list — its turns may fail'
+    : '';
+  lsModelWarn.hidden = !unknown;
+}
+lsModel.addEventListener('input', () => refreshSuggestions(false));
+// Model and effort: free text, committed on change — the board keeps no list of
+// either, the string goes straight to the harness CLI. Empty clears it back to
+// the harness default. It applies to the NEXT spawn or resume, not to the live
+// session, so nothing is killed here.
+for (const [input, key] of [[lsModel, 'model'], [lsEffort, 'effort']]) {
+  input.onchange = async () => {
+    const l = lieutenant(lsLtId);
+    const want = input.value.trim();
+    if (!l || want === (l[key] || '')) return;
+    if (!(await patch({ [key]: want || null }))) input.value = l[key] || '';
+    else input.value = want;
+    refreshSuggestions();
+  };
+  input.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } };
+}
 // The card-id prefix commits on change like the other picks. The server refuses
 // one another lieutenant already holds — say so and put the field back, so the
 // box never shows a prefix this lieutenant does not have.

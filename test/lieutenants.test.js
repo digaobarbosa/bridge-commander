@@ -262,7 +262,7 @@ test('cli: lieutenant create --avatar and lieutenant patch', async () => {
     assert.strictEqual(r.code, 0, r.stderr);
     // The line reports what it runs on too — 'none'/'default' for a lieutenant
     // registered without a session and pinned to no model.
-    assert.match(r.stdout, /lieutenant avi updated \(avatar=9 color=#abcdef prefix=AVI harness=none model=default\)/);
+    assert.match(r.stdout, /lieutenant avi updated \(avatar=9 color=#abcdef prefix=AVI harness=none model=default effort=default\)/);
 
     r = await runCli(['lieutenant', 'patch', 'avi', '--avatar', 'none', ...args]);
     assert.strictEqual(r.code, 0, r.stderr);

@@ -225,6 +225,76 @@ test('the model survives a supervisor respawn', async () => {
   } finally { await b.teardown(); }
 });
 
+// Effort rides beside the model: stored by a patch that kills nothing, on the
+// next spawn (a switch here) and a supervisor respawn, and cleared by null.
+test('the effort is stored, rides the typed effort option on the next spawn, and clears with null', async () => {
+  const b = await boot({ seed: (dir, fdir) => fakeSession(fdir, 'bc-lt-ada:lt') });
+  try {
+    let r = await b.s.api('PATCH', '/api/lieutenants/ada', { effort: 'high' });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+    assert.strictEqual((await b.lt()).effort, 'high');
+    assert.deepStrictEqual(b.launches(), [], 'an effort change costs nobody their conversation');
+
+    r = await b.s.api('PATCH', '/api/lieutenants/ada', { harness: 'recfake' });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+    assert.deepStrictEqual(b.launches().map((l) => l.effort), ['high']);
+
+    r = await b.s.api('PATCH', '/api/lieutenants/ada', { effort: '' });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+    assert.strictEqual((await b.lt()).effort, undefined);
+    r = await b.s.api('PATCH', '/api/lieutenants/ada', { harness: 'recfake2' });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+    assert.deepStrictEqual(b.launches().map((l) => l.effort), ['high', null]);
+  } finally { await b.teardown(); }
+});
+
+test('a pinned effort survives a supervisor respawn', async () => {
+  const b = await boot({
+    lieutenant: LT_ADA({
+      effort: 'low',
+      ref: { harness: 'recfake', session: 'bc-lt-ada', window: 'lt', cwd: '/tmp', resumeId: 'uuid-lost' },
+    }),
+    env: { BC_SUPERVISE_INTERVAL_MS: '150' },
+  });
+  try {
+    await until('respawned event', async () => {
+      const board = (await b.s.api('GET', '/api/board')).body;
+      return board.events.some((e) => e.kind === 'respawned');
+    });
+    assert.strictEqual(b.launches()[0].effort, 'low');
+  } finally { await b.teardown(); }
+});
+
+test('an effort that is not one bare word is refused, and the stored one survives', async () => {
+  const b = await boot({ seed: (dir, fdir) => fakeSession(fdir, 'bc-lt-ada:lt') });
+  try {
+    assert.strictEqual((await b.s.api('PATCH', '/api/lieutenants/ada', { effort: 'medium' })).status, 200);
+    const r = await b.s.api('PATCH', '/api/lieutenants/ada', { effort: 'high"; x=1' });
+    assert.strictEqual(r.status, 400);
+    assert.match(r.body.error, /bad effort/);
+    assert.strictEqual((await b.lt()).effort, 'medium');
+  } finally { await b.teardown(); }
+});
+
+// The settings modal's model suggestions: codex reads its own models cache
+// (under CODEX_HOME), and a harness that keeps no list answers null.
+test('GET /api/harnesses/:name/models lists codex\'s cached models and null for one that cannot say', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-codex-home-'));
+  fs.writeFileSync(path.join(home, 'models_cache.json'), JSON.stringify({ models: [
+    { slug: 'gpt-6-astra', visibility: 'list', supported_reasoning_levels: [{ effort: 'high' }] },
+  ] }));
+  const b = await boot({ env: { CODEX_HOME: home } });
+  try {
+    let r = await b.s.api('GET', '/api/harnesses/codex/models');
+    assert.strictEqual(r.status, 200, JSON.stringify(r.body));
+    assert.deepStrictEqual(r.body.models, [{ slug: 'gpt-6-astra', efforts: ['high'] }]);
+    r = await b.s.api('GET', '/api/harnesses/fake/models');
+    assert.strictEqual(r.body.models, null);
+    r = await b.s.api('GET', '/api/harnesses/no-such/models');
+    assert.strictEqual(r.body.models, null, 'an unknown harness cannot say either');
+  } finally { await b.teardown(); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
 // The respawn prompt lists what the lieutenant owns; a handoff artifact on one
 // of its PLAN cards is the note its predecessor left for whoever picks the work
 // up. Paths only — the fresh session reads what it decides it needs.
@@ -280,7 +350,13 @@ test('bc-axi lieutenant patch moves the harness and pins the model; list shows b
     r = await cli('lieutenant', 'patch', 'ada', '--model', 'none');
     assert.strictEqual(r.code, 0, r.stderr);
     assert.match(r.stdout, /model=default/);
-    assert.match(r.stdout, /applies to the NEXT spawn or resume/);
+    assert.match(r.stdout, /apply to the NEXT spawn or resume/);
+
+    r = await cli('lieutenant', 'patch', 'ada', '--effort', 'high');
+    assert.strictEqual(r.code, 0, r.stderr);
+    assert.match(r.stdout, /effort=high/);
+    r = await cli('lieutenant', 'patch', 'ada', '--effort', 'none');
+    assert.match(r.stdout, /effort=default/);
 
     r = await cli('lieutenant', 'list');
     assert.match(r.stdout, /\trecfake\t/, 'no model pinned, so the harness stands alone');

@@ -39,6 +39,7 @@ export const api = {
   clientId: CLIENT_ID,
   createLieutenant: (lt) => j('POST', '/api/lieutenants', Object.assign({ actor: 'user' }, lt)),
   updateLieutenant: (id, patch) => j('PATCH', '/api/lieutenants/' + encodeURIComponent(id), patch),
+  harnessModels: (name) => j('GET', '/api/harnesses/' + encodeURIComponent(name) + '/models', undefined, 5000),
   retireLieutenant: (id) => j('DELETE', '/api/lieutenants/' + encodeURIComponent(id), { actor: 'user' }),
   createCard: (card) => j('POST', '/api/cards', Object.assign({ actor: 'user' }, card)),
   // A captain move may come back as {ordered: 'start-order'|'rework-order'}

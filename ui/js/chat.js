@@ -4,7 +4,7 @@
 // premium composer.
 import { S, card, cards, lieutenants, lieutenant, lieutenantColor, lieutenantName, lieutenantAvatar, lieutenantUnread, cardStatus, cardActivityTs, render, applyBoard, applyLocalRead, threadUnread, targetOwedState, targetOwedStale, USER } from './state.js';
 import { api } from './api.js';
-import { esc, hhmm, dayLabel, cardEmoji, setHtmlIfChanged, fmtSize, isImageMime, statusBlockHtml, ctxBarHtml, owedIndHtml } from './util.js';
+import { esc, hhmm, dayLabel, cardEmoji, setHtmlIfChanged, fmtSize, isImageMime, statusBlockHtml, ctxBarHtml, owedIndHtml, runsOn, lastTurnHtml } from './util.js';
 import { md, mdEnhance, copyText } from './md.js';
 import { speakMessage } from './voice.js';
 import { openAttachment } from './detail.js';
@@ -378,8 +378,10 @@ function ltTriggerHtml(lt) {
   const owed = targetOwedState('lieutenant:' + lt.id);
   const ind = owedIndHtml(owed, owed && targetOwedStale('lieutenant:' + lt.id));
   const st = lt.agentStatus || {};
-  const model = st.model
-    ? '<span class="clt-model">' + esc(st.model) + (st.effort ? ' <span class="clt-effort">(' + esc(st.effort) + ')</span>' : '') + '</span>'
+  const on = runsOn(lt);
+  const model = on.model
+    ? '<span class="clt-model">' + esc(on.model) + (on.effort ? ' <span class="clt-effort">(' + esc(on.effort) + ')</span>' : '')
+      + lastTurnHtml('clt-last', on.last, true) + '</span>'
     : '';
   const meta = model || ctxBarHtml(st) ? '<span class="clt-meta">' + model + ctxBarHtml(st) + '</span>' : '';
   const others = lieutenants().reduce((n, l) => n + (l.id === lt.id ? 0 : lieutenantUnread(l)), 0);
