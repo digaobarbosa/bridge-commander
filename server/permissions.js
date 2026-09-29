@@ -25,10 +25,11 @@ function summarize(tool, input) {
   return s.length > 200 ? s.slice(0, 199) + '…' : s;
 }
 
-// createPermissions({ capMs, onChange }) -> { hold, decide, list, has }
+// createPermissions({ capMs, onChange }) -> { hold, decide, drop, list, has }
 //   hold(res, item)  keep `res` open under a fresh id; replies {decision:null}
 //                    at capMs; drops the item if the client hangs up first.
 //   decide(id, decision, message) -> the item, or null for an unknown id.
+//   drop(pred)       answer every matching ask with no decision ('gone').
 //   onChange(item, outcome) fires on every add and removal —
 //   outcome: 'asked' | 'allow' | 'deny' | 'timeout' | 'gone'.
 function createPermissions({ capMs, onChange }) {
@@ -67,6 +68,9 @@ function createPermissions({ capMs, onChange }) {
     if (message) answer.message = message;
     return settle(id, answer, decision);
   }
+  function drop(pred) {
+    for (const [id, p] of [...pending]) if (pred(p.item)) settle(id, { decision: null }, 'gone');
+  }
   function list() {
     return [...pending.values()].map((p) => p.item).sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
   }
@@ -74,7 +78,7 @@ function createPermissions({ capMs, onChange }) {
     for (const p of pending.values()) if (pred(p.item)) return true;
     return false;
   }
-  return { hold, decide, list, has };
+  return { hold, decide, drop, list, has };
 }
 
 module.exports = { PERMISSION_MODES, permissionMode, summarize, createPermissions };

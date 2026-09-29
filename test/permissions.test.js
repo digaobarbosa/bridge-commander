@@ -198,6 +198,30 @@ test('attribution: a worker ask names its card, owner and window; the decision l
   }
 });
 
+// Claude does not kill the hook when its dialog is answered in the terminal,
+// so the held ask would sit on the board for up to an hour. A turn-end proves
+// the agent is not waiting on anything.
+test('a turn-end drops that agent\'s held asks, and only its own', async () => {
+  const s = await startServer({ env: QUIET, seed: (dir) => seedBoard(dir, seed()) });
+  try {
+    const w = ask(s, { session: 'bc-lt-ada:w-fix', tool_name: 'Bash', tool_input: { command: 'make' } });
+    const l = ask(s, { session: 'whatever', session_id: 'lt-uuid', tool_name: 'Bash', tool_input: { command: 'ls' } });
+    await waitPending(s, 2);
+
+    await s.api('POST', '/api/turn-end', { session: 'bc-lt-ada:w-fix', session_id: 'w-uuid' });
+    assert.deepStrictEqual((await w.reply).body, { decision: null }, 'the worker hook is released with no decision');
+    const [left] = await waitPending(s, 1);
+    assert.strictEqual(left.lieutenant, 'ada');
+    assert.strictEqual(left.card, null, 'the lieutenant ask is untouched');
+
+    await s.api('POST', '/api/turn-end', { session: 'whatever', session_id: 'lt-uuid' });
+    assert.deepStrictEqual((await l.reply).body, { decision: null });
+    await waitPending(s, 0);
+  } finally {
+    await s.stop();
+  }
+});
+
 test('a pending ask holds the stall ladder; after the decision it runs again', async () => {
   const fdir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-fake-'));
   fs.writeFileSync(path.join(fdir, 'bc-lt-ada:w-fix.json'), JSON.stringify({ cwd: '/tmp', resumeId: 'w-uuid' }) + '\n');

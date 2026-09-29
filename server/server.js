@@ -3634,7 +3634,7 @@ async function superviseTick() {
       // said so he can judge from the feed. Any real activity — signal,
       // turn-end, resume, a permission ask or its answer — resets the ladder.
       // A worker with a permission ask pending is waiting on the captain, not hung.
-      if (up && !w.paused && BC_WORKER_STALE_SECS > 0 && !permissions.has((it) => it.card === w.card)) {
+      if (up && !w.paused && BC_WORKER_STALE_SECS > 0 && !permissions.has((it) => it.card === w.card && it.worker === workerName(w.ref))) {
         const card = findCard(w.card);
         if (card && card.column === 'working') {
           const stamps = [w.spawnedAt, w.lastTurnEnd, w.lastSignalAt, w.lastPermissionAt]
@@ -4877,6 +4877,10 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || '{}');
       const sid = body.session_id ? String(body.session_id) : '';
       const { lt, worker: w } = resolveHookAgent(body);
+      // A stopped agent waits on nothing. Its held asks were answered in the
+      // terminal (Claude does not kill the hook then), so they leave the board.
+      if (w) permissions.drop((it) => it.card === w.card && it.worker === workerName(w.ref));
+      else if (lt) permissions.drop((it) => !it.card && it.lieutenant === lt.id);
       if (w) {
         if (sid && w.ref.resumeId !== sid) w.ref.resumeId = sid; // hook payload is ground truth
         w.lastTurnEnd = now();
