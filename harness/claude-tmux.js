@@ -391,8 +391,9 @@ async function resume(ref, opts = {}) {
     // from the card's playbook and a resume that drops them is a worker quietly
     // moved to another model, and a root session that comes back without
     // IS_SANDBOX=1 does not come back at all. The permission mode is replayed
-    // too, so an agent never comes back looser than it was born. opts, when
-    // given, wins over the record. A missing or corrupt record is no flags, no
+    // for callers that pass none; the board always passes the current config
+    // mode, so a config change applies on resume. opts, when given, wins over
+    // the record. A missing or corrupt record is no flags, no
     // prefix and the default mode, never a throw.
     const rec = s.recordedSpawnArgs(stateDir, key);
     const extra = (opts.extraArgs || rec.args).map(String);
