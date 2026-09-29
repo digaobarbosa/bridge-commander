@@ -312,7 +312,7 @@ nothing. The server's worker-stall alert quotes it.
 ## The claude profile
 
 - **spawn** — `tmux new-session -d -s bc-<id> -c <cwd>`, then launches
-  `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude --permission-mode <mode> --session-id <uuid>`
+  `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --permission-mode <mode> --session-id <uuid>`
   (bare — no prompt on the command line). `<mode>` is `opts.permissionMode`
   (`auto` when absent; `default`, `acceptEdits` also pass through). `bypass`
   is the old launch: `claude --dangerously-skip-permissions`, with the

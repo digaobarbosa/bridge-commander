@@ -10,7 +10,7 @@ const claude = require('../claude-tmux.js');
 const { mockTmux } = require('./tmux-mock.js');
 
 const READY = '⏵⏵ auto mode on (shift+tab to cycle)\n❯ ';
-const PREFIX = 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude';
+const PREFIX = 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude';
 
 async function launchLines(fn) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-claude-cwd-'));

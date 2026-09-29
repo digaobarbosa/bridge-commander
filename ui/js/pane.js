@@ -18,7 +18,6 @@ import { terminalLink, cardTarget, lieutenantTarget } from './terminal.js';
 import { getTerminalMode, onTerminalMode } from './terminalsettings.js';
 import { push as toast } from './toast.js';
 import { keepStream } from './streamkeeper.js';
-import { frameSlide } from './panescroll.js';
 
 const overlay = document.getElementById('pane-overlay');
 const titleEl = document.getElementById('pane-title');
@@ -33,7 +32,6 @@ let keeper = null;               // reopens es while the drawer is open
 const STALE_MS = 12000;
 let inputUrl = null;
 let termTarget = null;          // { session, window } of what the drawer shows
-let lastLines = null;           // previous frame's lines: the scroll anchor's reference
 
 // ---------- ⌨ open in a real terminal ----------
 // Off (the default) or no known session: the button is not there at all.
@@ -148,19 +146,10 @@ function open(url, title, inputAt) {
   preEl.hidden = false;
   msgEl.hidden = true;
   preEl.textContent = 'connecting…';
-  lastLines = null;
   setLive(false);
   overlay.hidden = false;
   setHint();
   keeper = keepStream({ connect: () => connect(url), staleMs: STALE_MS });
-}
-
-// keepAnchor — the frame window slid up under a scrolled-up reader: scroll up
-// by the same number of lines so the text they were reading stays put.
-function keepAnchor(lines, top) {
-  const lh = parseFloat(getComputedStyle(preEl).lineHeight);
-  const d = frameSlide(lastLines, lines);
-  if (d && lh > 0) preEl.scrollTop = top - d * lh;
 }
 
 function connect(url) {
@@ -179,12 +168,8 @@ function connect(url) {
     // bottom only when the user was already there — a scroll-up into the
     // scrollback must survive the next frame.
     const stick = preEl.scrollTop + preEl.clientHeight >= preEl.scrollHeight - 12;
-    const top = preEl.scrollTop;
-    const lines = String(frame).split('\n');
     preEl.innerHTML = ansiToHtml(String(frame));
     if (stick) preEl.scrollTop = preEl.scrollHeight;
-    else if (lastLines) keepAnchor(lines, top);
-    lastLines = lines;
     setLive(true);
   });
   es.addEventListener('caps', (e) => {
