@@ -48,6 +48,7 @@ Per-workspace config lives in `.bridge-commander/config.json`:
 | `port` | `4780` | server port (also `--port N` on `init`/`open`) |
 | `host` | `127.0.0.1` | bind address — see network exposure below |
 | `harness` | `claude` | default agent harness (`claude` \| `codex`) |
+| `permissionMode` | `auto` | how agents launch: `auto` \| `default` \| `acceptEdits` \| `bypass`. Outside `bypass`, a prompt an agent would show lands on the board for you to approve or deny |
 | `voices` | — | UI text-to-speech voice filter |
 | `tts` | — | speak agent messages through an external TTS engine: `{"url": "http://127.0.0.1:8883", "lang": "pt", "voice": null, "params": {}}` (voxbench API). Absent = the board stays silent. The **server** reaches the engine: the browser talks to `/api/tts/*` on the board's own origin and the url only has to be reachable from the machine running the server (no CORS, no tailnet on the phone) |
 
