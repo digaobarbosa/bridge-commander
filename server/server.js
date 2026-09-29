@@ -4950,7 +4950,7 @@ const server = http.createServer(async (req, res) => {
       if (card) {
         const text = 'captain ' + (body.decision === 'allow' ? 'approved ' : 'denied ') + item.tool_name + ': '
           + item.summary + (message ? ' — ' + message : '');
-        card.events.push(mkEvent({ text, actor: 'captain' }, { kind: 'permission', level: 2 }));
+        card.events.push(mkEvent({ text, actor: 'captain' }, { kind: 'permission-decided', level: 2 }));
         card.updated = now();
       }
       saveBoard(); broadcast();

@@ -186,7 +186,7 @@ test('attribution: a worker ask names its card, owner and window; the decision l
     await s.api('POST', '/api/permission/' + pw.id + '/decide', { decision: 'deny', message: 'no force' });
     assert.strictEqual((await w.reply).body.decision, 'deny');
     const card = (await s.api('GET', '/api/cards/fix')).body;
-    const ev = card.events.find((e) => e.kind === 'permission');
+    const ev = card.events.find((e) => e.kind === 'permission-decided');
     assert.ok(ev, 'decision event on the card');
     assert.strictEqual(ev.actor, 'captain');
     assert.strictEqual(ev.text, 'captain denied Bash: git push --force — no force');

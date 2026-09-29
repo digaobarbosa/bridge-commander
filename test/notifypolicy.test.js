@@ -46,6 +46,8 @@ test('defaultCategoryPolicy: done/chat/error toast on with non-none sounds', () 
 
 test('permission prompts get their own approval bucket: toast + a sound by default', () => {
   assert.strictEqual(categorize('permission', 1), 'approval');
+  // the captain's own decision lands on the card but must not alert the captain
+  assert.strictEqual(categorize('permission-decided', 2), 'other');
   const d = defaultCategoryPolicy();
   assert.strictEqual(d.approval.toast, true);
   assert.notStrictEqual(d.approval.sound, 'none');
