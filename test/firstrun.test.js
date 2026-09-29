@@ -295,11 +295,6 @@ test('a hand-run recipe printed at root carries the escape hatch root needs', ()
 // now. The hand-run line has to be the same launch her spawn makes, and outside
 // bypass there is no root refusal and no consent screen to explain.
 test('outside bypass, the hand-run line is the spawn\'s own --permission-mode, with no root escape hatch', () => {
-  assert.strictEqual(fr.permissionModeOf({}), 'auto');
-  assert.strictEqual(fr.permissionModeOf(null), 'auto');
-  assert.strictEqual(fr.permissionModeOf({ permissionMode: 'acceptEdits' }), 'acceptEdits');
-  assert.strictEqual(fr.permissionModeOf({ permissionMode: '' }), 'auto');
-
   assert.strictEqual(fr.handRunLine('claude', '/root/myfleet', { root: true }),
     '  cd /root/myfleet && claude --permission-mode auto', 'the default mode, and root needs nothing extra');
   assert.strictEqual(fr.handRunLine('claude', '/ws', { root: false, mode: 'acceptEdits' }),

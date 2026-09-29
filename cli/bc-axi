@@ -32,6 +32,8 @@ const { seedHooks } = require(path.join(SELF_DIR, '..', 'server', 'hooks.js'));
 // --charter-file writes the lieutenant's memory file, not a board field — the
 // charter is prose the agent reads at launch (see server/charter.js).
 const { charterPath, readCharter, writeCharter } = require(path.join(SELF_DIR, '..', 'server', 'charter.js'));
+// The server's own reading of config permissionMode, so a typo launches (and is reported) the same way.
+const { permissionMode } = require(path.join(SELF_DIR, '..', 'server', 'permissions.js'));
 const DEFAULT_PORT = 4780;
 
 function die(msg) { console.error(msg); process.exit(1); }
@@ -629,7 +631,7 @@ async function cmdInitOnboard() {
   // would come up with nobody on it and a message that guessed wrong about why.
   // Only the bypass launch carries that flag; the server spawns her with the
   // same config permissionMode read here.
-  const mode = fr.permissionModeOf(readConfig());
+  const mode = permissionMode(readConfig().permissionMode);
   const bypass = mode === 'bypass';
   if (harness === 'claude' && bypass && fr.isRoot() && !opts.allowRoot) {
     die('bc-axi: first run blocked (root)\n\n' + fr.rootBlockText());

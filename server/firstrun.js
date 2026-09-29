@@ -189,14 +189,6 @@ function gitIdentityText(id) {
     + '  git config --global user.email "<their email>"';
 }
 
-// The permission mode agents launch with (.bridge-commander/config.json
-// `permissionMode`). Only 'bypass' launches with --dangerously-skip-permissions,
-// so only 'bypass' can hit the root refusal and the bypass consent screen.
-function permissionModeOf(config) {
-  const m = config && config.permissionMode;
-  return typeof m === 'string' && m ? m : 'auto';
-}
-
 // Root. Claude Code refuses `--dangerously-skip-permissions` as uid 0 and exits
 // immediately, so as root there is no lieutenant to be had — the board would
 // come up with nobody on it. That is checked HERE, before anything is written,
@@ -382,5 +374,5 @@ module.exports = {
   IGNORABLE, MANIFESTS, SOURCE_DIRS, SOURCE_EXT, ONBOARDING_STEPS,
   isWorkspaceDir, inspectTarget, listPhrase, refusalText,
   hasBin, isRoot, installCommand, tmuxMissingText, gitIdentity, gitIdentityText, portFree,
-  rootBlockText, agentMissingText, agentAtHome, handRunLine, diagnoseSpawn, permissionModeOf,
+  rootBlockText, agentMissingText, agentAtHome, handRunLine, diagnoseSpawn,
 };
