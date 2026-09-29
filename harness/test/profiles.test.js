@@ -115,6 +115,27 @@ test('an acp profile without the acp adapter records a clear error instead of cr
   else assert.deepStrictEqual(r, { name: 'lp-acp', plugin: 'lp', ok: false, error: 'acp adapter not available' });
 });
 
+test('an acp profile may declare model and effort as options; nothing else, and never a tmux one', () => {
+  const acp = { name: 'lp-opt', adapter: 'acp', command: 'npx', args: ['x'] };
+  assert.deepStrictEqual(resolveProfile({ ...acp, options: ['model', 'effort'] }, BASES).options, ['model', 'effort']);
+  assert.strictEqual(resolveProfile(acp, BASES).options, undefined, 'undeclared: learned from a session');
+  assert.throws(() => resolveProfile({ ...acp, options: ['permissionMode'] }, BASES), /may only list "model" and "effort"/);
+  assert.throws(() => resolveProfile({ ...acp, options: 'model' }, BASES), /may only list/);
+  assert.throws(() => resolveProfile({ name: 'lp-t', extends: 'claude', options: ['model'] }, BASES), /options is for acp profiles/);
+});
+
+test('an acp profile may name its ways out: a by-hand resume prefix and a desktop app link', () => {
+  const acp = { name: 'lp-out', adapter: 'acp', command: 'npx' };
+  const app = { label: 'Codex app', url: 'codex://threads/{id}' };
+  const p = resolveProfile({ ...acp, handResume: 'codex resume', appResume: app }, BASES);
+  assert.strictEqual(p.handResume, 'codex resume');
+  assert.deepStrictEqual(p.appResume, app);
+  assert.throws(() => resolveProfile({ ...acp, handResume: 'codex resume; rm -rf ~' }, BASES), /handResume must be/);
+  assert.throws(() => resolveProfile({ ...acp, appResume: { label: 'x', url: 'codex://threads/' } }, BASES), /appResume must be/);
+  assert.throws(() => resolveProfile({ ...acp, appResume: { url: 'codex://threads/{id}' } }, BASES), /appResume must be/);
+  assert.throws(() => resolveProfile({ name: 'lp-t2', extends: 'claude', appResume: app }, BASES), /appResume is for acp profiles/);
+});
+
 // ---------- the port registry ----------
 
 test('listHarnesses: sorted, fake only where tests ask for it; defaultHarness; splitOptions', () => {

@@ -21,10 +21,13 @@ const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 // secrets.env, never from a manifest that may be committed.
 const SECRET_KEY_RE = /(KEY|TOKEN|SECRET|PASSWORD)$/i;
 const JSON_FIELDS = new Set(['name', 'extends', 'adapter', 'env', 'contextWindows', 'requirements',
-  'installHint', 'command', 'args',
+  'installHint', 'command', 'args', 'options', 'handResume', 'appResume',
   // bookkeeping that manifests.js and contributions() add
   'plugin', 'key', 'rank', 'builtin', 'when', 'description']);
 const SECRETS_FILE = 'secrets.env';
+// The UI re-checks both before use; failing here names the bad manifest.
+const HAND_RESUME_RE = /^[A-Za-z0-9_./-]+( [A-Za-z0-9_./-]+)*$/;
+const APP_RESUME_RE = /^[a-z][a-z0-9+.-]*:\/\/[A-Za-z0-9_./?=&%-]*\{id\}[A-Za-z0-9_./?=&%-]*$/;
 
 function fail(msg) { throw new Error(msg); }
 function isObj(v) { return !!v && typeof v === 'object' && !Array.isArray(v); }
@@ -92,12 +95,33 @@ function resolveProfile(json, bases) {
     if (json.args !== undefined && !(Array.isArray(json.args) && json.args.every((a) => typeof a === 'string'))) {
       fail(where + ': args must be a list of strings');
     }
+    // Declaring the options up front honors a pinned model/effort from the
+    // very first spawn; otherwise the adapter learns them only after a session
+    // exposed the matching config option.
+    if (json.options !== undefined && !(Array.isArray(json.options) && json.options.every((o) => o === 'model' || o === 'effort'))) {
+      fail(where + ': options may only list "model" and "effort" for an acp profile');
+    }
+    // An acp session has no tmux to attach to: these are the ways out to a real
+    // client, `<handResume> <resumeId>` in a terminal and a desktop app link.
+    if (json.handResume !== undefined && !(typeof json.handResume === 'string' && HAND_RESUME_RE.test(json.handResume))) {
+      fail(where + ': handResume must be a plain command prefix like "claude --resume"');
+    }
+    if (json.appResume !== undefined && !(isObj(json.appResume) && typeof json.appResume.label === 'string' && json.appResume.label
+      && typeof json.appResume.url === 'string' && APP_RESUME_RE.test(json.appResume.url))) {
+      fail(where + ': appResume must be {label, url} with a scheme:// url holding {id}');
+    }
     return {
       name, adapter, command: json.command, args: (json.args || []).slice(), env,
       contextWindows: windows, requirements, installHint: json.installHint || '',
+      ...(json.options ? { options: json.options.slice() } : {}),
+      ...(json.handResume ? { handResume: json.handResume } : {}),
+      ...(json.appResume ? { appResume: { label: json.appResume.label, url: json.appResume.url } } : {}),
     };
   }
 
+  for (const k of ['options', 'handResume', 'appResume']) {
+    if (json[k] !== undefined) fail(where + ': ' + k + ' is for acp profiles; a tmux profile takes its base\'s');
+  }
   if (typeof json.extends !== 'string' || !json.extends) fail(where + ': a tmux profile needs "extends" (a base like claude)');
   const lookup = typeof bases === 'function' ? bases
     : bases instanceof Map ? (n) => bases.get(n)

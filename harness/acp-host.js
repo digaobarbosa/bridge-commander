@@ -359,12 +359,16 @@ function createHost(deps) {
     };
   }
 
-  function modelOption(options) {
-    return (options || []).find((o) => o && o.type !== 'boolean' && (o.category === 'model' || o.id === 'model')) || null;
+  // ACP names the reasoning level's category `thought_level`; the id differs
+  // per agent (claude-agent-acp: effort, codex-acp: reasoning_effort).
+  const PINNABLE = { model: ['model', 'model'], effort: ['thought_level', 'effort'] };
+  function pinnableOption(options, what) {
+    const [category, id] = PINNABLE[what];
+    return (options || []).find((o) => o && o.type !== 'boolean' && (o.category === category || o.id === id)) || null;
   }
 
   /**
-   * spawn({ key, harness, command, args, env, cwd, prompt?, callbackUrl?, mode: 'new'|'resume', resumeId?, model? })
+   * spawn({ key, harness, command, args, env, cwd, prompt?, callbackUrl?, mode: 'new'|'resume', resumeId?, model?, effort? })
    * -> info. Resume restores memory when the agent can (session/resume, then
    * session/load); otherwise it starts a new session and says restored: false.
    */
@@ -433,10 +437,17 @@ function createHost(deps) {
         s.sessionId = res.sessionId;
       }
       if (res && Array.isArray(res.configOptions)) s.configOptions = res.configOptions;
-      if (p.model) {
-        const opt = modelOption(s.configOptions);
-        if (!opt) throw new Error(`agent ${s.harness} exposes no model option; cannot pin model ${p.model}`);
-        const r = await call(s, 'session/set_config_option', { sessionId: s.sessionId, configId: opt.id, value: String(p.model) }, SETUP_TIMEOUT_MS);
+      for (const what of ['model', 'effort']) {
+        if (!p[what]) continue;
+        const opt = pinnableOption(s.configOptions, what);
+        // The effort levels depend on the model (claude-agent-acp drops the
+        // option for haiku), so a missing one is noted, never fatal.
+        if (!opt && what === 'effort') {
+          append(s.key, { kind: 'error', message: `effort ${p.effort} not pinned: the agent offers no effort option for this model` });
+          continue;
+        }
+        if (!opt) throw new Error(`agent ${s.harness} exposes no ${what} option; cannot pin ${what} ${p[what]}`);
+        const r = await call(s, 'session/set_config_option', { sessionId: s.sessionId, configId: opt.id, value: String(p[what]) }, SETUP_TIMEOUT_MS);
         if (r && Array.isArray(r.configOptions)) s.configOptions = r.configOptions;
       }
       append(s.key, { kind: 'session', sessionId: s.sessionId, mode: p.mode === 'resume' ? (s.restored ? 'restored' : 'fresh') : 'new' });

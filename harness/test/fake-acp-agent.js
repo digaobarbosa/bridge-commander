@@ -12,6 +12,7 @@
 //   FAKE_ACP_RESUME=1 advertise sessionCapabilities.resume
 //   FAKE_ACP_CLOSE=1  advertise sessionCapabilities.close
 //   FAKE_ACP_MODEL=1  expose a `model` select config option
+//   FAKE_ACP_EFFORT=1 expose an `effort` select option of category thought_level
 //   FAKE_ACP_AUTH=1   refuse session/new with auth_required
 //
 // prompt text:
@@ -44,12 +45,17 @@ function save(s) { fs.writeFileSync(file(s.id), JSON.stringify({ ...s, turn: und
 
 const sessions = new Map(); // id -> { id, cwd, history: [{role, text}], model, turn? }
 
+const SELECTS = {
+  model: { env: 'FAKE_ACP_MODEL', category: 'model', values: ['fake-small', 'fake-large'] },
+  effort: { env: 'FAKE_ACP_EFFORT', category: 'thought_level', values: ['low', 'high'] },
+};
+
 function configOptions(s) {
-  if (!on('FAKE_ACP_MODEL')) return undefined;
-  return [{
-    id: 'model', name: 'Model', category: 'model', type: 'select', currentValue: s.model || 'fake-small',
-    options: [{ value: 'fake-small', name: 'Small' }, { value: 'fake-large', name: 'Large' }],
-  }];
+  const out = Object.entries(SELECTS).filter(([, c]) => on(c.env)).map(([id, c]) => ({
+    id, name: id, category: c.category, type: 'select', currentValue: s[id] || c.values[0],
+    options: c.values.map((value) => ({ value, name: value })),
+  }));
+  return out.length ? out : undefined;
 }
 
 const rpc = createRpc({
@@ -123,9 +129,10 @@ async function handle(method, params) {
     }
     case 'session/set_config_option': {
       const s = sessionOf(params);
-      if (params.configId !== 'model' || !on('FAKE_ACP_MODEL')) throw new RpcError(ERR.INVALID_PARAMS, 'unknown config ' + params.configId);
-      if (!['fake-small', 'fake-large'].includes(params.value)) throw new RpcError(ERR.INVALID_PARAMS, 'unknown model ' + params.value);
-      s.model = params.value;
+      const c = Object.prototype.hasOwnProperty.call(SELECTS, params.configId) ? SELECTS[params.configId] : null;
+      if (!c || !on(c.env)) throw new RpcError(ERR.INVALID_PARAMS, 'unknown config ' + params.configId);
+      if (!c.values.includes(params.value)) throw new RpcError(ERR.INVALID_PARAMS, 'unknown ' + params.configId + ' ' + params.value);
+      s[params.configId] = params.value;
       save(s);
       return { configOptions: configOptions(s) };
     }

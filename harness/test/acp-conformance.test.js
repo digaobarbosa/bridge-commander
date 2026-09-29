@@ -260,7 +260,30 @@ test('commands, runCommand, status and profileInfo read what the agent advertise
     const fresh = { harness: 'fakeacp', session: 'acp-none', cwd };
     assert.strictEqual(await h.status(fresh, { stateDir }), null);
     await assert.rejects(h.runCommand(fresh, '/status', { stateDir }), /no status for acp-none/);
-    await assert.rejects(h.spawn(cwd, 'x', { stateDir, effort: 'high' }), /does not support effort/);
+    // No effort option (haiku has none): the spawn goes on and the pane says why.
+    const noEffort = await h.spawn(cwd, 'x', { session: 'bc-noeff', stateDir, effort: 'high' });
+    await waitFor(() => turnEnds(stateDir, 'acp-noeff').length === 1);
+    assert.match(await h.paneSnapshot(noEffort, { stateDir }), /effort high not pinned/);
+    await h.kill(noEffort);
+  });
+});
+
+test('effort pins the thought_level option; a declared profile honors it before any session', async () => {
+  await withEnv(async ({ stateDir, cwd, agentDir }) => {
+    const env = { FAKE_ACP_MODEL: '1', FAKE_ACP_EFFORT: '1' };
+    const learned = acpAdapter(profileFor(agentDir, env));
+    assert.deepStrictEqual(learned.profileInfo().options, []);
+    const declared = acpAdapter({ ...profileFor(agentDir, env), options: ['model', 'effort'] });
+    assert.deepStrictEqual(declared.profileInfo().options, ['model', 'effort'], 'the board can pin both on the first spawn');
+    const ref = await declared.spawn(cwd, 'hi', { session: 'bc-eff', stateDir, model: 'fake-large', effort: 'high' });
+    await waitFor(() => turnEnds(stateDir, 'acp-eff').length === 1);
+    const calls = fs.readFileSync(path.join(agentDir, 'calls.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const set = calls.filter((c) => c.method === 'session/set_config_option').map((c) => [c.params.configId, c.params.value]);
+    assert.deepStrictEqual(set, [['model', 'fake-large'], ['effort', 'high']]);
+    const st = JSON.parse(fs.readFileSync(path.join(stateDir, 'acp-eff.acp-state.json'), 'utf8'));
+    assert.strictEqual(st.configOptions.find((o) => o.id === 'effort').currentValue, 'high');
+    assert.deepStrictEqual(await declared.status(ref, { stateDir }), { contextUsed: 100, contextWindow: 1000, model: 'fake-large', effort: 'high' });
+    await declared.kill(ref);
   });
 });
 

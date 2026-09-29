@@ -87,3 +87,22 @@ test('refResume: a ref resumes only when its harness has a by-hand prefix', asyn
   assert.strictEqual(refResume({ cwd: '/p' }, CLI), null);
   assert.strictEqual(refResume(null, CLI), null);
 });
+
+test('openerLink: any vetted command through the chosen opener; off or no command gives null', async () => {
+  const { openerLink } = await mod;
+  const cmd = `cd '/p' && codex resume ${ID}`;
+  assert.deepStrictEqual(openerLink('iterm2', cmd), { href: 'iterm2:/command?c=' + encodeURIComponent(cmd) });
+  assert.deepStrictEqual(openerLink('copy', cmd), { copy: cmd });
+  assert.strictEqual(openerLink('off', cmd), null);
+  assert.strictEqual(openerLink('iterm2', null), null);
+});
+
+test('appResumeLink: the profile url with the uuid in {id}; a bad url or id gives null', async () => {
+  const { appResumeLink } = await mod;
+  assert.strictEqual(appResumeLink({ label: 'Claude desktop', url: 'claude://resume?session={id}' }, ID), 'claude://resume?session=' + ID);
+  assert.strictEqual(appResumeLink({ label: 'Codex app', url: 'codex://threads/{id}' }, ID), 'codex://threads/' + ID);
+  assert.strictEqual(appResumeLink({ url: 'codex://threads/{id}' }, 'x&evil=1'), null);
+  assert.strictEqual(appResumeLink({ url: 'javascript:alert(1)//{id}' }, ID), null);
+  assert.strictEqual(appResumeLink({ url: 'codex://threads/' }, ID), null, 'no {id}: it would open the wrong thing');
+  assert.strictEqual(appResumeLink(null, ID), null);
+});

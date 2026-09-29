@@ -103,6 +103,44 @@ test('the `when`s show each command on the cards it is for', async () => {
   assert.strictEqual(matches(whenOf(path.join(SHIPPED, 'local-git'), 'local-git.checkout'), orphan), false);
 });
 
+// ---------- acp-agents: claude-acp and codex-acp ----------
+
+test('acp-agents contributes claude-acp and codex-acp as pinned acp profiles that honor model and effort', () => {
+  const port = require('../harness/port.js');
+  const { loadProfiles } = require('../harness/profiles.js');
+  const m = manifestOf(path.join(SHIPPED, 'acp-agents'));
+  assert.notStrictEqual(m.enabled, false, 'on by default: nothing else changes for claude or codex');
+  const profiles = m.contributes.profiles.map((p) => Object.assign({ plugin: 'acp-agents' }, p));
+  assert.deepStrictEqual(profiles.map((p) => p.name), ['claude-acp', 'codex-acp']);
+  for (const p of profiles) {
+    // an unpinned npx fetch would move under the board every day
+    assert.ok(p.args.some((a) => /^@agentclientprotocol\/[a-z-]+@\d+\.\d+\.\d+$/.test(a)), p.name + ' pins its package: ' + p.args);
+  }
+  assert.ok(profiles[1].args.every((a) => !a.startsWith('@zed-industries/')), 'not the dead codex-acp');
+
+  const before = ['claude', 'codex'].map((n) => port.listHarnesses().find((h) => h.name === n));
+  const res = loadProfiles({ profiles, stateDir: tmp('bc-acp-agents-') });
+  assert.deepStrictEqual(res, [{ name: 'claude-acp', plugin: 'acp-agents', ok: true }, { name: 'codex-acp', plugin: 'acp-agents', ok: true }]);
+  for (const name of ['claude-acp', 'codex-acp']) {
+    const impl = port.getHarness(name);
+    const info = impl.profileInfo();
+    assert.strictEqual(info.adapter, 'acp');
+    assert.deepStrictEqual(info.options, ['model', 'effort'], name + ' pins both from the first spawn');
+    assert.deepStrictEqual(info.requirements.bins, ['npx']);
+    assert.deepStrictEqual(port.splitOptions(impl, { model: 'm', effort: 'high' }), { opts: { model: 'm', effort: 'high' }, ignored: [] });
+    assert.strictEqual(typeof impl.interrupt, 'function', name + ' can be interrupted from the board');
+  }
+  // The ways out of the drawer: the ACP session id IS the CLI's (verified on
+  // real sessions), so the plain CLI and the desktop app reopen it.
+  const listed = (n) => port.listHarnesses().find((h) => h.name === n);
+  assert.strictEqual(listed('claude-acp').handResume, 'claude --resume');
+  assert.deepStrictEqual(listed('claude-acp').appResume, { label: 'Claude desktop', url: 'claude://resume?session={id}' });
+  assert.strictEqual(listed('codex-acp').handResume, 'codex resume');
+  assert.deepStrictEqual(listed('codex-acp').appResume, { label: 'Codex app', url: 'codex://threads/{id}' });
+  assert.deepStrictEqual(['claude', 'codex'].map((n) => port.listHarnesses().find((h) => h.name === n)), before,
+    'the tmux claude and codex are untouched');
+});
+
 // ---------- github: the PR watch belongs to the plugin ----------
 
 function fakeCtx(internal) {

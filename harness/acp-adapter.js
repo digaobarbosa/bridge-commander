@@ -333,7 +333,9 @@ function acpAdapter(profile, deps = {}) {
   if (typeof profile.command !== 'string' || !profile.command) throw new TypeError(`acp profile "${profile.name}" needs a command`);
   const host = deps.host || createHostClient();
   const memo = new Map(); // keyOf|cwd -> stateDir
-  let modelSeen = Array.isArray(profile.options) && profile.options.includes('model');
+  // The typed options this profile honors: declared by the profile, or learned
+  // once a session exposed the matching config option.
+  const honored = new Set(Array.isArray(profile.options) ? profile.options.filter((o) => o === 'model' || o === 'effort') : []);
   const callbackOf = (opts) => opts.callbackUrl || process.env.BC_TURNEND_URL || '';
   const memoKey = (ref) => keyOf(ref) + '\n' + ref.cwd;
 
@@ -346,9 +348,13 @@ function acpAdapter(profile, deps = {}) {
     memo.set(memoKey(ref), stateDir);
     writePointer(ref, stateDir);
   }
-  function noteModel(info) {
-    if (info && Array.isArray(info.configOptions)
-      && info.configOptions.some((o) => o && (o.category === 'model' || o.id === 'model'))) modelSeen = true;
+  function noteOptions(info) {
+    if (!info || !Array.isArray(info.configOptions)) return;
+    for (const o of info.configOptions) {
+      if (!o || o.type === 'boolean') continue;
+      if (o.category === 'model' || o.id === 'model') honored.add('model');
+      if (o.category === 'thought_level' || o.id === 'effort') honored.add('effort');
+    }
   }
 
   function sessionName(opts) {
@@ -359,13 +365,13 @@ function acpAdapter(profile, deps = {}) {
   }
 
   function hostParams(cwd, key, stateDir, opts, extraArgs) {
-    if (opts.effort) throw new Error(`${profile.name} does not support effort`);
     const p = {
       key, harness: profile.name, command: profile.command,
       args: (profile.args || []).map(String).concat((extraArgs || []).map(String)),
       env: expandEnv(profile.env, stateDir), cwd, callbackUrl: callbackOf(opts),
     };
     if (opts.model) p.model = String(opts.model);
+    if (opts.effort) p.effort = String(opts.effort);
     return p;
   }
 
@@ -391,7 +397,7 @@ function acpAdapter(profile, deps = {}) {
       try { fs.unlinkSync(briefFile); } catch { /* best-effort */ }
       throw new Error(`${profile.name} could not start: ${e.message}`);
     }
-    noteModel(info);
+    noteOptions(info);
     const ref = makeRef(profile.name, session, window, cwdAbs, info.sessionId);
     remember(ref, stateDir);
     return ref;
@@ -449,7 +455,7 @@ function acpAdapter(profile, deps = {}) {
     } catch (e) {
       throw new Error(`${profile.name} could not resume ${key}: ${e.message}`);
     }
-    noteModel(info);
+    noteOptions(info);
     const back = makeRef(profile.name, ref.session, ref.window, ref.cwd, info.sessionId);
     remember(back, stateDir);
     return back;
@@ -513,13 +519,17 @@ function acpAdapter(profile, deps = {}) {
     return base;
   }
 
-  /** status(ref, opts?) -> { model?, contextUsed, contextWindow } | null — from the last usage_update. */
+  /** status(ref, opts?) -> { model?, effort?, contextUsed, contextWindow } | null — from the last usage_update. */
   async function status(ref, opts = {}) {
     const st = readState(stateDirOf(ref, opts), keyOf(ref));
     if (!st || !st.usage || !Number.isFinite(st.usage.used) || !Number.isFinite(st.usage.size)) return null;
     const out = { contextUsed: st.usage.used, contextWindow: st.usage.size };
-    const m = (st.configOptions || []).find((o) => o && (o.category === 'model' || o.id === 'model'));
-    if (m && typeof m.currentValue === 'string' && m.currentValue) out.model = m.currentValue;
+    const current = (category, id) => {
+      const o = (st.configOptions || []).find((x) => x && x.type !== 'boolean' && (x.category === category || x.id === id));
+      return o && typeof o.currentValue === 'string' && o.currentValue ? o.currentValue : null;
+    };
+    if (current('model', 'model')) out.model = current('model', 'model');
+    if (current('thought_level', 'effort')) out.effort = current('thought_level', 'effort');
     return out;
   }
 
@@ -570,12 +580,14 @@ function acpAdapter(profile, deps = {}) {
     return lastLines(renderLog(readLog(logFile(stateDir, keyOf(ref)))), opts.lines > 0 ? opts.lines : 200);
   }
 
-  /** profileInfo() — typed options: 'model' once the agent showed a model config option. */
+  /** profileInfo() — typed options: 'model' / 'effort' as declared, or once the agent showed the config option. */
   function profileInfo() {
     return {
-      name: profile.name, adapter: 'acp', options: modelSeen ? ['model'] : [], permissionModes: [],
+      name: profile.name, adapter: 'acp', options: ['model', 'effort'].filter((o) => honored.has(o)), permissionModes: [],
       requirements: { bins: [profile.command], tmux: false, rootBypass: false },
       installHint: profile.installHint || '', contextWindows: profile.contextWindows || [],
+      handResume: profile.handResume || '',
+      ...(profile.appResume ? { appResume: profile.appResume } : {}),
     };
   }
 

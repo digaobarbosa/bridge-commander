@@ -183,7 +183,7 @@ function profileOf(name) {
   return impl && impl.profile && typeof impl.profile === 'object' ? impl.profile : null;
 }
 
-// listHarnesses() -> [{name, adapter, plugin?, handResume?}], sorted. The fake is a test
+// listHarnesses() -> [{name, adapter, plugin?, handResume?, appResume?}], sorted. The fake is a test
 // double, so it is listed only where tests run it.
 function listHarnesses() {
   const withFake = !!(process.env.BC_FAKE_STATE || process.env.BC_LIST_FAKE);
@@ -196,6 +196,7 @@ function listHarnesses() {
     const e = { name, adapter: (info && info.adapter) || (name === 'fake' ? 'fake' : 'custom') };
     if (pluginOf.has(name)) e.plugin = pluginOf.get(name);
     if (info && info.handResume) e.handResume = info.handResume;
+    if (info && info.appResume) e.appResume = info.appResume;
     out.push(e);
   }
   return out;

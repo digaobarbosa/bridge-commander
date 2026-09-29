@@ -7,6 +7,70 @@ seven-verb harness port as the tmux family. The decision behind it is in
 and long-tail agents, behind a long-lived host, and BC shows the session as a
 read-only event log. BC does not rebuild a TUI.
 
+## The shipped profiles: claude-acp and codex-acp
+
+`plugins/acp-agents` ships two profiles, enabled by default. They sit beside
+the tmux `claude` and `codex`, which do not change.
+
+| Pick | When |
+|---|---|
+| `claude` / `codex` (tmux) | you want to attach, type into the terminal, see the statusline. Lieutenants, mostly |
+| `claude-acp` / `codex-acp` | a worker you only supervise: a structured event log, a turn end straight from the protocol, no TUI to settle or screen-scrape |
+
+Both honor the typed `model` and `effort` options (a lieutenant's pins, a
+playbook's `model:`). They set the agent's `model` and `thought_level` config
+options before the first prompt. A model without effort levels (haiku)
+starts without the effort, and the pane says so. `permissionMode` is not honored: every tool
+permission goes to the board (see Permissions).
+
+The versions are pinned: `claude-agent-acp@0.79.0` and `codex-acp@1.12.0`.
+
+- Both packages release almost daily, and a bad release breaks every spawn at
+  once. A pin moves only when someone runs the smoke on the new version.
+- A pin must be at least 7 days old. An npm with `min-release-age=7` refuses a
+  newer one with `ETARGET`, and the spawn fails in `initialize`.
+
+A real run on 2026-09-29 (`--cancel --resume`, both CLIs logged in, npx cache warm):
+
+| | claude-acp | codex-acp |
+|---|---|---|
+| spawn returns | 5.1 s | 4.5 s |
+| first output after spawn | 7.0 s | 7.1 s |
+| first turn end after spawn | 8.1 s | 10.5 s |
+| cancel: first output → cancelled turn end | 1.3 s → 1.7 s | 3.3 s → 3.6 s |
+| resume after the host died (same session id) | 2.1 s | 1.2 s |
+| resumed session recalls turn 1 | yes | yes |
+| models offered | default, opus[1m], claude-fable-5-1[1m], sonnet, haiku | gpt-6-astra, gpt-5.6-sol/terra/luna, gpt-5.5 |
+
+codex-acp prefixes some replies with a "Skill descriptions were shortened"
+warning when many skills are installed. It is part of the turn's text.
+
+### Leaving the board: terminal and desktop app
+
+An ACP session id is the CLI's own session id. claude-agent-acp writes
+`~/.claude/projects/<cwd>/<id>.jsonl`, and codex-acp writes
+`~/.codex/sessions/…/rollout-…-<id>.jsonl`. So the plain CLI and the desktop
+app reopen the conversation. The 👁 drawer offers:
+
+| Where | claude-acp | codex-acp |
+|---|---|---|
+| ⌨ (iTerm2) and 📋 "resume" | `cd '<cwd>' && claude --resume <id>` | `cd '<cwd>' && codex resume <id>` |
+| 📋 "open in …" | `claude://resume?session=<id>` (Claude desktop imports the CLI session) | `codex://threads/<id>` (the Codex app in ChatGPT.app) |
+
+The profile declares these as `handResume` and `appResume: {label, url}`, with
+`{id}` in the url. A tmux profile cannot declare them.
+
+Checked on 2026-09-29: a real session of each, killed, then `claude -p --resume
+<id>` and `codex exec resume <id>` recalled a codeword from the ACP turn. Claude
+desktop 2.9939.4 logged "Imported CLI session <id>". ChatGPT 26.924 ran
+`thread/resume` on the id with no error.
+
+A second client on a live session can conflict: both write the same
+conversation. Stop the board's session first, as with the tmux resume.
+
+To move a pin: `node harness/acp-smoke.js claude-acp --cancel --resume`
+runs the profile exactly as the plugin declares it.
+
 ## Configure a profile
 
 ```json
@@ -17,6 +81,12 @@ read-only event log. BC does not rebuild a TUI.
 ```
 
 `profiles.js` hands the profile to `require('./acp-adapter.js').acpAdapter(profile)`.
+
+- `options` (optional) lists the typed options the profile honors: `model`,
+  `effort`, or both. Declared, the board pins them from the first spawn.
+  Undeclared, the adapter learns each one when a session first exposes the
+  matching config option, and a pin before that is dropped with the board's
+  "does not support" note.
 
 - `command` and `args` start the agent. `opts.extraArgs` is appended, and a
   resume replays it from `<key>.spawn-args`, like the tmux family.
@@ -60,7 +130,7 @@ BC server ──(harness port)── acp-adapter.js ──unix socket, JSON-RPC�
 
 | Verb | ACP |
 |---|---|
-| `spawn` | start the host when needed → `initialize` (protocol 1, `fs` and `terminal` off) → `session/new {cwd, mcpServers: []}` → `session/set_config_option` for `opts.model` → the brief is queued as the first `session/prompt`. It returns once the session exists, not when the turn ends |
+| `spawn` | start the host when needed → `initialize` (protocol 1, `fs` and `terminal` off) → `session/new {cwd, mcpServers: []}` → `session/set_config_option` for `opts.model` (the `model` option) and `opts.effort` (the `thought_level` option) → the brief is queued as the first `session/prompt`. It returns once the session exists, not when the turn ends |
 | `send` | queue a `session/prompt`. It returns once the host accepts it. Prompts run one at a time per session |
 | `alive` | the host holds a live agent for the key. No host = `false`. A host that cannot answer throws |
 | `resumable` | a resume id is known (`<key>.session-id`, then `ref.resumeId`) AND the agent advertised `sessionCapabilities.resume` or `loadSession` |
@@ -69,13 +139,16 @@ BC server ──(harness port)── acp-adapter.js ──unix socket, JSON-RPC�
 | `onTurnEnd` | the shared tail of `<key>.turnend.jsonl` |
 | `openPane` / `paneSnapshot` | `<key>.acp.jsonl` rendered as text frames: prompts, messages, thoughts (dim), tool calls with their status, diffs, the latest plan, permission asks and their verdicts, turn ends, exits |
 | `commands` / `runCommand` | `/status` and `/help`, then what `available_commands_update` advertised. An advertised command is sent as a prompt, as the literal line |
-| `status` | the last `usage_update` → `{contextUsed: used, contextWindow: size, model?}`; `model` is the `model` config option's current value |
+| `status` | the last `usage_update` → `{contextUsed: used, contextWindow: size, model?, effort?}`; `model` and `effort` are the current values of the `model` and `thought_level` config options |
 | `brief` | `<key>.prompt` |
-| `profileInfo` | `{name, adapter: 'acp', options: [] \| ['model'], permissionModes: [], requirements: {bins: [command], tmux: false, rootBypass: false}, installHint, contextWindows}`. `'model'` shows up once a session of this profile exposed a `model` config option, or when the profile lists it in `options` |
+| `interrupt` | `session/cancel` for the running turn. The session stays open |
+| `profileInfo` | `{name, adapter: 'acp', options: ⊆ ['model', 'effort'], permissionModes: [], requirements: {bins: [command], tmux: false, rootBypass: false}, installHint, contextWindows}`. An option shows up when the profile lists it in `options`, or once a session exposed the matching config option |
 
 `paneInput`, `adoptWindow` and `panePids` are not offered: there is no terminal
-to type into, no tmux window, and no pane. `opts.effort` and `permissionMode`
-are not honored; `effort` throws.
+to type into, no tmux window, and no pane. `permissionMode` is not honored. A
+`model` the agent has no config option for fails the spawn. A missing `effort`
+option does not: the levels depend on the model (claude-agent-acp offers none
+for haiku), so the pin is skipped and the pane log says so.
 
 ### The ref
 
@@ -144,8 +217,9 @@ is its `rawInput`. Fields reported in earlier `tool_call` updates are merged in.
 
 ## Limits
 
-- **No human attach.** The pane is a read-only log. There is no terminal drawer
-  and no statusline.
+- **No human attach.** The pane is a read-only log. There is no terminal to
+  attach to and no statusline. The way out is to reopen the conversation in
+  another client (see "Leaving the board").
 - **Adapter maturity.** The ACP bridges for Claude Code and Codex are young.
   The RFC records around 100 open issues each: steering, background tasks, a
   permission deadlock, orphaned children, partial history replay. Pin versions
@@ -163,10 +237,11 @@ node --test harness/test/acp-rpc.test.js harness/test/acp-host.test.js harness/t
 node harness/acp-smoke.js codex --resume     # REAL agent through npx; needs the network and a login
 BC_ACP_SMOKE_MODEL=gpt-5.5 node harness/acp-smoke.js codex
 node harness/acp-smoke.js claude --resume
+node harness/acp-smoke.js codex-acp --cancel --resume   # a shipped profile, pinned version and all
 ```
 
 `test/fake-acp-agent.js` is a scriptable ACP agent. Its env sets the
 capabilities (`FAKE_ACP_LOAD`, `FAKE_ACP_RESUME`, `FAKE_ACP_CLOSE`,
-`FAKE_ACP_MODEL`, `FAKE_ACP_AUTH`). The prompt text sets the turn (`CRASH`,
+`FAKE_ACP_MODEL`, `FAKE_ACP_EFFORT`, `FAKE_ACP_AUTH`). The prompt text sets the turn (`CRASH`,
 `HANG`, `SLOW <ms>`, `PERMISSION`, `RECALL`, `PLAN`, else an echo). The
 conformance cases run the real detached host, and each one stops its host.

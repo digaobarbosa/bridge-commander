@@ -14,9 +14,9 @@ import { card, lieutenant, workerFor } from './state.js';
 import { api } from './api.js';
 import { ansiToHtml } from './ansi.js';
 import { keyForEvent } from './panekeys.js';
-import { terminalLink, safeAttach, refResume, cardTarget, lieutenantTarget } from './terminal.js';
+import { terminalLink, openerLink, safeAttach, refResume, appResumeLink, cardTarget, lieutenantTarget } from './terminal.js';
 import { openPopover, closePopover } from './popover.js';
-import { handResumeOf } from './plugins.js';
+import { handResumeOf, appResumeOf, adapterOf } from './plugins.js';
 import { getTerminalMode, onTerminalMode } from './terminalsettings.js';
 import { push as toast } from './toast.js';
 import { keepStream } from './streamkeeper.js';
@@ -36,12 +36,22 @@ const STALE_MS = 12000;
 let inputUrl = null;
 let termTarget = null;          // { session, window } of what the drawer shows
 let resume = null;              // { cmd, cli } when the harness can be resumed by hand
+let app = null;                 // { label, href } when a desktop app opens the conversation
+let acp = false;                // an acp session: no tmux, the ways out are resume and app
+// A second client on a live conversation: the board's agent and it both write.
+const CONFLICT = 'a second client on a live session can conflict';
 
 // ---------- ⌨ open in a real terminal ----------
 // Off (the default) or no known session: the button is not there at all.
 function drawTerm() {
-  const link = overlay.hidden ? null : terminalLink(getTerminalMode(), termTarget);
+  const mode = getTerminalMode();
+  const link = overlay.hidden ? null
+    : termTarget ? terminalLink(mode, termTarget)
+      : acp && resume ? openerLink(mode, resume.cmd) : null;
   termEl.hidden = !link;
+  termEl.title = acp && resume
+    ? 'open this conversation with ' + resume.cli + ' in a real terminal — use when the board\'s session is stopped: ' + CONFLICT
+    : 'open this session in a real terminal';
   termEl.dataset.copy = (link && link.copy) || '';
   if (link && link.href) termEl.href = link.href; else termEl.removeAttribute('href');
 }
@@ -50,7 +60,7 @@ termEl.onclick = (e) => {
   if (!cmd) return;              // an href: the browser hands it to the terminal app
   e.preventDefault();
   navigator.clipboard.writeText(cmd).then(
-    () => toast({ emoji: '⌨', text: 'tmux command copied — paste it in a terminal' }),
+    () => toast({ emoji: '⌨', text: (termTarget ? 'tmux' : 'resume') + ' command copied — paste it in a terminal' }),
     () => toast({ emoji: '⌨', text: 'could not copy: ' + cmd }));
 };
 onTerminalMode(drawTerm);
@@ -65,12 +75,27 @@ function copyItems() {
     title: 'join the live session as a grouped session — the agent\'s own view never moves' });
   if (resume) items.push({ label: 'resume ' + resume.cli, cmd: resume.cmd,
     title: 'use only when the board\'s session is gone — two ' + resume.cli + ' processes on one conversation conflict' });
+  if (app) items.push({ label: 'open in ' + app.label, href: app.href,
+    title: 'opens this conversation in ' + app.label + ' — ' + CONFLICT + '; prefer it once the board\'s session is stopped' });
   return items;
 }
 function resumeOf(ref) {
   const prefix = handResumeOf(ref && ref.harness);
   const cmd = refResume(ref, prefix);
   return cmd ? { cmd, cli: prefix.split(' ')[0] } : null;
+}
+function appOf(ref) {
+  const a = appResumeOf(ref && ref.harness);
+  const href = a && ref ? appResumeLink(a, ref.resumeId) : null;
+  return href ? { label: a.label, href } : null;
+}
+// setAgent(target, ref) — what the drawer's ways out address. An acp ref's
+// session name is no tmux session, so it never becomes an attach target.
+function setAgent(target, ref) {
+  acp = adapterOf(ref && ref.harness) === 'acp';
+  termTarget = acp ? null : target;
+  resume = resumeOf(ref);
+  app = appOf(ref);
 }
 function drawCopy() {
   copyEl.hidden = overlay.hidden || !copyItems().length;
@@ -83,7 +108,9 @@ function copy(cmd) {
 }
 copyEl.onclick = () => {
   if (closePopover('pane-copy-pop')) return; // a second click is a toggle
-  const items = copyItems().map((it) => ({ label: it.label, title: it.title + '\n\n' + it.cmd, onClick: () => copy(it.cmd) }));
+  const items = copyItems().map((it) => (it.href
+    ? { label: it.label, title: it.title + '\n\n' + it.href, onClick: () => { window.location.href = it.href; } }
+    : { label: it.label, title: it.title + '\n\n' + it.cmd, onClick: () => copy(it.cmd) }));
   openPopover(copyEl, items, { id: 'pane-copy-pop', align: 'right' });
 };
 
@@ -270,8 +297,7 @@ export function openCardPane(cardId, window_) {
   const q = pick ? '?window=' + encodeURIComponent(pick) : '';
   drawTabs(names, pick, (name) => openCardPane(cardId, name));
   const w = workerFor(cardId);
-  termTarget = cardTarget(c, w, pick);
-  resume = resumeOf(w && w.ref);
+  setAgent(cardTarget(c, w, pick), w && w.ref);
   open(base + 'stream' + q, String(at.session || (c && c.title) || cardId), base + 'input' + q);
   drawTerm();
   drawCopy();
@@ -280,8 +306,7 @@ export function openLieutenantPane(id) {
   const l = lieutenant(id);
   const base = '/api/lieutenants/' + encodeURIComponent(id) + '/pane/';
   drawTabs([], null, () => {}); // a lieutenant is one session, never tabbed
-  termTarget = lieutenantTarget(l);
-  resume = resumeOf(l && l.ref);
+  setAgent(lieutenantTarget(l), l && l.ref);
   open(base + 'stream', String((l && l.ref && l.ref.session) || (l && l.name) || id), base + 'input');
   drawTerm();
   drawCopy();
@@ -290,8 +315,7 @@ export function closePane() {
   stop();
   inputUrl = null;
   drawTabs([], null, () => {});
-  termTarget = null;
-  resume = null;
+  setAgent(null, null);
   preEl.blur();
   overlay.hidden = true;
   drawTerm();

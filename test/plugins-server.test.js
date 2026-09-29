@@ -77,6 +77,14 @@ test('GET /api/plugins: the catalog, commands without their shell line, harnesse
   assert.ok(r.body.contributions.checks.some((c) => c.plugin === 'recorder' && c.id === 'fine' && c.exec === undefined));
   assert.ok(Array.isArray(r.body.harnesses) && r.body.harnesses.every((h) => typeof h.name === 'string'));
   assert.ok(Array.isArray(r.body.disabled));
+  // The shipped acp-agents plugin adds two harnesses beside the tmux ones.
+  const h = (n) => r.body.harnesses.find((x) => x.name === n);
+  assert.strictEqual(h('claude-acp').adapter, 'acp');
+  assert.strictEqual(h('claude-acp').plugin, 'acp-agents');
+  assert.strictEqual(h('codex-acp').adapter, 'acp');
+  assert.strictEqual(h('claude').adapter, 'tmux');
+  assert.strictEqual(h('codex').adapter, 'tmux');
+  assert.ok(r.body.plugins.find((p) => p.id === 'acp-agents').enabled);
 });
 
 test('the board carries activities, pluginsVersion, and card.ext from a decorator (omitted when empty)', async () => {

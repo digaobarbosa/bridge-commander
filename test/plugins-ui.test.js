@@ -33,7 +33,9 @@ const PAYLOAD = {
     sections: [{ id: 'deploys', title: 'Deploys', slot: 'detail.sections/v1', plugin: 'kit', key: 'section:deploys', rank: 1000 }],
     checks: [],
   },
-  harnesses: [{ name: 'claude', adapter: 'tmux' }, { name: 'deepseek', adapter: 'tmux', plugin: 'deepseek' }],
+  harnesses: [{ name: 'claude', adapter: 'tmux' }, { name: 'deepseek', adapter: 'tmux', plugin: 'deepseek' },
+    { name: 'codex-acp', adapter: 'acp', plugin: 'acp-agents', handResume: 'codex resume',
+      appResume: { label: 'Codex app', url: 'codex://threads/{id}' } }],
   disabled: ['view:kanban', 'menu:card.actions/v1:kit.pr'],
 };
 function stubFetch(answers) {
@@ -82,7 +84,13 @@ test('loadPlugins fills the slots and the view registry, and applies the disable
   assert.deepStrictEqual(views.views().map((v) => v.id), ['table', 'timeline'], 'view:kanban off, the plugin view in');
   assert.strictEqual(views.current(), 'table', 'the kanban was on screen: falls back');
   assert.strictEqual(P.command('kit.deploy').tracked, true);
-  assert.deepStrictEqual(P.harnesses(), ['claude', 'deepseek']);
+  assert.deepStrictEqual(P.harnesses(), ['claude', 'deepseek', 'codex-acp']);
+  assert.strictEqual(P.adapterOf('codex-acp'), 'acp');
+  assert.strictEqual(P.adapterOf('claude'), 'tmux');
+  assert.strictEqual(P.adapterOf('nope'), '');
+  assert.strictEqual(P.handResumeOf('codex-acp'), 'codex resume');
+  assert.deepStrictEqual(P.appResumeOf('codex-acp'), { label: 'Codex app', url: 'codex://threads/{id}' });
+  assert.strictEqual(P.appResumeOf('claude'), null, 'the tmux claude gets no app link');
   assert.strictEqual(P.defaultHarness(), 'claude');
 });
 

@@ -37,9 +37,14 @@ export function terminalMode(stored) {
 // terminalLink(mode, target) -> { href } | { copy } | null
 // target: { session, window? } — null when the mode is off or the names are unsafe.
 export function terminalLink(mode, target) {
+  return openerLink(mode, safeAttach(target));
+}
+
+// openerLink(mode, cmd) -> the opener's { href } | { copy } for any vetted
+// command: an acp session has no tmux, so its way into a terminal is the resume.
+export function openerLink(mode, cmd) {
   const opener = OPENERS.find((o) => o.key === mode);
-  const cmd = opener && opener.link ? safeAttach(target) : null;
-  return cmd ? opener.link(cmd) : null;
+  return opener && opener.link && cmd ? opener.link(cmd) : null;
 }
 
 // safeAttach(target) -> the attach command, or null when the names are unsafe.
@@ -72,6 +77,15 @@ export function resumeCommand(cli, cwd, id) {
 // refResume(ref, cli) — cli is the ref's harness profile handResume ('' = none).
 export function refResume(ref, cli) {
   return ref ? resumeCommand(cli, ref.cwd, ref.resumeId) : null;
+}
+
+// appResumeLink(app, id) -> the desktop app link that opens this conversation,
+// or null. `app` is profile data ({label, url with {id}}); the id is a uuid,
+// so nothing else can be smuggled into the scheme's query.
+const APP_URL_RE = /^[a-z][a-z0-9+.-]*:\/\/[A-Za-z0-9_./?=&%-]*\{id\}[A-Za-z0-9_./?=&%-]*$/;
+export function appResumeLink(app, id) {
+  if (!app || typeof app.url !== 'string' || !APP_URL_RE.test(app.url) || !UUID_RE.test(String(id || ''))) return null;
+  return app.url.replace('{id}', id);
 }
 
 // Where an agent lives, from what the board payload already carries: a
