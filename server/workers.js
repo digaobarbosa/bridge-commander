@@ -252,6 +252,7 @@ function createWorkers(deps) {
     card.attributes.session = refKey(w.ref);
     if (w.ref && w.ref.resumeId) card.attributes.resumeId = w.ref.resumeId;
     else delete card.attributes.resumeId;
+    if (deps.rememberSession) deps.rememberSession(card, w);
   }
 
   // ---------- kill / release / drop: the three halves of an ending ----------
@@ -411,7 +412,7 @@ function createWorkers(deps) {
   /** Drop the registry entry (ONLY behind a verified kill), stamping its address on the card. */
   function drop(card, w) {
     if (!isCurrent(w)) return null;
-    stamp(deps.findCard(w.card), w);
+    stamp(deps.findCard(w.card) || card, w);
     deps.board().workers = records().filter((x) => x !== w);
     deps.save();
     return w;
@@ -430,6 +431,7 @@ function createWorkers(deps) {
   async function end(card, trigger, opts = {}) {
     const row = END_OF_LIFE[trigger];
     if (!row) throw new Error('unknown end-of-life trigger: ' + trigger);
+    if (card.execution === 'external') return { spared: true };
     let w = find(card.id) || null;
     const onBoard = !!deps.findCard(card.id);
     if (row.spares(w, card, onBoard)) return { spared: true };
@@ -515,6 +517,7 @@ function createWorkers(deps) {
   }
 
   async function doStart(card, body) {
+    if (card.execution === 'external') return { error: 'this card tracks an external session; use its eye button to continue it', code: 409 };
     if (card.type === 'plan') return { error: 'plan cards never start (no worker is spawned for a plan)', code: 400 };
     // The second way a card could start is gone, not merely unsupported.
     if (body.command !== undefined) {
@@ -842,6 +845,7 @@ function createWorkers(deps) {
       said ? { lastTurnEndText: said } : {}));
     const statusChanged = deps.refreshStatus ? !!(await deps.refreshStatus(w)) : false;
     const card = deps.findCard(w.card);
+    stamp(card, w);
     let stopped = false;
     if (card && card.column === 'working' && !w.done) {
       transition(w, 'stop-notified', { stopNotified: true });

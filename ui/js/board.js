@@ -8,7 +8,8 @@ import { cardFacts, cornerHtml, orderHtml, WORKER_LABEL } from './cardview.js';
 import { labelChipHtml } from './labels.js';
 import { openDetail } from './detail.js';
 import { openLieutenantChat } from './chat.js';
-import { openCardPane } from './pane.js';
+import { openCardSession } from './pane.js';
+import { cardSessions } from './terminal.js';
 import { avatarGridHtml, wireAvatarGrid } from './avatars.js';
 import { selectionOn, isSelected, pick } from './selection.js';
 import { openCardMenu, moveCard, pluginBadgesHtml, activityChipHtml, tileActionsHtml } from './cardactions.js';
@@ -23,6 +24,8 @@ const boardEl = document.getElementById('board');
 // table row and the detail panel draw from, so the surfaces cannot drift.
 function tileHtml(c) {
   const f = cardFacts(c, S.doc, Date.now());
+  const session = cardSessions(c)[0];
+  const sessionTitle = 'open or resume session' + (session ? ' · ' + session.provider + ' · ' + session.host : '');
   const at = c.attributes || {};
   const repo = at.repo || '';
   const msgs = f.messageCount;
@@ -73,9 +76,9 @@ function tileHtml(c) {
     '<span class="grow"></span>' +
     (hasLink ? '<span class="t-ind" title="has link">📎</span>' : '') +
     (msgs ? '<span class="t-ind" title="' + msgs + ' messages">💬' + msgs + '</span>' : '') +
-    // Working tiles carry the worker's context bar and the 👁 peek (its terminal)
+    // The conversation stays reachable after its worker leaves Working.
     (f.inWorking ? ctxBarHtml(f.agentStatus) : '') +
-    (f.inWorking ? '<button class="t-peek" title="watch this worker\'s terminal live">👁</button>' : '') +
+    (f.inWorking || session ? '<button class="t-peek" title="' + esc(sessionTitle) + '">👁</button>' : '') +
     tileActionsHtml(c, S.doc) +
     agoSpanHtml(cardRecency(c), 't-ago') +
     '</div></div>';
@@ -137,7 +140,7 @@ function wire() {
       }
       const t = e.target;
       if (t.closest('a')) return; // PR chip / link: let the anchor navigate, don't open detail
-      if (t.closest('.t-peek')) { openCardPane(el.dataset.id); return; }
+      if (t.closest('.t-peek')) { openCardSession(el.dataset.id); return; }
       const cmd = t.closest('.t-cmd');
       if (cmd) { runCommand(cmd.dataset.cmd, el.dataset.id); return; }
       const act = t.closest('.t-activity');

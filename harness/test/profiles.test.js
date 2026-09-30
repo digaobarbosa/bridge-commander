@@ -21,6 +21,18 @@ const SECRET = 'sk-SECRET-7f3a9c';
 
 function tmpdir(prefix) { return fs.mkdtempSync(path.join(os.tmpdir(), prefix)); }
 
+test('ACP conversation providers survive profile resolution; derived tmux profiles inherit their base provider', () => {
+  const acp = { name: 'session-acp', adapter: 'acp', command: 'npx', sessionProvider: 'codex' };
+  assert.strictEqual(resolveProfile(acp, BASES).sessionProvider, 'codex');
+  assert.throws(() => resolveProfile({ ...acp, sessionProvider: 'unknown' }, BASES), /sessionProvider/);
+  assert.strictEqual(resolveProfile({ name: 'session-derived', extends: 'claude' }, BASES).sessionProvider, 'claude');
+  assert.throws(() => resolveProfile({ name: 'bad-derived', extends: 'claude', sessionProvider: 'codex' }, BASES), /for acp profiles/);
+  const manifests = require('../../plugins/acp-agents/plugin.json').contributes.profiles;
+  for (const json of manifests) {
+    assert.ok(['codex', 'claude'].includes(resolveProfile(json, BASES).sessionProvider));
+  }
+});
+
 // ---------- resolveProfile ----------
 
 test('extends: the JSON overlays data on its base, and the behaviour stays the base\'s', () => {
@@ -343,5 +355,6 @@ test('detectSelf and skillsDir: each profile answers for its own CLI only', () =
 test('listHarnesses carries a profile\'s by-hand resume prefix, and only when it has one', () => {
   const byName = Object.fromEntries(port.listHarnesses().map((h) => [h.name, h]));
   assert.strictEqual(byName.claude.handResume, 'claude --resume');
-  assert.ok(!('handResume' in byName.codex));
+  assert.strictEqual(byName.codex.handResume, 'codex resume');
+  assert.deepStrictEqual(byName.codex.appResume, { label: 'Codex', url: 'codex://threads/{id}' });
 });

@@ -127,11 +127,11 @@ test('a merged card whose worker kill FAILED still archives with the run\'s addr
     assert.ok(spawnId);
 
     // the relay moves the run onto a new transcript id AFTER the spawn — the
-    // record knows it, the card's own note still says the old one
+    // the record and the durable card address must both adopt it immediately
     const relayed = 'relay-uuid-after-the-spawn';
     const te = await s.api('POST', '/api/turn-end', { session: workerKey(wsDir, 'mergefail'), session_id: relayed });
     assert.strictEqual(te.status, 200, JSON.stringify(te.body));
-    assert.strictEqual((await s.api('GET', '/api/cards/mergefail')).body.attributes.resumeId, spawnId);
+    assert.strictEqual((await s.api('GET', '/api/cards/mergefail')).body.attributes.resumeId, relayed);
 
     gh.setState(PR, 'OPEN');
     await s.api('POST', '/api/cards/mergefail/worker/done', { outcome: 'PR open: ' + PR });

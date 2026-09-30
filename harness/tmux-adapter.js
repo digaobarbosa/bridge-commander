@@ -131,6 +131,9 @@ function tmuxAdapter(profile) {
     const launchLine = withEnv(profile.launch(ctx), stateDir, key);
     if (profile.prepare) await profile.prepare(cwdAbs, key, ctx);
 
+    // A reused pane name starts a new conversation, not the previous run's id.
+    fs.rmSync(path.join(stateDir, key + '.session-id'), { force: true });
+
     const briefFile = promptFile(stateDir, key);
     fs.writeFileSync(briefFile, prompt);
     // Recorded so resume() can replay them — a worker pinned to a model by its
@@ -268,6 +271,7 @@ function tmuxAdapter(profile) {
       installHint: profile.installHint || '',
       contextWindows: (profile.contextWindows || []).map((p) => p.slice()),
       handResume: profile.handResume || '',
+      ...(profile.appResume ? { appResume: { ...profile.appResume } } : {}),
     };
   }
 

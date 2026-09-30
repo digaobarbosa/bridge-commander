@@ -30,7 +30,7 @@ import { initTopbar, renderTopbar } from './topbar.js';
 import { configurePalette, togglePalette } from './palette.js';
 import { initSettingsTabs, syncSettingsTabs, isPluginTab, renderSettingsTab } from './settingstabs.js';
 import { push as toastPush } from './toast.js';
-import { closePane, paneOpen, openCardPane } from './pane.js';
+import { closePane, paneOpen, openCardPane, openCardSession } from './pane.js';
 import { openMonitor, closeMonitor, monitorOpen } from './monitor.js';
 import { closeLog, logOpen } from './logview.js';
 import { renderNotifications, onOpenCard as notifOnOpenCard } from './notify.js';
@@ -58,7 +58,7 @@ toastOnOpenLieutenant(openLieutenantChat); // card-less chat toast → the lieut
   const taskbar = document.getElementById('taskbar');
   configurePlugins({ host: document.getElementById('board-wrap'), before: taskbar, openCard: openDetail, openActivity, toast });
   configureCommands({ openActivity, toast });
-  configureCardActions({ openPane: openCardPane, talk: talkOnCard });
+  configureCardActions({ openPane: openCardPane, openSession: openCardSession, talk: talkOnCard });
   initActivities({ bar: taskbar, openCard: openDetail });
   initTopbar({ el: document.getElementById('topbar-cmds') });
   // the palette's context: the card the detail panel shows (not a schedule or a hook)

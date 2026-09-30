@@ -27,7 +27,7 @@ export const OPENERS = [
   // iTerm2's own URL scheme: it shows the command and asks before running it.
   { key: 'iterm2', label: 'iTerm2 (macOS)', link: (cmd) => ({ href: 'iterm2:/command?c=' + encodeURIComponent(cmd) }) },
   // Works anywhere: the command lands on the clipboard for any terminal.
-  { key: 'copy', label: 'copy tmux command', link: (cmd) => ({ copy: cmd }) },
+  { key: 'copy', label: 'copy terminal command', link: (cmd) => ({ copy: cmd }) },
 ];
 
 export function terminalMode(stored) {
@@ -101,3 +101,40 @@ export function cardTarget(c, worker, pickedWindow) {
   const s = c && c.attributes && c.attributes.session;
   return s ? { session: String(s), window: pickedWindow || null } : null;
 }
+
+/** Saved conversations outlive the worker and its stage. Current goes first. */
+export function cardSessions(c) {
+  const list = (c && Array.isArray(c.sessions) ? c.sessions : []).filter((s) =>
+    s && typeof s.provider === 'string' && s.provider && UUID_RE.test(String(s.id || '')));
+  return list.slice().sort((a, b) => Number(b.key === c.currentSession) - Number(a.key === c.currentSession));
+}
+
+/** Resolve navigation without treating a saved tmux address as a live process. */
+export function sessionNavigation(s, worker, mode, profile = {}) {
+  if (!s || !s.provider || !UUID_RE.test(String(s.id || ''))) return null;
+  const prefix = profile.cli || s.resumeCli;
+  const cmd = resumeCommand(prefix, s.cwd, s.id);
+  if (s.local !== true) return { cmd, reason: `This session belongs to ${s.host || 'another machine'}. Open it there; local launch is unavailable.`, remote: true };
+  const ref = worker && worker.ref;
+  const matching = s.origin === 'managed' && ref && ref.resumeId === s.id;
+  const live = matching && (worker.live === true || (worker.live === undefined &&
+    ((!worker.paused && !worker.flagged) || worker.expectExit)));
+  const attach = live && safeAttach(adapterIsTmux(profile) ? ref : null);
+  const appProfile = profile.app || s.resumeApp;
+  const app = s.surface === 'app' ? appResumeLink(appProfile, s.id) : null;
+  const reason = s.cwdAvailable === false
+    ? `The checkout is missing: ${s.cwd}. Restore this directory before continuing development.`
+    : s.cwdAvailable !== true ? `Checkout availability is unknown: ${s.cwd}. Refresh the board before resuming in a terminal.` : '';
+  // Desktop navigation can still restore the conversation when its checkout is gone.
+  if (app) return { href: app, cmd: reason || live || (matching && worker.live === null) ? null : cmd,
+    reason, live: !!live, label: appProfile.label || s.provider };
+  if (matching && worker.live === null) return {
+    cmd: null, live: null, reason: 'Cannot verify whether the managed session is still running. Try again before resuming in a terminal.',
+  };
+  if (attach) return { ...openerLink(mode, attach), cmd: attach, live: true, watch: true, reason: '' };
+  // ACP workers have no attach target. Watch the board's client while it runs.
+  if (live) return { live: true, watch: true, reason: '' };
+  if (reason) return { cmd: null, reason };
+  return { ...openerLink(mode, cmd), cmd, reason: '', live: false };
+}
+function adapterIsTmux(profile) { return profile.adapter !== 'acp'; }

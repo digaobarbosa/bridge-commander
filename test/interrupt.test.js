@@ -90,7 +90,7 @@ test('lieutenant interrupt: a wake makes it busy; the route reaches its ref; the
     await until('the wake marks the lieutenant busy',
       async () => (await board(s)).lieutenants.find((l) => l.id === LT).busy);
 
-    const cli = await runCli(['interrupt', 'lieutenant:' + LT, '--port', String(s.port)]);
+    const cli = await runCli(['interrupt', 'lieutenant:' + LT, '--workspace', s.dir, '--port', String(s.port)]);
     assert.strictEqual(cli.code, 0, cli.stderr);
     assert.match(cli.stdout, /interrupted -> lieutenant:/);
     assert.strictEqual(interrupts(fdir, 'bc-lt-int'), 1);

@@ -64,6 +64,9 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
+const { readSessionId } = require('../harness/util.js');
+const { createSessions, captureManaged, publicSessions } = require('./sessions.js');
 // The harness port — the ONLY seam the server speaks to agent sessions through
 // (docs/api/overview.md, "harness port"). Lazy builtins: requiring port.js
 // drags in no tmux/claude machinery until a ref is actually dispatched.
@@ -407,6 +410,7 @@ function normalizeBoard(doc) {
     if (!Array.isArray(c.thread)) c.thread = [];
     if (!Array.isArray(c.labels)) c.labels = [];
     if (!c.attributes || typeof c.attributes !== 'object') c.attributes = {};
+    if (c.sessions !== undefined && !Array.isArray(c.sessions)) c.sessions = [];
     if (!CARD_TYPES.includes(c.type)) c.type = 'implementation';
     // playbook: the id of a file in playbooks/, or '' — cards that predate it
     // have none and cannot start until one is set (card patch --playbook <id>).
@@ -422,6 +426,7 @@ function normalizeBoard(doc) {
       c.status = { worker: ok ? { id: String(w.id), state: w.state, expires: w.expires || null } : null };
     }
   }
+  for (const w of b.workers) captureWorkerSession(b.cards.find((c) => c.id === w.card), w);
   // seq must top every stored event (defensive after hand edits)
   let max = b.seq || 0;
   for (const e of b.events) if (e.seq > max) max = e.seq;
@@ -453,6 +458,31 @@ const store = createStore({
   log: (m) => console.error(now() + ' ' + m),
 });
 const board = store.load();
+const sessions = createSessions({ board: () => board, findCard, createCard, readArchive, now,
+  managedCard: (session) => {
+    if (session.host !== os.hostname()) return null;
+    const w = board.workers.find((w) => workerProvider(w.ref) === session.provider
+      && (w.ref.resumeId || readSessionId(HARNESS_STATE_DIR, keyOf(w.ref)) || '').toLowerCase() === session.id);
+    return w ? findCard(w.card) : null;
+  },
+  rememberManaged: (card) => captureWorkerSession(card, findWorker(card.id)),
+  event: (card, fields) => store.cardEvent(card, fields),
+});
+
+function workerProvider(ref) {
+  try {
+    const profile = port.profileOf(ref.harness);
+    return profile && profile.sessionProvider || null;
+  } catch {}
+  return null;
+}
+function captureWorkerSession(card, w) {
+  if (!w || !w.ref) return null;
+  const entry = captureManaged(card, w, { provider: workerProvider(w.ref),
+    id: w.ref.resumeId || readSessionId(HARNESS_STATE_DIR, keyOf(w.ref)), now: now() });
+  if (entry) w.ref.resumeId = entry.id;
+  return entry;
+}
 
 // One-time migration, at boot: the charter used to be a board field. Move what
 // is still there into the lieutenant's memory file and drop the key. The write
@@ -1168,6 +1198,7 @@ function cardActivity(card) {
 // the host per card.updated — absent when no plugin has anything to say.
 function publicCard(card, user) {
   const out = Object.assign({}, card, { status: cardStatus(card, user), activity: cardActivity(card) });
+  if (card.sessions) out.sessions = publicSessions(card);
   const ext = pluginHost ? pluginHost.decorations(card, board) : null;
   if (ext && Object.keys(ext).length) out.ext = ext;
   return out;
@@ -1981,6 +2012,7 @@ function checkPlaybook(raw) {
 function createCard(body, actorDefault) {
   const title = String(body.title || '').trim();
   if (!title) return { error: 'title required', code: 400 };
+  if (body.execution !== undefined && !['managed', 'external'].includes(body.execution)) return { error: 'execution must be managed or external', code: 400 };
   const owner = String(body.owner || '').trim();
   if (!owner) return { error: 'owner required (every card belongs to exactly one lieutenant)', code: 400 };
   const lt = findLieutenant(owner);
@@ -2023,6 +2055,7 @@ function createCard(body, actorDefault) {
     created: now(), updated: now(), threadStart: null, pendingOrder: null,
     events: [], thread: [],
   };
+  if (body.execution === 'external') card.execution = 'external';
   // Write-ahead first: a queue append that throws must leave no card behind.
   if (actor === 'user') queuePush(owner, { kind: 'card-created', card: id, text: card.title, column });
   store.cardEvent(card, { text: 'created in ' + columnTitle(column), actor }, { kind: 'created' });
@@ -2053,7 +2086,7 @@ function moveCard(card, body, actorDefault) {
   const from = card.column;
 
   if (actor === 'user') {
-    const order = column === 'working' ? 'start-order'
+    const order = card.execution === 'external' ? null : column === 'working' ? 'start-order'
       : from === 'review' && column === 'backlog' ? 'rework-order' : null;
     if (order) {
       const item = queuePush(card.owner, Object.assign(
@@ -2064,9 +2097,9 @@ function moveCard(card, body, actorDefault) {
         text: (order === 'start-order' ? 'start ordered' : 'rework ordered') + ' (' + columnTitle(from) + ' → ' + columnTitle(column) + ')' });
       return { ok: true, ordered: order, event: ev, seq: item.seq };
     }
-  } else if (column === 'working') {
+  } else if (column === 'working' && card.execution !== 'external') {
     return { error: 'only card.start moves a card into Working (it spawns the worker) — run: card start ' + card.id, code: 409 };
-  } else if (column !== 'review') {
+  } else if (column !== 'review' && card.execution !== 'external') {
     return { error: 'lieutenants move cards only to review (the handoff)', code: 400 };
   }
 
@@ -2085,6 +2118,9 @@ function moveCard(card, body, actorDefault) {
 }
 
 function patchCard(card, body) {
+  if (body.currentSession !== undefined && !(card.sessions || []).some((s) => s.key === body.currentSession)) {
+    return { error: 'currentSession must name one of this card\'s sessions', code: 400 };
+  }
   // Validate every field before applying any: a refused patch must leave nothing
   // in memory for the next unrelated save to persist.
   // Owner reassignment is allowed ONLY while no worker is bound to the card
@@ -2108,6 +2144,7 @@ function patchCard(card, body) {
     store.cardEvent(card, { actor: body.actor, text: 'owner: ' + prev + ' → ' + newOwner }, { kind: 'moved' });
   }
   if (pb) card.playbook = pb.playbook;
+  if (body.currentSession !== undefined) card.currentSession = body.currentSession;
   if (body.title !== undefined) card.title = String(body.title).slice(0, 200);
   if (body.body !== undefined) card.body = String(body.body);
   if (body.type !== undefined && CARD_TYPES.includes(body.type)) card.type = body.type;
@@ -2547,6 +2584,7 @@ const workers = createWorkers({
   save: store.commit,
   planStart, ownerSession, workerWindow: names.workerWindow,
   refreshStatus: refreshAgentStatus,
+  rememberSession: captureWorkerSession,
   permissionMode: () => configPermissionMode(),
   permissionPending: (cardId) => permissions.has((it) => it.card === cardId),
   log: (m) => console.error(now() + ' ' + m),
@@ -3094,7 +3132,8 @@ const server = http.createServer(async (req, res) => {
       const n = parseInt(url.searchParams.get('limit') || '50', 10) || 50;
       const off = parseInt(url.searchParams.get('offset') || '0', 10) || 0;
       const all = readArchive().reverse();
-      return sendJson(res, 200, { archive: all.slice(off, off + n), total: all.length });
+      return sendJson(res, 200, { archive: all.slice(off, off + n).map((r) => ({ ...r,
+        card: r.card && r.card.sessions ? { ...r.card, sessions: publicSessions(r.card) } : r.card })), total: all.length });
     }
     if (route === 'GET /api/notifications') {
       const items = notificationItems(url.searchParams.get('user'));
@@ -3290,7 +3329,7 @@ const server = http.createServer(async (req, res) => {
       if (w) {
         const r = await workers.turnEnd(w, { sid, text: body.text });
         store.save();
-        if (r.stopped || r.statusChanged) broadcast();
+        if (r.stopped || r.statusChanged || sid) broadcast();
         return sendJson(res, 200, { ok: true, lieutenant: null, worker: w.card });
       }
       if (!lt) return sendJson(res, 200, { ok: true, lieutenant: null });
@@ -3344,6 +3383,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ----- cards -----
+    if (route === 'POST /api/sessions/sync') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const r = store.mutate(() => sessions.sync(body));
+      return respond(res, r, () => ({ ok: true, card: publicCard(r.card, 'user'),
+        session: publicSessions(r.card).find((s) => s.key === r.session.key) }));
+    }
     if (route === 'POST /api/cards') {
       const body = JSON.parse(await readBody(req) || '{}');
       const r = store.mutate(() => createCard(body));
@@ -3358,11 +3403,18 @@ const server = http.createServer(async (req, res) => {
       const r = store.mutate(() => restoreCard(decodeURIComponent(restoreRoute[1]), body));
       return respond(res, r, () => ({ ok: true, card: publicCard(r.card, 'user'), event: r.event }));
     }
-    const cardRoute = /^\/api\/cards\/([^/]+)(\/(move|events|archive|status|start|park|artifacts|worker\/signal|worker\/done|worker\/send|worker\/pause))?$/.exec(p);
+    const cardRoute = /^\/api\/cards\/([^/]+)(\/(move|events|archive|status|start|park|artifacts|sessions|worker\/signal|worker\/done|worker\/send|worker\/pause))?$/.exec(p);
     if (cardRoute) {
       const card = findCard(decodeURIComponent(cardRoute[1]));
       if (!card) return sendJson(res, 404, { error: 'unknown card: ' + decodeURIComponent(cardRoute[1]) });
       const sub = cardRoute[3];
+      if (sub === 'sessions' && req.method === 'GET') {
+        const w = findWorker(card.id);
+        let live = null;
+        if (w) { try { live = !!(await harnessFor(w.ref).alive(w.ref)); } catch {} }
+        return sendJson(res, 200, { sessions: publicSessions(card), currentSession: card.currentSession,
+          worker: w ? { ...w, live } : null });
+      }
       if (sub === 'start' && req.method === 'POST') { // card.start — the ONE atomic op into Working
         const body = JSON.parse(await readBody(req) || '{}');
         const from = card.column;

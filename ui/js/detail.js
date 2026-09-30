@@ -1,6 +1,6 @@
 // card detail: attributes header + markdown body + event timeline (chat lives in the chat panel)
 import { S, card, lieutenants, lieutenantColor, cardActivityTs, cardRecency, kindEmoji, render, toggleFilter, filterSelected } from './state.js';
-import { cardFacts, orderHtml, archiveReasonHtml } from './cardview.js';
+import { cardFacts, orderHtml, archiveReasonHtml, sessionCheckpointHtml } from './cardview.js';
 import { esc, hhmm, agoSpanHtml, cardEmoji, cardPrs, prChipHtml, cardArtifacts, artifactsHtml, cardStripHtml, uriBasename, uriDir, setHtmlIfChanged, playbookAttrHtml, classifyFile, attachmentKind } from './util.js';
 import { md, mdEnhance, copyText } from './md.js';
 import { api } from './api.js';
@@ -14,6 +14,8 @@ import { renderPluginSection } from './plugins.js';
 import { cardContext } from './cardview.js';
 import { archivedCard, unarchive } from './archive.js';
 import { openPopover } from './popover.js';
+import { openCardSession } from './pane.js';
+import { cardSessions } from './terminal.js';
 
 const isDesktop = () => window.innerWidth > 760; // matches the chat.js layout breakpoint
 
@@ -859,6 +861,11 @@ export function renderDetail() {
   // action is unarchive (restoring keeps the panel open — it becomes the live card)
   document.getElementById('dt-talk').hidden = !!arch;
   document.getElementById('dt-menu-btn').hidden = !!arch;
+  const sessionBtn = document.getElementById('dt-session');
+  const session = cardSessions(c)[0];
+  sessionBtn.hidden = !session && (!!arch || c.column !== 'working');
+  sessionBtn.title = 'open or resume session' + (session ? ' · ' + session.provider + ' · ' + session.host : '');
+  sessionBtn.onclick = () => openCardSession(c.id);
   const unBtn = document.getElementById('dt-unarch');
   unBtn.hidden = !arch;
   if (arch) unBtn.onclick = () => unarchive(c.id, unBtn);
@@ -964,6 +971,10 @@ export function renderDetail() {
   // unconditionally: it is per-node guarded, so an unchanged body is a no-op,
   // and enhanced DOM (copy buttons, diagrams) never changes the cached html
   // string setHtmlIfChanged compares against.
+  const checkpointEl = document.getElementById('dt-checkpoint');
+  const checkpoint = sessionCheckpointHtml(c);
+  checkpointEl.hidden = !checkpoint;
+  setHtmlIfChanged(checkpointEl, checkpoint);
   if (!editingBody) {
     setHtmlIfChanged(bodyEl, md(c.body || ''));
     mdEnhance(bodyEl);

@@ -32,7 +32,7 @@ Already on the branch:
 - `harness/profiles.js`
   - `resolveProfile(json, bases) → profile`.
     - `bases` is a `name → base profile object` lookup.
-    - The JSON may carry: `name`, `extends`, `adapter` (`'tmux'`, the default, or `'acp'`), `env`, `contextWindows`, `requirements`, `installHint`, and for acp only `command`, `args`.
+    - The JSON may carry: `name`, `extends`, `adapter` (`'tmux'`, the default, or `'acp'`), `env`, `contextWindows`, `requirements`, `installHint`, and for acp only `command`, `args`, `sessionProvider` (`claude` or `codex`, for durable conversation links). Tmux profiles inherit the provider from their base.
     - An `env` value is either exactly `${NAME}` (a reference) or a literal with no `${`. A key whose name ends in `KEY`, `TOKEN`, `SECRET` or `PASSWORD` must be a reference. Anything else throws.
     - An unknown `extends` throws.
   - `loadProfiles({ profiles, stateDir, log }) → [{name, plugin, ok, error?}]`.

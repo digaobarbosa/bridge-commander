@@ -14,12 +14,13 @@ import { card, lieutenant, workerFor } from './state.js';
 import { api } from './api.js';
 import { ansiToHtml } from './ansi.js';
 import { keyForEvent } from './panekeys.js';
-import { terminalLink, openerLink, safeAttach, refResume, appResumeLink, cardTarget, lieutenantTarget } from './terminal.js';
+import { terminalLink, openerLink, safeAttach, refResume, appResumeLink, cardTarget, lieutenantTarget, cardSessions, sessionNavigation } from './terminal.js';
 import { openPopover, closePopover } from './popover.js';
 import { handResumeOf, appResumeOf, adapterOf } from './plugins.js';
 import { getTerminalMode, onTerminalMode } from './terminalsettings.js';
 import { push as toast } from './toast.js';
 import { keepStream } from './streamkeeper.js';
+import { archivedCard } from './archive.js';
 
 const overlay = document.getElementById('pane-overlay');
 const titleEl = document.getElementById('pane-title');
@@ -29,6 +30,7 @@ const msgEl = document.getElementById('pane-msg');
 const hintEl = document.getElementById('pane-hint');
 const termEl = document.getElementById('pane-term');
 const copyEl = document.getElementById('pane-copy');
+const sessionsEl = document.getElementById('pane-sessions');
 let es = null;
 let keeper = null;               // reopens es while the drawer is open
 // The server pings pane streams every 5s; longer silence means a dead stream.
@@ -204,6 +206,7 @@ preEl.addEventListener('paste', (e) => {
 
 function open(url, title, inputAt) {
   stop();
+  sessionsEl.hidden = true;
   inputUrl = inputAt;
   titleEl.textContent = title;
   preEl.hidden = false;
@@ -302,6 +305,96 @@ export function openCardPane(cardId, window_) {
   drawTerm();
   drawCopy();
 }
+
+function navigation(s, worker) {
+  const matching = worker && worker.ref && worker.ref.resumeId === s.id;
+  const harness = (matching && worker.ref.harness) || s.harness;
+  return sessionNavigation(s, worker, getTerminalMode(), harness ? {
+    cli: handResumeOf(harness), app: appResumeOf(harness), adapter: adapterOf(harness),
+  } : {});
+}
+function launchSession(nav, cardId) {
+  if (nav.href) { closePane(); window.location.href = nav.href; }
+  else if (nav.copy) copy(nav.copy);
+  else if (nav.watch) openCardPane(cardId);
+}
+
+/** The eye opens the conversation; the separate watch action keeps the live pane. */
+export async function openCardSession(cardId) {
+  const liveCard = card(cardId);
+  let c = liveCard || (archivedCard(cardId) || {}).c;
+  if (!c) return;
+  let sessions = cardSessions(c);
+  if (!sessions.length) { openCardPane(cardId); return; }
+  let worker = liveCard && workerFor(cardId);
+  // Turn completion is not process death. Probe before offering another CLI client.
+  if (worker && sessions.some((s) => s.origin === 'managed' && s.surface !== 'app' && s.id === (worker.ref || {}).resumeId)) {
+    try {
+      const status = await api.sessionStatus(cardId);
+      c = { ...c, sessions: status.sessions, currentSession: status.currentSession };
+      sessions = cardSessions(c);
+      worker = status.worker;
+      if (!sessions.length) return;
+    } catch (e) {
+      worker = { ...worker, live: null };
+    }
+  }
+  const nav = navigation(sessions[0], worker);
+  if (sessions.length === 1 && nav && !nav.reason && (nav.href || nav.copy || nav.watch)) {
+    launchSession(nav, cardId);
+    return;
+  }
+  showSession(c, sessions, sessions[0], worker, !!liveCard);
+}
+
+function showSession(c, sessions, selected, worker, editable) {
+  stop();
+  inputUrl = null;
+  setAgent(null, null);
+  preEl.blur();
+  overlay.hidden = false;
+  preEl.hidden = true;
+  setLive(false);
+  setHint();
+  titleEl.textContent = c.title || c.id;
+  drawTerm();
+  drawCopy();
+  drawTabs(sessions.map((s) => s.key), selected.key, (key) =>
+    showSession(c, sessions, sessions.find((s) => s.key === key), worker, editable));
+  // Full ids and hostnames distinguish sessions with the same provider.
+  [...tabsEl.children].forEach((b, i) => {
+    const s = sessions[i];
+    b.textContent = (s.key === c.currentSession ? '● ' : '') + s.provider + ' · ' + s.id.slice(0, 8);
+    b.title = s.id + ' · ' + s.host;
+  });
+  const nav = navigation(selected, worker);
+  msgEl.hidden = false;
+  msgEl.textContent = `${selected.provider} · ${selected.surface} · ${selected.host}\n${selected.id}\n${selected.cwd}` +
+    (nav && nav.reason ? '\n\n' + nav.reason : '');
+  sessionsEl.textContent = '';
+  sessionsEl.hidden = false;
+  function button(label, run) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'pane-tab';
+    b.textContent = label;
+    b.onclick = run;
+    sessionsEl.appendChild(b);
+  }
+  if (nav) {
+    if (nav.href || nav.watch || nav.copy) button(nav.href ? nav.watch ? 'Attach live terminal' : 'Open in ' + (nav.label || 'terminal')
+      : nav.copy ? nav.watch ? 'Copy attach command' : 'Copy resume command' : 'Watch live session', () => launchSession(nav, c.id));
+    if (nav.cmd && !nav.watch && !nav.copy) button(nav.remote ? 'Copy command for ' + selected.host : 'Copy resume command', () => copy(nav.cmd));
+    if (nav.live && nav.href) button('Watch live session', () => openCardPane(c.id));
+  }
+  if (editable && selected.key !== c.currentSession) button('Make current session', async () => {
+    try {
+      await api.patchCard(c.id, { currentSession: selected.key });
+      c = { ...c, currentSession: selected.key };
+      showSession(c, cardSessions(c), selected, worker, editable);
+    } catch (e) { toast({ emoji: '⚠', text: e.message }); }
+  });
+}
 export function openLieutenantPane(id) {
   const l = lieutenant(id);
   const base = '/api/lieutenants/' + encodeURIComponent(id) + '/pane/';
@@ -315,6 +408,7 @@ export function closePane() {
   stop();
   inputUrl = null;
   drawTabs([], null, () => {});
+  sessionsEl.hidden = true;
   setAgent(null, null);
   preEl.blur();
   overlay.hidden = true;

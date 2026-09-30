@@ -112,6 +112,9 @@ const INSTALL_HINT = '  npm i -g @openai/codex          # a user-local npm prefi
 
 const profile = {
   name: 'codex',
+  sessionProvider: 'codex',
+  handResume: 'codex resume',
+  appResume: { label: 'Codex', url: 'codex://threads/{id}' },
   settle: SETTLE,
   idAtBirth: () => undefined, // codex assigns the thread-id; the first notify delivers it
   // No prepare: the relay rides the launch line, so opts.installHooks has

@@ -53,6 +53,16 @@ test('permissionMode is ignored: codex keeps its bypass flags in every mode', as
   }
 });
 
+test('fresh spawn under a reused pane key cannot inherit the previous conversation identity', async () => {
+  await launchLines(async (cwd, stateDir) => {
+    const identityFile = path.join(stateDir, 'bc-rework:w-1.session-id');
+    fs.writeFileSync(identityFile, '019f49a7-81f4-7ad3-822d-3acf8cf81ed6');
+    const ref = await codex.spawn(cwd, 'new task', { session: 'bc-rework', window: 'w-1', stateDir });
+    assert.strictEqual(fs.existsSync(identityFile), false);
+    assert.strictEqual(await codex.resumable(ref, { stateDir }), false);
+  });
+});
+
 test('resume line: `codex resume <thread-id>` with a known id, a bare codex without one', async () => {
   const { lines } = await launchLines(async (cwd, stateDir) => {
     await codex.resume({ harness: 'codex', session: 'bc-cr', cwd, resumeId: 'thread-9' }, { stateDir });

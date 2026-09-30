@@ -93,6 +93,23 @@ the board, including starting workers (running code):
   kept alongside. The mesh is your only auth boundary.
 - **Never bind `0.0.0.0`.**
 
+## Session companion
+
+The `bridge-sync` skill links an existing Codex or Claude conversation to a card and updates a
+recent checkpoint through the board API. The eye opens that conversation in every stage,
+including archived cards; multiple linked conversations have a picker and a current selection.
+Commander-managed workers save the same links automatically. External companion cards follow
+their development stage without spawning a worker. CLI sessions use the terminal setting or
+offer a copyable exact resume command; Codex desktop sessions open in Codex. Claude defaults
+to CLI unless its harness profile supplies a verified app link. Use launch links on the session's
+machine; opening an old conversation does not recreate a released checkout.
+
+Install the skill folder in `~/.claude/skills/bridge-sync` and symlink it from
+`~/.codex/skills/bridge-sync` to keep Claude as the canonical source. Invoke `/bridge-sync` in
+Claude or `$bridge-sync` in Codex. Its helper uses a separate lightweight model (`haiku` or
+`gpt-6-luna`, configurable), leaving the development model unchanged. See
+[the skill](skills/bridge-sync/SKILL.md) for board discovery and direct API input.
+
 ## Plugins
 
 A plugin is a folder with a `plugin.json`: shipped ones in `plugins/<id>/`, a workspace's own in

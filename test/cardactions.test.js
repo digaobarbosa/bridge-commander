@@ -63,14 +63,18 @@ test('a move that is an order asks for a comment; any other move does not', asyn
   assert.deepStrictEqual(asked, ['Comment for the start order (optional):']);
 });
 
-test('built-ins: 👁 peek only on Working, archive refused while a worker lives', async () => {
+test('built-ins: session navigation survives stages, watch stays Working-only, archive refuses live workers', async () => {
   const { A, card } = await setup();
   const ids = (id) => A.cardMenuModel(card(id)).actions.map((a) => a.id);
   assert.deepStrictEqual(ids('B'), ['card.talk', 'card.select', 'card.archive']);
-  assert.deepStrictEqual(ids('W'), ['card.peek', 'card.talk', 'card.select', 'card.archive']);
+  assert.deepStrictEqual(ids('W'), ['card.peek', 'card.watch', 'card.talk', 'card.select', 'card.archive']);
+  card('R').sessions = [{ key: 'codex:one', provider: 'codex', id: '0f8e2c1a-3b4d-4e5f-8a9b-0c1d2e3f4a5b' }];
+  assert.deepStrictEqual(ids('R'), ['card.peek', 'card.talk', 'card.select', 'card.archive']);
   const arch = (id) => A.cardMenuModel(card(id)).actions.find((a) => a.id === 'card.archive');
   assert.strictEqual(arch('W').refused, 'live worker on bc/w');
   assert.strictEqual(arch('B').refused, '');
+  card('W').execution = 'external';
+  assert.ok(!ids('W').includes('card.watch'), 'externally managed sessions do not offer an unavailable board terminal');
 });
 
 test('a refused built-in is an inert menu item that says why — never a red button', async () => {

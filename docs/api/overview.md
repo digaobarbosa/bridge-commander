@@ -33,7 +33,7 @@ One board per **workspace** (the directory where the skill was initialized; hold
 📋 Backlog → 🔨 Working → 👀 Your review → 🤝 Peer review
 
 No Done: cards leave by archive (merge = `merged`; dismissal = `killed`).
-Working means the task is unfinished and SHOULD have a live worker on it; the doors in are
+For managed cards, Working means the task is unfinished and SHOULD have a live worker on it; the doors in are
 `card.start`, which spawns that worker atomically, and `worker.send` reopening a done-but-alive
 worker for a new turn — that second door is open only WHILE the card is still in Working, since
 the handoff out of it ends the worker, with the one exception the handoff itself makes: a
@@ -41,6 +41,27 @@ the handoff out of it ends the worker, with the one exception the handoff itself
 and its cards carry that color stripe.
 
 ## Entities
+
+Cards with `execution: external` track conversations started outside the harness. Their stages
+can move without spawning a worker; moving or archiving them never ends the session or releases
+its checkout. Managed cards retain their existing worker lifecycle. Both keep a durable history
+of conversation links, with one selected current session, independent of the worker registry.
+
+The eye opens that conversation in its original app or offers an exact CLI resume command.
+A live managed CLI worker is attached to rather than resumed in a second process. Links remain
+available in every column and archived snapshots. A missing checkout is reported explicitly;
+opening a conversation does not recreate its worktree. Launch links operate on the browser's
+machine, so use them on the session's machine.
+
+`POST /api/sessions/sync` accepts `{card?, owner?, title?, session: {provider, id, cwd, host,
+surface}, summary?, stage?, nextAction?, blocker?}`. Identity is the hostname, provider and exact
+conversation UUID. Repeated syncs reuse an active card; an archived match requires restoration
+or an explicit active target. New companion cards require an existing owner and a title.
+Stage is `planning`, `implementation`, `review` or `peer`; it moves external cards only.
+`GET /api/cards/:id/sessions` returns saved links, the current key and the worker's freshly
+probed liveness (`true`, `false` or `null` when the harness cannot tell). A failed probe does not
+authorize starting a second process. `PATCH /api/cards/:id` selects `currentSession` only from
+that card's saved links.
 
 | Entity | Description |
 |---|---|

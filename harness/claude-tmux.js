@@ -328,6 +328,7 @@ async function beforeInterrupt(target, t) {
 
 const profile = {
   name: 'claude',
+  sessionProvider: 'claude',
   beforeInterrupt,
   settle: SETTLE,
   // `--session-id <uuid>` makes the resume id known at birth (verified 2.1.202).

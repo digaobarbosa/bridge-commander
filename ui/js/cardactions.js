@@ -26,11 +26,13 @@ import { enterSelection } from './selection.js';
 import { openPopover } from './popover.js';
 import { runCommand, isBusy } from './commandui.js';
 import { esc } from './util.js';
+import { cardSessions } from './terminal.js';
 
 export const TILE_ACTIONS_MAX = 2;
 
 const deps = {
   openPane() {},
+  openSession() {},
   talk() {},
   prompt: (msg) => (globalThis.prompt ? globalThis.prompt(msg, '') : ''),
   alert: (msg) => { if (globalThis.alert) globalThis.alert(msg); },
@@ -73,9 +75,10 @@ async function archive(c) {
 }
 
 export const BUILTIN_ACTIONS = [
-  { id: 'card.peek', title: 'watch the terminal', icon: '👁', group: 'card', rank: 100,
-    // Working cards have a worker's terminal to watch
-    when: { 'card.column': 'working' }, run: (c) => deps.openPane(c.id) },
+  { id: 'card.peek', title: 'open or resume session', icon: '👁', group: 'card', rank: 100,
+    visible: (c) => c.column === 'working' || cardSessions(c).length > 0, run: (c) => deps.openSession(c.id) },
+  { id: 'card.watch', title: 'watch the live terminal', icon: '▣', group: 'card', rank: 110,
+    when: { 'card.column': 'working' }, visible: (c) => c.execution !== 'external', run: (c) => deps.openPane(c.id) },
   { id: 'card.talk', title: 'talk in its thread', icon: '💬', group: 'card', rank: 200, run: (c) => deps.talk(c.id) },
   // The way INTO selection mode, on the board and the table alike — nothing has
   // to sit on screen the rest of the time for it to be reachable.
@@ -100,7 +103,7 @@ export function cardMenuModel(c, doc = S.doc, nowMs = Date.now()) {
     current: col.id === c.column, run: () => moveCard(c.id, col.id),
   }));
   const actions = BUILTIN_ACTIONS
-    .filter((a) => !isDisabled(a.key) && matches(a.when, ctx))
+    .filter((a) => !isDisabled(a.key) && matches(a.when, ctx) && (!a.visible || a.visible(c)))
     .map((a) => {
       const v = a.predicate ? a.predicate(c, f) : { ok: true };
       return { id: a.id, key: a.key, title: a.title, icon: a.icon, danger: !!a.danger,

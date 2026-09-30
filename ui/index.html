@@ -339,6 +339,7 @@
       <div class="dt-sub" id="dt-sub"></div>
     </div>
     <button id="dt-talk" title="talk in this card's thread">💬 talk</button>
+    <button id="dt-session" title="open or resume session" hidden>👁</button>
     <button id="dt-menu-btn" title="move / archive">⋯</button>
     <!-- archived snapshots only: the one action a frozen card offers -->
     <button id="dt-unarch" class="tv-unarch" hidden>🧟 unarchive</button>
@@ -365,6 +366,7 @@
       <div class="dt-events" id="dt-events"></div>
     </div>
     <div class="dt-artifacts" id="dt-artifacts"></div>
+    <section class="dt-checkpoint" id="dt-checkpoint" aria-label="Session checkpoint" hidden></section>
     <div class="dt-body md" id="dt-body"></div>
     <button id="dt-body-edit" type="button" title="edit description">✎ edit</button>
     <div id="dt-body-editor" hidden>
@@ -483,6 +485,7 @@
          the pane (including Escape, which is why the head carries the way out) -->
     <pre id="pane-body" tabindex="0"></pre>
     <div id="pane-msg" hidden></div>
+    <div class="pane-tabs" id="pane-sessions" hidden></div>
   </div>
 </div>
 

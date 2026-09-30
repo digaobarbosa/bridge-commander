@@ -212,3 +212,28 @@ test('a frozen snapshot: archive reason, and nothing live or editable', async ()
   assert.match(archiveReasonHtml(k), /🪦 killed/);
   assert.strictEqual(archiveReasonHtml(cardFacts(cardOf(), docOf(), NOW)), '', 'a live card has no reason');
 });
+
+test('session checkpoint shows stage, summary, next action and blocker as escaped text', async () => {
+  const { sessionCheckpointHtml } = await cv;
+  const c = cardOf({ sessionCheckpoint: { stage: 'review', summary: 'Fixed <worker> & session routing',
+    nextAction: 'Run the "resume" check', blocker: '<script>wait for checkout</script>' } });
+  const html = sessionCheckpointHtml(c);
+  assert.match(html, /Session checkpoint<span>review<\/span>/);
+  assert.match(html, /Fixed &lt;worker&gt; &amp; session routing/);
+  assert.match(html, /<dt>Next action<\/dt><dd>Run the &quot;resume&quot; check<\/dd>/);
+  assert.match(html, /Blocker<\/dt><dd class="checkpoint-blocker">&lt;script&gt;wait for checkout&lt;\/script&gt;/);
+  assert.ok(!html.includes('<script>'));
+  const frozen = JSON.parse(JSON.stringify(c));
+  assert.strictEqual(sessionCheckpointHtml(frozen), html, 'archived card renders the same saved checkpoint');
+});
+
+test('empty checkpoints disappear and a cleared blocker leaves no stale blocker row', async () => {
+  const { sessionCheckpointHtml } = await cv;
+  for (const sessionCheckpoint of [undefined, null, {}, { summary: '  ', blocker: '' }, { summary: {} }]) {
+    assert.strictEqual(sessionCheckpointHtml(cardOf({ sessionCheckpoint })), '');
+  }
+  const html = sessionCheckpointHtml(cardOf({ sessionCheckpoint: { summary: 'Ready to continue', nextAction: 'Review', blocker: '' } }));
+  assert.match(html, /Ready to continue/);
+  assert.match(html, /Next action/);
+  assert.ok(!html.includes('Blocker'));
+});

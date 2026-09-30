@@ -54,6 +54,7 @@ export const api = {
     j('POST', '/api/cards/' + encodeURIComponent(id) + '/move',
       Object.assign({ column, actor: 'user' }, text ? { text } : {}))),
   patchCard: (id, patch) => j('PATCH', '/api/cards/' + encodeURIComponent(id), patch),
+  sessionStatus: (id) => j('GET', '/api/cards/' + encodeURIComponent(id) + '/sessions', undefined, 5000),
   archiveCard: (id, reason) => j('POST', '/api/cards/' + encodeURIComponent(id) + '/archive', { actor: 'user', reason }),
   feedback: (target, text, attachments) => j('POST', '/api/feedback',
     Object.assign({ target, text }, attachments && attachments.length ? { attachments } : {})),

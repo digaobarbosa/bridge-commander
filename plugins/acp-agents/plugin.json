@@ -5,11 +5,13 @@
   "contributes": {
     "profiles": [
       { "name": "claude-acp", "adapter": "acp", "command": "npx",
+        "sessionProvider": "claude",
         "args": ["-y", "@agentclientprotocol/claude-agent-acp@0.79.0"], "options": ["model", "effort"],
         "handResume": "claude --resume",
         "appResume": { "label": "Claude desktop", "url": "claude://resume?session={id}" },
         "installHint": "needs node (npx) and a Claude Code login: run `claude` once" },
       { "name": "codex-acp", "adapter": "acp", "command": "npx",
+        "sessionProvider": "codex",
         "args": ["-y", "@agentclientprotocol/codex-acp@1.12.0"], "options": ["model", "effort"],
         "handResume": "codex resume",
         "appResume": { "label": "Codex app", "url": "codex://threads/{id}" },

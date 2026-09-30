@@ -6,6 +6,14 @@ delivery to a lieutenant is a durable, at-least-once queue item. The conceptual 
 a disagreement between it and the code is a bug in one of them — change deliberately, never let
 them drift.
 
+Conversation links are persisted separately from worker records in `card.sessions`, with
+`card.currentSession` selecting the current one. `server/sessions.js` validates identity and
+owns checkpoint sync; the worker's stamp callback captures its conversation before teardown
+and at turn-end. External companion cards have `execution: external`: their stage is mirrored
+without harness lifecycle effects. The eye's navigation probes managed worker liveness on
+demand and uses the saved link after the record is dropped. `skills/bridge-sync` uses a small
+one-shot CLI model for checkpoint text and a deterministic HTTP helper for writes.
+
 ```
         captain (browser UI)                    agents (tmux sessions)
               │  clicks/drags = orders                ▲      ▲

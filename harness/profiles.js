@@ -13,6 +13,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const port = require('./port.js');
+const { SESSION_PROVIDERS } = require('./session-links.js');
 
 const NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const REF_RE = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
@@ -21,7 +22,7 @@ const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 // secrets.env, never from a manifest that may be committed.
 const SECRET_KEY_RE = /(KEY|TOKEN|SECRET|PASSWORD)$/i;
 const JSON_FIELDS = new Set(['name', 'extends', 'adapter', 'env', 'contextWindows', 'requirements',
-  'installHint', 'command', 'args', 'options', 'handResume', 'appResume',
+  'installHint', 'command', 'args', 'options', 'handResume', 'appResume', 'sessionProvider',
   // bookkeeping that manifests.js and contributions() add
   'plugin', 'key', 'rank', 'builtin', 'when', 'description']);
 const SECRETS_FILE = 'secrets.env';
@@ -89,6 +90,9 @@ function resolveProfile(json, bases) {
   const windows = windowPairs(json.contextWindows, where);
   const requirements = validateRequirements(json.requirements, where);
   if (json.installHint !== undefined && typeof json.installHint !== 'string') fail(where + ': installHint must be a string');
+  if (json.sessionProvider !== undefined && !SESSION_PROVIDERS.includes(json.sessionProvider)) {
+    fail(where + ': sessionProvider must be ' + SESSION_PROVIDERS.join(' or '));
+  }
 
   if (adapter === 'acp') {
     if (typeof json.command !== 'string' || !json.command) fail(where + ': an acp profile needs a command');
@@ -114,12 +118,13 @@ function resolveProfile(json, bases) {
       name, adapter, command: json.command, args: (json.args || []).slice(), env,
       contextWindows: windows, requirements, installHint: json.installHint || '',
       ...(json.options ? { options: json.options.slice() } : {}),
+      ...(json.sessionProvider ? { sessionProvider: json.sessionProvider } : {}),
       ...(json.handResume ? { handResume: json.handResume } : {}),
       ...(json.appResume ? { appResume: { label: json.appResume.label, url: json.appResume.url } } : {}),
     };
   }
 
-  for (const k of ['options', 'handResume', 'appResume']) {
+  for (const k of ['options', 'handResume', 'appResume', 'sessionProvider']) {
     if (json[k] !== undefined) fail(where + ': ' + k + ' is for acp profiles; a tmux profile takes its base\'s');
   }
   if (typeof json.extends !== 'string' || !json.extends) fail(where + ': a tmux profile needs "extends" (a base like claude)');

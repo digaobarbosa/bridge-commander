@@ -133,6 +133,22 @@ function archiveVerdict(frozen, rec, leaseBoundState) {
 
 // ---------- presenters: the markup every surface shares ----------
 
+/** The saved checkpoint is plain text, including frozen archive snapshots. */
+export function sessionCheckpointHtml(card) {
+  const checkpoint = card && card.sessionCheckpoint;
+  if (!checkpoint || typeof checkpoint !== 'object') return '';
+  const value = (field) => typeof checkpoint[field] === 'string' ? checkpoint[field].trim() : '';
+  const summary = value('summary'), stage = value('stage');
+  const nextAction = value('nextAction'), blocker = value('blocker');
+  if (!summary && !stage && !nextAction && !blocker) return '';
+  return '<h3>Session checkpoint' + (stage ? '<span>' + esc(stage) + '</span>' : '') + '</h3>' +
+    (summary ? '<p>' + esc(summary) + '</p>' : '') +
+    (nextAction || blocker ? '<dl>' +
+      (nextAction ? '<dt>Next action</dt><dd>' + esc(nextAction) + '</dd>' : '') +
+      (blocker ? '<dt class="checkpoint-blocker">Blocker</dt><dd class="checkpoint-blocker">' + esc(blocker) + '</dd>' : '') +
+      '</dl>' : '');
+}
+
 const CARD_OWED_TITLES = {
   stale: 'no response yet — the lieutenant may be stuck',
   queued: 'delivered — the lieutenant hasn\'t picked it up yet',
