@@ -1,0 +1,18 @@
+{
+  "id": "deepseek",
+  "name": "DeepSeek (over Claude Code)",
+  "description": "A derived profile: claude's TUI pointed at DeepSeek's Anthropic-compatible API. Needs DEEPSEEK_API_KEY in the server environment or .bridge-commander/secrets.env.",
+  "enabled": false,
+  "contributes": {
+    "profiles": [{
+      "name": "deepseek",
+      "extends": "claude",
+      "env": {
+        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+        "ANTHROPIC_AUTH_TOKEN": "${DEEPSEEK_API_KEY}",
+        "ANTHROPIC_MODEL": "deepseek-chat"
+      },
+      "contextWindows": { "deepseek": 128000 }
+    }]
+  }
+}

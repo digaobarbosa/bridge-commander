@@ -36,7 +36,8 @@ export function setHtmlIfChanged(el, html) {
   return true;
 }
 export function hhmm(iso) {
-  try { return new Date(iso).toTimeString().slice(0, 5); } catch (e) { return ''; }
+  const d = new Date(iso);
+  return Number.isFinite(d.getTime()) ? d.toTimeString().slice(0, 5) : '';
 }
 export function dayLabel(iso) {
   const d = new Date(iso), today = new Date();
@@ -205,6 +206,27 @@ export function fmtTokens(n) {
 // harness port's status(), refreshed at turn-end). Green → yellow (≥60%) →
 // red (≥80% — auto-compact territory). No/partial status → no bar (graceful
 // absence, like avatars).
+// What a lieutenant runs on: the pinned model/effort when set (the next launch
+// uses them), else the live status. The live status is the last SUCCESSFUL
+// turn, so it lags a repin and hides failing turns; `last` names a mismatch.
+export function runsOn(l) {
+  const st = (l && l.agentStatus) || {};
+  const differs = (l.model && st.model && st.model !== l.model)
+    || (l.effort && st.effort && st.effort !== l.effort);
+  return {
+    model: l.model || st.model || '',
+    effort: l.effort || st.effort || '',
+    last: differs ? [st.model, st.effort && '(' + st.effort + ')'].filter(Boolean).join(' ') : '',
+  };
+}
+// `compact` is for the chat header, where the full hint clips: a ⚠ that
+// carries it in its tooltip. The switcher gives the full hint its own line.
+export function lastTurnHtml(cls, last, compact) {
+  if (!last) return '';
+  const title = 'last turn: ' + last + ' — the live status comes from the last successful turn, and it disagrees with the pinned setting';
+  return ' <span class="' + cls + '" title="' + esc(title) + '">' + (compact ? '⚠' : 'last turn: ' + esc(last)) + '</span>';
+}
+
 export function ctxBarHtml(st) {
   if (!st || !(st.contextUsed > 0) || !(st.contextWindow > 0)) return '';
   const pct = Math.min(100, Math.round((st.contextUsed / st.contextWindow) * 100));
@@ -218,11 +240,18 @@ export function ctxBarHtml(st) {
 // owed-reply indicator (chat header trigger + switcher rows): same tri-state
 // visual language as the tile corner and the chat typing bubble — animated dots
 // (owed, seen), static ⏳ (queued, not picked up), static amber ⚠ (stale).
-export function owedIndHtml(state, stale) {
+// `titles` rewords the tooltips for a surface (the card tile names "the
+// lieutenant"); the markup itself is the one shape everywhere.
+const OWED_TITLES = {
+  stale: 'no response yet — the lieutenant may be stuck',
+  queued: 'delivered — not picked up yet',
+  seen: 'owes you a reply',
+};
+export function owedIndHtml(state, stale, titles = OWED_TITLES) {
   if (!state) return '';
-  if (stale) return '<span class="t-typing stale" title="no response yet — the lieutenant may be stuck">⚠</span>';
-  if (state === 'queued') return '<span class="t-typing queued" title="delivered — not picked up yet">⏳</span>';
-  return '<span class="t-typing" title="owes you a reply"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></span>';
+  if (stale) return '<span class="t-typing stale" title="' + esc(titles.stale) + '">⚠</span>';
+  if (state === 'queued') return '<span class="t-typing queued" title="' + esc(titles.queued) + '">⏳</span>';
+  return '<span class="t-typing" title="' + esc(titles.seen) + '"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></span>';
 }
 
 // green → yellow (≥60%) → red (≥80%) — the shared context-bar thresholds
@@ -270,4 +299,57 @@ export function cardArtifacts(card) {
   const v = card && card.attributes && card.attributes.artifacts;
   if (!Array.isArray(v)) return [];
   return v.filter((e) => e && typeof e === 'object' && typeof e.uri === 'string' && e.uri);
+}
+
+/**
+ * How a hook run or a schedule firing ended, in the words `bc-axi` prints for
+ * it. One wording for every screen that says it — the hooks card, the ▶ note,
+ * the schedule card and its firings.
+ */
+export function runOutcome(r) {
+  return r.skipped ? 'skipped' : r.timedOut ? 'timed out' : r.error ? 'failed to start'
+    : r.canceled ? 'restarted mid-run' : r.code === null ? 'killed' : 'exit ' + r.code;
+}
+
+// First match wins, so the order is the dispatch order: a drawing is JSON on
+// disk but opens as a canvas, and audio must be claimed before the binary list.
+const FILE_KINDS = [
+  ['drawing', /\.excalidraw$/i],
+  ['image', /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i],
+  ['video', /\.(mp4|mov|webm|m4v)$/i],
+  ['audio', /\.(mp3|wav|m4a|aac|ogg|oga|opus|flac)$/i],
+  ['html', /\.html?$/i],
+  ['markdown', /\.(md|markdown)$/i],
+  ['text', /\.(txt|log|json|ya?ml|csv|js|ts|py|sh|css)$/i],
+  // known binaries: never worth a text preview — offer the download straight away
+  ['binary', /\.(pdf|zip|gz|tgz|tar|xlsx?|docx?|pptx?|bin|exe|dmg|iso|woff2?|ttf|otf|parquet|pkl|npz|so|dll|wasm|class|jar)$/i],
+];
+
+/**
+ * What a file name opens as, by extension: 'drawing' | 'image' | 'video' |
+ * 'audio' | 'html' | 'markdown' | 'text' | 'binary', or '' when the name does
+ * not say (the viewer then asks the server).
+ */
+export function classifyFile(name) {
+  const s = String(name || '');
+  for (const [kind, re] of FILE_KINDS) if (re.test(s)) return kind;
+  return '';
+}
+
+const TEXTY_MIME = /^(text\/|application\/(json|xml|javascript|x-sh|x-yaml|yaml|csv|x-www-form-urlencoded)|image\/svg)/;
+
+/**
+ * How a chat attachment shows: 'image' | 'video' | 'audio' | 'text' |
+ * 'binary', from its mime when it has one, else from its name. '' means
+ * neither decides — the served Content-Type has to (pass it back in as mime).
+ */
+export function attachmentKind(mime, name) {
+  const m = String(mime || '');
+  if (m) {
+    for (const k of ['image', 'video', 'audio']) if (m.startsWith(k + '/')) return k;
+    return TEXTY_MIME.test(m) ? 'text' : 'binary';
+  }
+  const k = classifyFile(name);
+  if (k === 'image' || k === 'video' || k === 'audio') return k;
+  return k === 'markdown' || k === 'html' || k === 'text' ? 'text' : '';
 }

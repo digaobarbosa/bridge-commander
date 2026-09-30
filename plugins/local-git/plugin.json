@@ -1,0 +1,62 @@
+{
+  "id": "local-git",
+  "name": "Local git",
+  "description": "Check a card's code out in the project folder, so you can run it from your usual checkout. Refuses when the project folder has uncommitted changes.",
+  "version": "1.0.0",
+  "contributes": {
+    "commands": [
+      {
+        "id": "local-git.checkout",
+        "title": "Check out in project folder",
+        "icon": "⎇",
+        "description": "Put the card's code in the project folder. \"detach\" checks out the worker's latest commit (the worktree's HEAD) detached, always possible; \"branch\" switches to the branch itself, only when no worktree holds it.",
+        "form": {
+          "mode": {
+            "title": "How",
+            "description": "detach: the worktree's latest commit, detached. branch: the branch itself (only when it exists and no worktree has it checked out).",
+            "enum": [
+              "detach",
+              "branch"
+            ],
+            "default": "detach"
+          }
+        },
+        "tracked": true,
+        "run": {
+          "exec": "sh \"$BC_PLUGIN_DIR/checkout.sh\"",
+          "timeoutMs": 120000
+        }
+      }
+    ],
+    "menus": {
+      "card.menu/v1": [
+        {
+          "command": "local-git.checkout",
+          "rank": 420,
+          "when": {
+            "card.branch": {
+              "$exists": true
+            },
+            "project.path": {
+              "$exists": true
+            }
+          }
+        }
+      ],
+      "detail.actions/v1": [
+        {
+          "command": "local-git.checkout",
+          "rank": 420,
+          "when": {
+            "card.branch": {
+              "$exists": true
+            },
+            "project.path": {
+              "$exists": true
+            }
+          }
+        }
+      ]
+    }
+  }
+}

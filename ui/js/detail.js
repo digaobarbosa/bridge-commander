@@ -1,13 +1,21 @@
 // card detail: attributes header + markdown body + event timeline (chat lives in the chat panel)
-import { S, card, lieutenant, lieutenants, lieutenantColor, cardStatus, cardActivityTs, cardRecency, kindEmoji, render, toggleFilter, filterSelected } from './state.js';
-import { esc, hhmm, agoSpanHtml, cardEmoji, cardPrs, prChipHtml, cardArtifacts, artifactsHtml, cardStripHtml, uriBasename, uriDir, setHtmlIfChanged, isImageMime, playbookAttrHtml } from './util.js';
+import { S, card, lieutenants, lieutenantColor, cardActivityTs, cardRecency, kindEmoji, render, toggleFilter, filterSelected } from './state.js';
+import { cardFacts, orderHtml, archiveReasonHtml, sessionCheckpointHtml } from './cardview.js';
+import { esc, hhmm, agoSpanHtml, cardEmoji, cardPrs, prChipHtml, cardArtifacts, artifactsHtml, cardStripHtml, uriBasename, uriDir, setHtmlIfChanged, playbookAttrHtml, classifyFile, attachmentKind } from './util.js';
 import { md, mdEnhance, copyText } from './md.js';
 import { api } from './api.js';
 import { labelChipHtml, openLabelPicker, saveCardLabels } from './labels.js';
 import { openCardThread, syncChatToMain } from './chat.js';
 import { openFile, closeFile, fileKey, fileDirty, fileMerges, fileResolve, fileUpdate, fileNotice } from './filepane.js';
-import { openMoveMenu } from './board.js';
+import { openCardMenu, detailActionsHtml } from './cardactions.js';
+import { runCommand } from './commandui.js';
+import { entries, hasEntries } from './slots.js';
+import { renderPluginSection } from './plugins.js';
+import { cardContext } from './cardview.js';
 import { archivedCard, unarchive } from './archive.js';
+import { openPopover } from './popover.js';
+import { openCardSession } from './pane.js';
+import { cardSessions } from './terminal.js';
 
 const isDesktop = () => window.innerWidth > 760; // matches the chat.js layout breakpoint
 
@@ -58,6 +66,7 @@ function renderAux() {
   document.getElementById('dt-talk').hidden = true;
   document.getElementById('dt-menu-btn').hidden = true;
   document.getElementById('dt-unarch').hidden = true;
+  setHtmlIfChanged(pactEl, ''); // plugin buttons are a card's, not a schedule's
   const emojiEl = document.getElementById('dt-emoji');
   if (emojiEl.textContent !== (aux.emoji || '')) emojiEl.textContent = aux.emoji || '';
   if (titleEl.textContent !== aux.title) titleEl.textContent = aux.title;
@@ -146,13 +155,14 @@ document.addEventListener('click', (e) => {
     t.closest('#table tbody tr') ||           // table/archive rows switch cards the same way
     t.closest('#archive tbody tr') ||
     t.closest('#lt-overlay') ||               // new-lieutenant modal
-    t.closest('#move-menu') ||                // transient popovers dismiss on their own
-    t.closest('#owner-menu') ||
-    t.closest('#playbook-menu') ||
+    t.closest('.popover') ||                  // transient popovers dismiss on their own
     t.closest('#notif-panel') ||
     t.closest('#settings-panel') ||
     t.closest('#label-picker') ||
     t.closest('#av-overlay') ||               // artifact viewer sits above the detail
+    t.closest('.bc-modal-overlay') ||         // a command form or an activity log opened from it
+    t.closest('#taskbar') ||                  // …and the taskbar that opens those logs
+    t.closest('#toast-stack') ||
     t.closest('#mmd-overlay') ||              // fullscreen mermaid diagram overlay
     t.closest('.speech-transport') ||         // floating speech transport (and its buttons)
     t.closest('[data-label-add]')
@@ -160,17 +170,18 @@ document.addEventListener('click', (e) => {
   if (editingTitle) commitTitleEdit();        // save the in-progress rename first
   closeDetail();
 });
-document.getElementById('dt-talk').onclick = () => {
-  if (S.openCardId) {
-    const id = S.openCardId;
-    // Desktop already shows the thread on the left (synced on select), so just
-    // focus that thread — keep the detail open for the side-by-side view. Mobile
-    // has no side-by-side, so switch the chat tab to the thread as before.
-    if (isDesktop()) { openCardThread(id); return; }
-    closeDetail();
-    openCardThread(id);
-  }
-};
+// 💬 talk — the card command table's talk action (cardactions.js) lands here,
+// from the header button and from any card's menu alike.
+export function talkOnCard(id) {
+  if (!id) return;
+  // Desktop already shows the thread on the left (synced on select), so just
+  // focus that thread — keep the detail open for the side-by-side view. Mobile
+  // has no side-by-side, so switch the chat tab to the thread as before.
+  if (isDesktop()) { openCardThread(id); return; }
+  if (S.openCardId) closeDetail();
+  openCardThread(id);
+}
+document.getElementById('dt-talk').onclick = () => talkOnCard(S.openCardId);
 // ---------- the collapsed line, and the artifacts accordion ----------
 // Both are per-card view state, and the card viewer remembers nothing across
 // cards: opening a different card collapses the line again and re-opens
@@ -193,13 +204,62 @@ stripEl.onkeydown = (e) => {
   if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleFold(); }
 };
 
+// ⋯ — the same card menu the tile and the table row open (cardactions.js)
 document.getElementById('dt-menu-btn').onclick = (e) => {
-  e.stopPropagation();
-  if (S.openCardId) {
-    const r = e.target.getBoundingClientRect();
-    openMoveMenu(S.openCardId, r.left, r.bottom + 4);
-  }
+  if (S.openCardId) openCardMenu(S.openCardId, e.currentTarget);
 };
+// the plugin buttons (detail.actions/v1) — one delegated handler, the markup is repainted
+const pactEl = document.getElementById('dt-pactions');
+pactEl.onclick = (e) => {
+  const b = e.target.closest('button[data-cmd]');
+  if (b && S.openCardId) runCommand(b.dataset.cmd, S.openCardId);
+};
+
+// ---------- plugin sections (detail.sections/v1) ----------
+// Below the built-in sections, each in its own box: the plugin's module is
+// imported the first time one is shown and its render(el, card, state) runs on
+// every repaint, inside the slot error boundary. The boxes are rebuilt only
+// when the card or the set of sections changes, so a plugin's DOM survives a
+// board push.
+const secEl = document.getElementById('dt-sections');
+let secMounts = { sig: '', list: [] };
+function clearSections() {
+  for (const m of secMounts.list) if (m.dispose) m.dispose();
+  secMounts = { sig: '', list: [] };
+  if (secEl.firstChild) secEl.textContent = '';
+}
+function renderSections(c, arch) {
+  // a frozen snapshot is not something a plugin acts on
+  const list = arch || !hasEntries('detail.sections/v1') ? [] : entries('detail.sections/v1', cardContext(c, S.doc));
+  const sig = c.id + '|' + list.map((e) => e.key).join(',');
+  if (sig !== secMounts.sig) {
+    clearSections();
+    secMounts.sig = sig;
+    for (const entry of list) {
+      const box = document.createElement('section');
+      box.className = 'dt-psec';
+      box.dataset.key = entry.key;
+      const head = document.createElement('div');
+      head.className = 'dt-events-head dt-psec-head';
+      head.textContent = (entry.icon ? entry.icon + ' ' : '') + entry.title;
+      if (entry.plugin) {
+        const by = document.createElement('span');
+        by.className = 'dt-psec-by';
+        by.textContent = entry.plugin;
+        head.appendChild(by);
+      }
+      const body = document.createElement('div');
+      body.className = 'dt-psec-body';
+      box.append(head, body);
+      secEl.appendChild(box);
+      secMounts.list.push({ entry, el: body, dispose: null });
+    }
+  }
+  for (const m of secMounts.list) {
+    const d = renderPluginSection(m.entry, m.el, c);
+    if (d) m.dispose = d;
+  }
+}
 
 // ---------- inline title rename ----------
 function startTitleEdit() {
@@ -293,9 +353,6 @@ const avDownload = document.getElementById('av-download');
 const avSrcBtn = document.getElementById('av-src');
 const avCopyBtn = document.getElementById('av-copy');
 const avEditBtn = document.getElementById('av-edit');
-const MD_EXT = /\.(md|markdown)$/i;
-const HTML_EXT = /\.html?$/i;
-const DRAW_EXT = /\.excalidraw$/i;
 // Reset the shared overlay to a clean text-mode state (used by both openers).
 function avReset(name, uri) {
   avUri = uri || '';
@@ -575,7 +632,7 @@ export async function openArtifactFile(uri, name, opts) {
   openFile({
     key: uri,
     name,
-    markdown: MD_EXT.test(name),
+    markdown: classifyFile(name) === 'markdown',
     content: drafts.has(uri) ? drafts.get(uri) : r.content,
     saved: r.content, // a restored draft is still unsaved typing
     crumb: o.crumb,
@@ -590,10 +647,11 @@ export async function openArtifactFile(uri, name, opts) {
 // An artifact entry may carry a content-type hint ({uri, label, type}) — e.g.
 // the auto-attached worker brief is markdown in a `.prompt` file. The hint
 // wins; the extension regex is the fallback.
-const isMdArtifact = (art, name) => (art && art.type) === 'markdown' || MD_EXT.test(name);
+const isMdArtifact = (art, name) => (art && art.type) === 'markdown' || classifyFile(name) === 'markdown';
 export async function openArtifact(uri) { // exported for the test; the UI reaches it by click
   const name = uriBasename(uri) || uri;
-  if (DRAW_EXT.test(name)) return openDrawing(uri, name); // a drawing opens as a canvas, not as its JSON
+  const kind = classifyFile(name);
+  if (kind === 'drawing') return openDrawing(uri, name); // a drawing opens as a canvas, not as its JSON
   avReset(name, uri);
   avBody.textContent = 'loading…';
   // A promoted chat attachment resolves through the attachment viewer (images
@@ -616,24 +674,24 @@ export async function openArtifact(uri) { // exported for the test; the UI reach
     avDownload.href = rawUrl; avDownload.setAttribute('download', name); avDownload.hidden = false;
     avBody.className = ''; avBody.textContent = msg;
   };
-  if (IMG_EXT.test(name)) {
+  if (kind === 'image') {
     avDownload.href = rawUrl; avDownload.setAttribute('download', name); avDownload.hidden = false;
     avBody.hidden = true; avImgWrap.hidden = false; avImg.src = rawUrl; avImg.alt = title;
     return;
   }
-  if (VIDEO_EXT.test(name)) {
+  if (kind === 'video') {
     // Inline player fed by the same raw serve the ⬇ button uses. No autoplay.
     avDownload.href = rawUrl; avDownload.setAttribute('download', name); avDownload.hidden = false;
     avBody.hidden = true; avVideoWrap.hidden = false; avVideo.src = rawUrl;
     return;
   }
-  if (AUDIO_EXT.test(name)) {
+  if (kind === 'audio') {
     // Inline player fed by the same raw serve the ⬇ button uses. No autoplay.
     avDownload.href = rawUrl; avDownload.setAttribute('download', name); avDownload.hidden = false;
     avBody.hidden = true; avAudioWrap.hidden = false; avAudio.src = rawUrl;
     return;
   }
-  if (HTML_EXT.test(name)) {
+  if (kind === 'html') {
     // A rendered .html/.htm page (teach-me, report): show it live in an iframe fed
     // by the *directory* serve, not the raw query — a page needs a folder for its
     // relative references to sit in, so `./audio.wav` beside it loads instead of
@@ -646,7 +704,7 @@ export async function openArtifact(uri) { // exported for the test; the UI reach
     avModal.classList.add('expanded');
     return;
   }
-  if (BIN_EXT.test(name)) return offerDownload('No inline preview for this file type. Use ⬇ to download.');
+  if (kind === 'binary') return offerDownload('No inline preview for this file type. Use ⬇ to download.');
   // Text / markdown (or unknown) → the existing text preview. A genuine binary
   // (null bytes → 415) or over-cap text (413, "too large") falls through to a
   // download offer, carrying the server's message.
@@ -668,15 +726,6 @@ export async function openArtifact(uri) { // exported for the test; the UI reach
 // Open a chat attachment: images preview inline, text-ish types show their
 // content, everything else downloads. Served straight from /api/attachments/:id
 // (never /api/artifact — an attachment need not be a promoted card artifact).
-const TEXTY_MIME = /^(text\/|application\/(json|xml|javascript|x-sh|x-yaml|yaml|csv|x-www-form-urlencoded)|image\/svg)/;
-const IMG_EXT = /\.(png|jpe?g|gif|webp|bmp|svg|avif)$/i;
-const VIDEO_EXT = /\.(mp4|mov|webm|m4v)$/i;
-const isVideoMime = (m) => /^video\//.test(String(m || ''));
-const AUDIO_EXT = /\.(mp3|wav|m4a|aac|ogg|oga|opus|flac)$/i;
-const isAudioMime = (m) => /^audio\//.test(String(m || ''));
-const TEXT_EXT = /\.(md|markdown|txt|log|json|ya?ml|csv|js|ts|py|sh|css|html?)$/i;
-// Known binaries — never worth a text preview; offer a download straight away.
-const BIN_EXT = /\.(pdf|zip|gz|tgz|tar|xlsx?|docx?|pptx?|bin|exe|dmg|iso|woff2?|ttf|otf|parquet|pkl|npz|so|dll|wasm|class|jar)$/i;
 export async function openAttachment(att) {
   const url = '/api/attachments/' + encodeURIComponent(att.id);
   const name = att.name || '';
@@ -691,35 +740,24 @@ export async function openAttachment(att) {
     if (isMdArtifact(att, name)) showMarkdown(text);
     else { avBody.className = ''; avBody.textContent = text; avCopyable(text); }
   };
-  const mime = String(att.mime || '');
+  const shows = { image: showImage, video: showVideo, audio: showAudio };
+  const noPreview = () => { avBody.textContent = 'No inline preview for this file type. Use ⬇ to download.'; };
   // Decide from mime/extension when possible; a promoted artifact carries only
   // {uri, label}, so its mime may be unknown — then consult the served
   // Content-Type before falling back to a download.
-  if (isImageMime(mime) || (!mime && IMG_EXT.test(name))) return showImage();
-  if (isVideoMime(mime) || (!mime && VIDEO_EXT.test(name))) return showVideo();
-  if (isAudioMime(mime) || (!mime && AUDIO_EXT.test(name))) return showAudio();
-  if (TEXTY_MIME.test(mime) || (!mime && TEXT_EXT.test(name))) {
-    avBody.textContent = 'loading…';
-    try {
-      const r = await fetch(url);
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      showText(await r.text());
-    } catch (e) { avBody.textContent = '⚠ no preview — ' + e.message + ' (use ⬇ to download)'; }
-    return;
-  }
-  if (mime) { avBody.textContent = 'No inline preview for this file type. Use ⬇ to download.'; return; }
-  // Unknown mime AND an undecided name (e.g. a promoted image with a custom
-  // label): ask the server what it is, then render accordingly.
+  const kind = attachmentKind(att.mime, name);
+  if (shows[kind]) return shows[kind]();
+  if (kind === 'binary') return noPreview();
   avBody.textContent = 'loading…';
   try {
     const r = await fetch(url);
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    const ct = (r.headers.get('content-type') || '').split(';')[0];
-    if (isImageMime(ct)) return showImage();
-    if (isVideoMime(ct)) return showVideo();
-    if (isAudioMime(ct)) return showAudio();
-    if (TEXTY_MIME.test(ct)) return showText(await r.text());
-    avBody.textContent = 'No inline preview for this file type. Use ⬇ to download.';
+    // the name said text, or nothing: an undecided one (a promoted image with a
+    // custom label) is settled by what the server says it is
+    const served = kind || attachmentKind((r.headers.get('content-type') || '').split(';')[0], '');
+    if (shows[served]) return shows[served]();
+    if (served === 'text') return showText(await r.text());
+    noPreview();
   } catch (e) { avBody.textContent = '⚠ no preview — ' + e.message + ' (use ⬇ to download)'; }
 }
 // A close hook lets main.js run one deferred render when the viewer closes
@@ -735,101 +773,47 @@ avExpand.onclick = () => { avModal.classList.toggle('expanded'); };
 avOverlay.onclick = (e) => { if (e.target === avOverlay) closeArtifact(); };
 
 // ---------- owner menu (reassign the owning lieutenant) ----------
-// Popover twin of the board's move-menu (shares its look — see app.css): lists
-// the OTHER lieutenants by name with their color dot; picking one PATCHes
-// {owner} and the SSE board push repaints chip + tile live. Opened by the ✎ on
-// the owner chip, which only renders while no worker is bound (the server
-// refuses owner changes otherwise). Closes on select / outside click / Esc
-// (main.js).
-const omEl = document.getElementById('owner-menu');
-function openOwnerMenu(cardId, x, y) {
+// Lists the OTHER lieutenants by name with their color dot; picking one
+// PATCHes {owner} and the SSE board push repaints chip + tile live. Opened by
+// the ✎ on the owner chip, which only renders while no worker is bound (the
+// server refuses owner changes otherwise).
+function openOwnerMenu(cardId, anchor) {
   const c = card(cardId);
-  if (!c) return;
-  omEl.textContent = '';
-  const head = document.createElement('div');
-  head.className = 'mm-head';
-  head.textContent = 'hand card to';
-  omEl.appendChild(head);
+  // the ✎ may be stale: a worker can bind between the paint and the click
+  if (!c || !cardFacts(c, S.doc).canEditOwner) return;
   const others = lieutenants().filter((l) => l.id !== c.owner);
-  if (!others.length) {
-    const none = document.createElement('div');
-    none.className = 'mm-none';
-    none.textContent = 'no other lieutenant';
-    omEl.appendChild(none);
-  }
-  for (const l of others) {
-    const b = document.createElement('button');
-    b.type = 'button';
-    const dot = document.createElement('span');
-    dot.className = 'dot';
-    dot.style.background = lieutenantColor(l.id);
-    b.appendChild(dot);
-    b.appendChild(document.createTextNode(l.name || l.id));
-    b.onclick = async () => {
-      closeOwnerMenu();
-      try { await api.patchCard(cardId, { owner: l.id }); }
-      catch (e) { alert(e.message); }
-    };
-    omEl.appendChild(b);
-  }
-  omEl.hidden = false;
-  const r = omEl.getBoundingClientRect();
-  omEl.style.left = Math.max(8, Math.min(x, window.innerWidth - r.width - 8)) + 'px';
-  omEl.style.top = Math.max(8, Math.min(y, window.innerHeight - r.height - 8)) + 'px';
+  openPopover(anchor, [
+    { head: 'hand card to' },
+    ...(others.length ? [] : [{ note: 'no other lieutenant' }]),
+    ...others.map((l) => ({ label: l.name || l.id, dot: lieutenantColor(l.id), onClick: () => patchOrSay(cardId, { owner: l.id }) })),
+  ], { id: 'owner-menu' });
 }
-export function closeOwnerMenu() { omEl.hidden = true; }
-export function ownerMenuOpen() { return !omEl.hidden; }
-document.addEventListener('click', (e) => { if (!omEl.hidden && !omEl.contains(e.target)) closeOwnerMenu(); });
+async function patchOrSay(cardId, body) {
+  try { await api.patchCard(cardId, body); } catch (e) { alert(e.message); }
+}
 
 // ---------- playbook menu (pick the playbook card.start renders) ----------
-// Same popover as the owner menu. The list is fetched on every open, never
-// cached: playbooks/ is a folder the captain edits, and a playbook dropped in a
-// minute ago must be pickable now. "none" is offered on purpose — clearing the
-// playbook is a real state, it just means the card cannot start.
-const bmEl = document.getElementById('playbook-menu');
-async function openPlaybookMenu(cardId, x, y) {
+// The list is fetched on every open, never cached: playbooks/ is a folder the
+// captain edits, and a playbook dropped in a minute ago must be pickable now.
+// "none" is offered on purpose — clearing the playbook is a real state, it just
+// means the card cannot start.
+async function openPlaybookMenu(cardId, anchor) {
   const c = card(cardId);
-  // Backlog only, the same rule the ✎ is drawn by — a card that moved while the
-  // panel was open must not pick up an editor through a stale button.
-  if (!c || c.column !== 'backlog') return;
-  bmEl.textContent = '';
-  const head = document.createElement('div');
-  head.className = 'mm-head';
-  head.textContent = 'playbook';
-  bmEl.appendChild(head);
-  bmEl.hidden = false;
-  bmEl.style.left = Math.max(8, Math.min(x, window.innerWidth - 200)) + 'px';
-  bmEl.style.top = Math.max(8, y) + 'px';
+  // the same rule the ✎ is drawn by (cardFacts) — a card that moved while the
+  // panel was open must not pick up an editor through a stale button
+  if (!c || !cardFacts(c, S.doc).canEditPlaybook) return;
+  const pop = openPopover(anchor, [{ head: 'playbook' }], { id: 'playbook-menu' });
   let ids = [];
   try { ids = (await api.playbooks()).playbooks || []; }
   catch (e) { ids = []; }
-  if (bmEl.hidden) return; // closed while the fetch was in flight
-  if (!ids.length) {
-    const none = document.createElement('div');
-    none.className = 'mm-none';
-    none.textContent = 'no playbooks in playbooks/';
-    bmEl.appendChild(none);
-  }
-  for (const id of ['', ...ids]) {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.textContent = id || '— none';
-    if (id === (c.playbook || '')) b.className = 'cur';
-    b.onclick = async () => {
-      closePlaybookMenu();
-      try { await api.patchCard(cardId, { playbook: id }); }
-      catch (e) { alert(e.message); }
-    };
-    bmEl.appendChild(b);
-  }
-  // re-clamp: the list only now has its real height
-  const r = bmEl.getBoundingClientRect();
-  bmEl.style.left = Math.max(8, Math.min(x, window.innerWidth - r.width - 8)) + 'px';
-  bmEl.style.top = Math.max(8, Math.min(y, window.innerHeight - r.height - 8)) + 'px';
+  if (!pop.isOpen()) return; // closed while the fetch was in flight
+  pop.set([
+    { head: 'playbook' },
+    ...(ids.length ? [] : [{ note: 'no playbooks in playbooks/' }]),
+    ...['', ...ids].map((id) => ({ label: id || '— none', current: id === (c.playbook || ''),
+      onClick: () => patchOrSay(cardId, { playbook: id }) })),
+  ]);
 }
-export function closePlaybookMenu() { bmEl.hidden = true; }
-export function playbookMenuOpen() { return !bmEl.hidden; }
-document.addEventListener('click', (e) => { if (!bmEl.hidden && !bmEl.contains(e.target)) closePlaybookMenu(); });
 
 // Opening the card clears its unread: level-1 events and lieutenant replies both
 // derive from the same per-card read marker server-side, so one POST covers
@@ -838,9 +822,9 @@ document.addEventListener('click', (e) => { if (!bmEl.hidden && !bmEl.contains(e
 // this is the detail-side half. Debounced like chat.js maybeMarkRead: keyed by
 // the newest unread-relevant ts so re-renders never spam the endpoint.
 let lastMarked = { id: '', ts: '' };
-function maybeMarkCardRead(c) {
+function maybeMarkCardRead(c, f) {
   if (document.hidden) return;
-  if (!cardStatus(c).unread) return; // server-derived; false once the marker lands
+  if (!f.unread) return; // server-derived; false once the marker lands
   const ts = cardActivityTs(c);
   if (lastMarked.id === c.id && lastMarked.ts === ts) return; // already sent
   lastMarked = { id: c.id, ts };
@@ -856,10 +840,10 @@ function attrHtml(k, v) {
 }
 
 export function renderDetail() {
-  if (aux) { renderAux(); return; }
+  if (aux) { clearSections(); renderAux(); return; }
   el.classList.remove('dt-aux-on');
   auxEl.hidden = true;
-  if (!S.openCardId) { el.hidden = true; return; }
+  if (!S.openCardId) { el.hidden = true; clearSections(); return; }
   let c = card(S.openCardId);
   let arch = null; // the archive record when this is a frozen snapshot
   if (!c) {
@@ -877,31 +861,32 @@ export function renderDetail() {
   // action is unarchive (restoring keeps the panel open — it becomes the live card)
   document.getElementById('dt-talk').hidden = !!arch;
   document.getElementById('dt-menu-btn').hidden = !!arch;
+  const sessionBtn = document.getElementById('dt-session');
+  const session = cardSessions(c)[0];
+  sessionBtn.hidden = !session && (!!arch || c.column !== 'working');
+  sessionBtn.title = 'open or resume session' + (session ? ' · ' + session.provider + ' · ' + session.host : '');
+  sessionBtn.onclick = () => openCardSession(c.id);
   const unBtn = document.getElementById('dt-unarch');
   unBtn.hidden = !arch;
   if (arch) unBtn.onclick = () => unarchive(c.id, unBtn);
   titleEl.title = arch ? '' : 'click to rename'; // rename is live-only (the editor no-ops on frozen ids)
 
+  // every derived fact (worker, owner, order, archive reason, what is editable)
+  // comes from the card view model the board and the table also draw from
+  const f = cardFacts(c, S.doc, Date.now(), arch);
   const emojiEl = document.getElementById('dt-emoji');
-  const emoji = cardEmoji(c);
-  if (emojiEl.textContent !== emoji) emojiEl.textContent = emoji;
+  if (emojiEl.textContent !== f.emoji) emojiEl.textContent = f.emoji;
   if (!editingTitle && titleEl.textContent !== (c.title || c.id)) titleEl.textContent = c.title || c.id; // don't clobber an in-progress rename
   // sub line: id + timestamps, plus a worker-id chip when a worker is attached.
-  // Same whitelist as the tile stripe (board.js) — only known states render, so
-  // no server value ever reaches the class name; the id itself is esc()'d.
-  // Frozen snapshots swap the worker chip for when/why they were archived.
-  const WORKER_STATES = { working: 1, 'needs-you': 1, idle: 1 };
-  const w = cardStatus(c).worker;
-  const worker = !arch && w && w.id && WORKER_STATES[w.state] ? w : null;
-  const rsn = arch && (arch.reason === 'merged' ? 'merged' : 'killed');
+  // workerState is whitelisted in cardview, so no server value reaches the class
+  // name; the id itself is esc()'d. Frozen snapshots carry no worker: they swap
+  // the chip for when/why they were archived.
   setHtmlIfChanged(document.getElementById('dt-sub'),
     esc(c.id + ' · ' + c.type + ' · created ') + agoSpanHtml(c.created) + esc(' ago') +
     (arch
-      ? esc(' · archived ') + agoSpanHtml(arch.ts) + esc(' ago') +
-        '<span class="tv-rsn tv-rsn-' + rsn + '"' + (arch.note ? ' title="' + esc(arch.note) + '"' : '') + '>' +
-        (rsn === 'merged' ? '🏁 merged' : '🪦 killed') + '</span>'
+      ? esc(' · archived ') + agoSpanHtml(arch.ts) + esc(' ago') + archiveReasonHtml(f)
       : esc(' · updated ') + agoSpanHtml(cardRecency(c)) + esc(' ago')) +
-    (worker ? '<span class="dt-worker dt-worker-' + worker.state + '" title="worker: ' + esc(worker.state) + '">' + esc(worker.id) + '</span>' : ''));
+    (f.workerId ? '<span class="dt-worker dt-worker-' + f.workerState + '" title="worker: ' + esc(f.workerState) + '">' + esc(f.workerId) + '</span>' : ''));
 
   // the collapsed line: what he needs before he needs anything else
   setHtmlIfChanged(stripEl, cardStripHtml(c, kindEmoji));
@@ -916,19 +901,18 @@ export function renderDetail() {
   // c, so a same-looking attrs row on another card must not skip the rebuild
   const attrsChanged = setHtmlIfChanged(attrsEl,
     '<span class="attr attr-owner" data-card="' + esc(c.id) + '" title="click: filter by lieutenant · alt-click: exclude"><span class="k">lieutenant</span>' +
-    '<span class="v" style="color:' + esc(lieutenantColor(c.owner)) + '">' + esc((lieutenant(c.owner) || {}).name || c.owner) + '</span>' +
-    // ✎ only while no worker is bound — mirrors the server guard on owner PATCH.
+    '<span class="v" style="color:' + esc(lieutenantColor(c.owner)) + '">' + esc(f.ownerName) + '</span>' +
+    // ✎ only while no worker is bound — the server's guard on owner PATCH.
     // Rendered in the markup (not appended after) so a worker binding/unbinding
     // changes the innerHTML signature and setHtmlIfChanged rebuilds the row.
     // Frozen snapshots never offer it: nothing about them is editable.
-    (worker || arch ? '' : '<button type="button" class="owner-edit" title="change owner (only while no worker is bound)">✎</button>') +
+    (f.canEditOwner ? '<button type="button" class="owner-edit" title="change owner (only while no worker is bound)">✎</button>' : '') +
     '</span>' +
     // playbook: which one card.start renders. Shown always, editable only in
-    // Backlog — see playbookAttrHtml. The column is in the innerHTML signature
-    // through the chip's own markup, so the ✎ appears and disappears with the
-    // move without a special case here.
-    playbookAttrHtml(c, !arch && c.column === 'backlog') +
-    (c.pendingOrder ? '<span class="attr"><span class="k">pending</span><span class="v">⏳ ' + esc(c.pendingOrder.kind) + '</span></span>' : '') +
+    // Backlog (cardFacts.canEditPlaybook). The ✎ is in the chip's own markup, so
+    // it appears and disappears with the move without a special case here.
+    playbookAttrHtml(c, f.canEditPlaybook) +
+    orderHtml(f, 'attr') +
     Object.entries(at)
       .filter(([k]) => k !== 'emoji' && k !== 'prs' && k !== 'artifacts')
       .map(([k, v]) => attrHtml(k, v)).join('') +
@@ -940,16 +924,14 @@ export function renderDetail() {
     const edit = ownerChip.querySelector('.owner-edit');
     if (edit) edit.onclick = (e) => {
       e.stopPropagation(); // the chip click is the owner filter, not the menu
-      const r = edit.getBoundingClientRect();
-      openOwnerMenu(c.id, r.left, r.bottom + 4);
+      openOwnerMenu(c.id, edit);
     };
   }
   if (attrsChanged) {
     const playbookEdit = attrsEl.querySelector('.attr-playbook .owner-edit');
     if (playbookEdit) playbookEdit.onclick = (e) => {
       e.stopPropagation();
-      const r = playbookEdit.getBoundingClientRect();
-      openPlaybookMenu(c.id, r.left, r.bottom + 4);
+      openPlaybookMenu(c.id, playbookEdit);
     };
   }
 
@@ -989,6 +971,10 @@ export function renderDetail() {
   // unconditionally: it is per-node guarded, so an unchanged body is a no-op,
   // and enhanced DOM (copy buttons, diagrams) never changes the cached html
   // string setHtmlIfChanged compares against.
+  const checkpointEl = document.getElementById('dt-checkpoint');
+  const checkpoint = sessionCheckpointHtml(c);
+  checkpointEl.hidden = !checkpoint;
+  setHtmlIfChanged(checkpointEl, checkpoint);
   if (!editingBody) {
     setHtmlIfChanged(bodyEl, md(c.body || ''));
     mdEnhance(bodyEl);
@@ -1038,5 +1024,9 @@ export function renderDetail() {
     '<div class="sub">' + esc(e.actor || '') + ' · ' + hhmm(e.ts) + ' · ' + agoSpanHtml(e.ts) + ' ago</div>' +
     '</div></div>').join('') || '<div class="ev"><div class="bd"><div class="sub">no events yet</div></div></div>');
 
-  if (!arch) maybeMarkCardRead(c); // frozen snapshots have no read state to advance
+  // plugin buttons in the header, plugin sections under everything else
+  setHtmlIfChanged(pactEl, arch ? '' : detailActionsHtml(c, S.doc));
+  renderSections(c, arch);
+
+  if (!arch) maybeMarkCardRead(c, f); // frozen snapshots have no read state to advance
 }

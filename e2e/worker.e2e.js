@@ -84,7 +84,7 @@ async function until(what, fn, ms, step = 1000) {
   }
 }
 
-const { lieutenantSession, workerWindow } = require(path.join(__dirname, '..', 'server', 'names.js'));
+const { lieutenantSession, workerWindow } = require(path.join(__dirname, '..', 'server', 'layout.js'));
 
 const CARD = 'hello-file';
 // the worker lives as a WINDOW inside the owning lieutenant's session

@@ -13,37 +13,30 @@
 import { api } from './api.js';
 import { openArtifactFile } from './detail.js';
 import { fileNotice } from './filepane.js';
+import { listSection } from './listpanel.js';
 
-const listEl = document.getElementById('pb-list');
-const dirEl = document.getElementById('pb-dir');
-const refEl = document.getElementById('pb-ref');
+let listEl, dirEl, refEl;
+/** Hand the section its elements: {list, dir, ref}. */
+export function initPlaybooks(els) { ({ list: listEl, dir: dirEl, ref: refEl } = els); }
 
 let items = null;  // [{id, source, file}] — last answer from the server
 let dir = '';      // where a copy lands
 let reference = null; // {placeholders, frontmatter} — written in server/playbooks.js
-let loading = false;
 
-// Paints from the last answer and fetches when there isn't one. `reload` is
-// what the playbooks tab passes on the way in, so showing the section always
-// reads disk afresh (a playbook dropped in a second ago is in the list) while
-// the renders that follow — one per board event — cost nothing. Nothing runs
-// at all while another tab is up: opening the screen for labels reads no disk.
-export async function renderPlaybooks(reload) {
-  if (reload) items = null;
-  if (items) return paint();
-  if (loading) return;
-  loading = true;
-  try {
+// `reload` is what the playbooks tab passes on the way in, so showing the
+// section always reads disk afresh (a playbook dropped in a second ago is in the
+// list) while the renders that follow — one per board event — cost nothing.
+// Nothing runs at all while another tab is up: opening labels reads no disk.
+export const renderPlaybooks = listSection({
+  load: async () => {
     const r = await api.playbooks();
     items = r.items || [];
     dir = r.dir || '';
     reference = r.reference || null;
-  } catch (e) {
-    listEl.textContent = '⚠ ' + e.message;
-    return;
-  } finally { loading = false; }
-  paint();
-}
+  },
+  paint,
+  fail: (e) => { listEl.textContent = '⚠ ' + e.message; },
+});
 
 function paint() {
   listEl.textContent = '';
@@ -138,8 +131,7 @@ async function copy(p) {
   } catch (e) {
     return fileNotice('⚠ could not copy — ' + e.message, 'err');
   }
-  items = null;
-  await renderPlaybooks();
+  await renderPlaybooks(true);
   await open({ id: p.id, file: target, source: 'workspace' });
   fileNotice('copied to the workspace — this is yours now', 'ok');
 }

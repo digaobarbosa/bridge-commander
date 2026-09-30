@@ -25,7 +25,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 const CLI = path.join(__dirname, '..', 'cli', 'bc-axi');
-const { writeCharter } = require(path.join(__dirname, '..', 'server', 'charter.js'));
+const { writeCharter } = require(path.join(__dirname, '..', 'server', 'layout.js'));
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -95,7 +95,7 @@ async function stepCase(name, fn) {
 }
 
 const FOUNDER = 'bc-e2e-founder';
-const SCOUT = require(path.join(__dirname, '..', 'server', 'names.js')).lieutenantSession(ws, 'scout');
+const SCOUT = require(path.join(__dirname, '..', 'server', 'layout.js')).lieutenantSession(ws, 'scout');
 
 (async () => {
   const port = await freePort();

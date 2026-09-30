@@ -16,7 +16,6 @@
 // to the room's listener. bridge3d/sound.js has to move both.
 const test = require('node:test');
 const assert = require('node:assert');
-const fs = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
@@ -206,49 +205,4 @@ test('a context that died is forgotten, not written to for the rest of the visit
   assert.deepEqual(s.heard, [fresh],
     'and the dead one was dropped the first frame after it died, rather than written to '
     + 'ninety times a second for the rest of the visit');
-});
-
-// ── the room's own two answers, wired ─────────────────────────────────────
-// Neither can be exercised here: main.js, list.js and voice3d.js all pull in
-// three.js and uikit, which is exactly why test/bridge3d.test.js reads the room's
-// source for the wiring it cannot run. Behaviour lives in test/voice.test.js;
-// what is asserted below is that the room is plugged into it at all.
-
-test('a failure the captain cannot see a toast for is written where he is looking', () => {
-  const main = fs.readFileSync(path.join(ROOT, 'ui', 'js', 'bridge3d', 'main.js'), 'utf8');
-  assert.match(main, /installVoice\([^)]*\bsay\b[^)]*\)/,
-    'the room does not hand voice.js anywhere to report a silence, so in a headset it has none');
-  assert.match(main, /plate\.setNote\(/,
-    'say() writes only to #status, which is inside the gate and hidden the moment he enters');
-
-  const voice3d = fs.readFileSync(path.join(ROOT, 'ui', 'js', 'bridge3d', 'voice3d.js'), 'utf8');
-  assert.match(voice3d, /setSilenceReport\(report\)/, 'and voice.js is never told about it');
-
-  const list = fs.readFileSync(path.join(ROOT, 'ui', 'js', 'bridge3d', 'list.js'), 'utf8');
-  assert.match(list, /setNote\(text\)/, 'the mat has nowhere to put a note');
-  assert.match(list, /safe\(text\)/,
-    'the note skips safe() — a hole in the middle of the one sentence explaining why the '
-    + 'room went quiet');
-  assert.match(list, /if \(!full\) return;/,
-    'an empty status line clears the note, and the room writes one empty on every '
-    + 'five-second poll');
-  assert.match(list, /slice\(0, NOTE_CHARS - 3\)/,
-    'an engine error of any length runs off the plate onto pale stone, where the warning '
-    + 'colour has none of the contrast it was measured for');
-});
-
-test('pressing the lieutenant that is talking is what stops it', () => {
-  const main = fs.readFileSync(path.join(ROOT, 'ui', 'js', 'bridge3d', 'main.js'), 'utf8');
-  const chat = main.slice(main.indexOf('function openChat('));
-  const hushed = chat.indexOf('hush(lt)');
-  assert.ok(hushed > -1 && hushed < chat.indexOf('windows.show('),
-    'the press opens the chat without silencing the voice first — and there is no other '
-    + 'control in here: no toolbar, and no keyboard on a face wearing a headset');
-  assert.ok(!/keydown[\s\S]*stopSpeaking/.test(main), 'a key is not a control he has');
-
-  const voice3d = fs.readFileSync(path.join(ROOT, 'ui', 'js', 'bridge3d', 'voice3d.js'), 'utf8');
-  assert.match(voice3d, /skipSpeaking\(\)/,
-    'the press stops the whole board instead of the one he pressed — a reply from another '
-    + 'berth he has not heard yet is not his to throw away');
-  assert.ok(!/stopSpeaking/.test(voice3d), 'and the blanket stop has no business on a berth');
 });

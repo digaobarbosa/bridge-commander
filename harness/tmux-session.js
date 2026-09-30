@@ -1,14 +1,11 @@
 'use strict';
-// tmux-session — session/window/pane plumbing SHARED by the tmux-TUI harness
-// adapters (claude-tmux.js, codex-tmux.js). Everything here is harness-agnostic:
-// pane lifecycle, naming/validation, state-dir resolution, the launch-and-settle
-// skeleton (the adapter supplies its trust-prompt and UI-ready signatures), the
-// turn-end file tail, and the optional pane-viewing verbs. An adapter differs
-// only in its launch line, screen signatures, resume semantics, and turn-end
-// relay wiring.
+// tmux-session — session/window/pane plumbing under tmux-adapter.js. Every
+// piece here is harness-agnostic: pane lifecycle, naming/validation, state-dir
+// resolution, the launch-and-settle loop (the profile supplies its screen
+// signatures), the turn-end file tail, and the pane-viewing verbs.
 //
-// Extracted verbatim from claude-tmux.js (the reference implementation) — the
-// comments below carry that provenance where behavior was learned the hard way.
+// Learned on claude-tmux.js first — the comments below carry that provenance
+// where behavior was learned the hard way.
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -16,6 +13,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const t = require('./tmux.js');
 const { validatePaneInput } = require('./port.js');
+const { shellQuote, stateKey, keyOf, isSpawnableSession, readSessionId } = require('./util.js');
 
 // A pane sitting back at a bare shell means the agent process exited.
 const SHELLS = new Set(['bash', 'zsh', 'sh', 'fish', 'dash', 'ksh']);
@@ -55,53 +53,51 @@ function spawnArgsFile(stateDir, key) {
 // The launch facts a resume has to replay, taken straight off the spawn's opts:
 // the extra flags (--model/--effort, pinned by the card's playbook) and the
 // caller's allowRoot consent (the IS_SANDBOX=1 prefix without which claude
-// refuses to come back as uid 0). Written as an object; a bare array is the
-// older record's shape and still reads as flags-only.
-function recordSpawnArgs(stateDir, key, opts = {}) {
+// refuses to come back as uid 0) and the permission mode (claude only; a
+// resume that drops it comes back in the default mode). Written as an object;
+// a bare array is the older record's shape and still reads as flags-only.
+function recordSpawnArgs(stateDir, key, opts = {}, envTemplate) {
   const file = spawnArgsFile(stateDir, key);
   try {
     const rec = { args: (opts.extraArgs || []).map(String) };
     if (opts.allowRoot) rec.allowRoot = true;
-    if (rec.args.length || rec.allowRoot) fs.writeFileSync(file, JSON.stringify(rec) + '\n');
+    if (typeof opts.permissionMode === 'string' && opts.permissionMode) rec.permissionMode = opts.permissionMode;
+    for (const k of ['model', 'effort']) if (typeof opts[k] === 'string' && opts[k]) rec[k] = opts[k];
+    // Env TEMPLATES only (`${NAME}`, never the value): resume re-expands them.
+    if (envTemplate && Object.keys(envTemplate).length) rec.env = envTemplate;
+    if (rec.args.length || rec.allowRoot || rec.permissionMode || rec.model || rec.effort || rec.env) {
+      fs.writeFileSync(file, JSON.stringify(rec) + '\n');
+    }
     else fs.rmSync(file, { force: true });
   } catch {
     // best-effort: the record is an optimisation, never a precondition
   }
 }
-// -> { args: string[], allowRoot: boolean }. Missing, unreadable or corrupt
+// -> { args: string[], allowRoot: boolean, permissionMode, model, effort: string|null }. Missing, unreadable or corrupt
 // reads as "nothing extra" and never throws: a resume that cannot read a hint
 // must still resume.
 function recordedSpawnArgs(stateDir, key) {
   try {
     const v = JSON.parse(fs.readFileSync(spawnArgsFile(stateDir, key), 'utf8'));
-    if (Array.isArray(v)) return { args: v.filter((a) => typeof a === 'string'), allowRoot: false };
+    if (Array.isArray(v)) return { args: v.filter((a) => typeof a === 'string'), allowRoot: false, permissionMode: null, model: null, effort: null };
     if (v && typeof v === 'object') {
+      const str = (x) => (typeof x === 'string' && x ? x : null);
       return {
         args: Array.isArray(v.args) ? v.args.filter((a) => typeof a === 'string') : [],
         allowRoot: !!v.allowRoot,
+        permissionMode: str(v.permissionMode),
+        model: str(v.model),
+        effort: str(v.effort),
       };
     }
   } catch {
     // fall through to the empty record
   }
-  return { args: [], allowRoot: false };
-}
-
-function shellQuote(s) {
-  return `'` + String(s).replace(/'/g, `'\\''`) + `'`;
+  return { args: [], allowRoot: false, permissionMode: null, model: null, effort: null };
 }
 
 function newSessionName() {
   return 'bc-' + crypto.randomBytes(3).toString('hex');
-}
-
-// stateKey — the per-agent key for prompt/turnend/session-id state files and
-// the turn-end relay's `session` argument. Window-granular agents share their
-// tmux session name with the lieutenant (and sibling workers), so the bare
-// session would collide; the `session:window` form is unique — tmux session
-// names can never contain ':'.
-function stateKey(session, window) {
-  return window ? `${session}:${window}` : session;
 }
 
 // paneTarget — exact-match tmux target for an agent's pane.
@@ -149,7 +145,7 @@ function paneExists(session, window, opts) {
 // numeric name would be parsed by tmux as a window INDEX (papercut #8).
 async function claimPaneNames(opts = {}) {
   const session = opts.session || newSessionName();
-  if (!/^bc-[A-Za-z0-9_-]+$/.test(session)) {
+  if (!isSpawnableSession(session)) {
     throw new Error(`invalid session name "${session}" (must match bc-<id>)`);
   }
   const window = opts.window === undefined || opts.window === null ? undefined : String(opts.window);
@@ -219,6 +215,23 @@ async function adoptWindow(ref, window, taken = []) {
   return { ...ref, window };
 }
 
+// panePids(ref | session) -> [{ window, pid }] — OPTIONAL capability verb:
+// every pane of the SESSION (all its windows, not just the ref's), so a caller
+// can attribute sibling windows to their own agents. [] when tmux or the
+// session is gone. The exact-match target, like every command here: a bare
+// name is a prefix match and could read another session's panes.
+async function panePids(refOrSession) {
+  const session = typeof refOrSession === 'string' ? refOrSession : refOrSession && refOrSession.session;
+  if (!session) return [];
+  const out = await t.tryTmux('list-panes', '-s', '-t', `=${session}:`, '-F', '#{window_name}\t#{pane_pid}');
+  const panes = [];
+  for (const line of String(out || '').split('\n')) {
+    const m = /^(.*)\t(\d+)$/.exec(line.trim());
+    if (m) panes.push({ window: m[1], pid: parseInt(m[2], 10) });
+  }
+  return panes;
+}
+
 // launchAndSettle — send the launch command into the pane, wait for the agent
 // process and its main UI, auto-accepting the harness's trust dialog if it
 // appears (a fresh cwd shows one even in bypass mode; the accept option is
@@ -226,6 +239,8 @@ async function adoptWindow(ref, window, taken = []) {
 //   sig.trustRe — matches the trust screen (checked FIRST: a trust screen may
 //                 contain composer-like glyphs, so it must win over readyRe)
 //   sig.readyRe — matches signatures only the main UI renders
+//   sig.declineRe — optional: the menu cursor sits on a "No", so Down goes
+//                 before Enter
 //   sig.label   — the agent name for error messages ('claude', 'codex')
 //
 // Both signatures are tested against the TAIL of the pane — the current
@@ -237,6 +252,8 @@ async function adoptWindow(ref, window, taken = []) {
 // (composer + footer are the screen's last rows), so the tail is behavior-
 // preserving there.
 const SETTLE_TAIL_LINES = 15;
+const SETTLE_CONFIRM_MS = Number(process.env.BC_SETTLE_CONFIRM_MS) >= 0 && process.env.BC_SETTLE_CONFIRM_MS !== undefined
+  ? Number(process.env.BC_SETTLE_CONFIRM_MS) : 700;
 
 function paneTail(pane) {
   return pane.replace(/\s+$/, '').split('\n').slice(-SETTLE_TAIL_LINES).join('\n');
@@ -248,7 +265,8 @@ async function launchAndSettle(target, launchCmd, sig) {
   await t.sendKey(target, 'Enter');
 
   // Screens that stand between the launch and the UI, each one a menu whose
-  // PRESELECTED option is the one we want, so Enter answers all of them. They
+  // wanted option is preselected (or one Down away, see declineRe), so Enter
+  // answers all of them. They
   // are checked before readyRe because a dialog can carry composer-like glyphs
   // and would otherwise be mistaken for the main UI.
   const menus = [sig.trustRe, sig.resumeRe].filter(Boolean);
@@ -272,11 +290,25 @@ async function launchAndSettle(target, launchCmd, sig) {
     }
     if (SHELLS.has(cmd)) continue; // agent not up yet (or it already exited — captured by timeout)
     if (menus.some((re) => re.test(tail))) {
+      // A menu can preselect a No (claude 2.1.282's trust screen: Enter there
+      // quits the agent). Walk the cursor off it before answering.
+      if (sig.declineRe && sig.declineRe.test(tail)) {
+        await t.sendKey(target, 'Down');
+        await t.sleep(300);
+        continue;
+      }
       await t.sendKey(target, 'Enter');
       await t.sleep(1000);
       continue;
     }
-    if (sig.readyRe.test(tail)) return;
+    if (sig.readyRe.test(tail)) {
+      // Ready only if it holds: codex 0.157 flashes a composer-like frame for
+      // ~200ms BEFORE its trust screen, and a brief typed then lands in the menu.
+      await t.sleep(SETTLE_CONFIRM_MS);
+      const again = paneTail(await t.capture(target, 40));
+      if (sig.readyRe.test(again) && !menus.some((re) => re.test(again))
+        && !(sig.fatalRe && sig.fatalRe.test(again))) return;
+    }
   }
   const tail = await t.capture(target, 20);
   throw new Error(`${sig.label} did not start at ${target} within 45s; pane tail:\n${tail}`);
@@ -316,7 +348,7 @@ async function verifyLive(target, sig, ms = 6000) {
 // polling backstop, so no boundary is missed on filesystems with flaky watch.
 function onTurnEnd(ref, hook, opts = {}) {
   const stateDir = stateDirOf(opts);
-  const file = path.join(stateDir, `${stateKey(ref.session, ref.window)}.turnend.jsonl`);
+  const file = path.join(stateDir, `${keyOf(ref)}.turnend.jsonl`);
   let offset = 0;
   try {
     offset = fs.statSync(file).size;
@@ -502,7 +534,7 @@ async function paneSnapshot(ref, opts = {}) {
 async function paneInput(ref, input = {}) {
   const { key, text } = validatePaneInput(input);
   if (!(await paneExists(ref.session, ref.window))) {
-    throw new Error(`pane ${stateKey(ref.session, ref.window)} is gone`);
+    throw new Error(`pane ${keyOf(ref)} is gone`);
   }
   const target = paneTarget(ref.session, ref.window);
   if (key) await t.sendKey(target, key);
@@ -527,6 +559,8 @@ module.exports = {
   shellQuote,
   newSessionName,
   stateKey,
+  keyOf,
+  readSessionId,
   paneTarget,
   paneCommand,
   hasSession,
@@ -536,6 +570,7 @@ module.exports = {
   createPane,
   killPane,
   adoptWindow,
+  panePids,
   launchAndSettle,
   verifyLive,
   onTurnEnd,

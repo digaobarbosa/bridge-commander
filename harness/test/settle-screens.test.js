@@ -181,3 +181,146 @@ test('the real ready footer is not mistaken for the consent screen', () => {
   assert.ok(!SETTLE.fatalRe.test(READY), 'a working session must never read as fatal');
   assert.ok(SETTLE.readyRe.test(READY));
 });
+
+// Agents launch with --permission-mode <mode> now (bypass is opt-in), and each
+// mode draws its own footer. The default mode draws none, so its composer's
+// column-zero ❯ is the only signature — the same anchor the picker test pins.
+const footerScreen = (footer) => `
+───────────────────────────────────────────────────────────────────────
+❯
+───────────────────────────────────────────────────────────────────────
+  Opus 5 | █████░░░░░░░░░░░░░░░ 27% | 270k/1000k
+${footer}
+`;
+
+test('every permission mode\'s ready UI reads as ready, and none reads as fatal', () => {
+  const screens = {
+    auto: footerScreen('  ⏵⏵ auto mode on (shift+tab to cycle)'),
+    acceptEdits: footerScreen('  ⏵⏵ accept edits on (shift+tab to cycle)'),
+    default: footerScreen('  ? for shortcuts'),
+    bypass: READY,
+  };
+  for (const [mode, screen] of Object.entries(screens)) {
+    assert.ok(SETTLE.readyRe.test(screen), mode + ' mode UI must read as ready');
+    assert.ok(!SETTLE.fatalRe.test(screen), mode + ' mode UI must never read as fatal');
+  }
+  // The footer alone, before the composer is drawn, is enough for the modes that have one.
+  assert.ok(SETTLE.readyRe.test('⏵⏵ auto mode on (shift+tab to cycle)'));
+  assert.ok(SETTLE.readyRe.test('⏵⏵ accept edits on (shift+tab to cycle)'));
+});
+
+// Captured from a failed worker start on claude 2.1.282: the trust screen now
+// preselects "No, exit". The old settle answered it with Enter, claude quit to
+// the shell, and every card start timed out at 45s.
+const TRUST_NO_PRESELECTED = `
+ Accessing workspace:
+
+ /Users/digao/dev/fleet/.bridge-commander/worktrees/BR2-1
+
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+`;
+const TRUST_YES_SELECTED = TRUST_NO_PRESELECTED
+  .replace(' ❯ No, exit', '   No, exit')
+  .replace('   Yes, I trust this folder', ' ❯ Yes, I trust this folder');
+
+test('the decline signature finds a cursor on "No" and nothing else', () => {
+  assert.ok(SETTLE.trustRe.test(TRUST_NO_PRESELECTED));
+  assert.ok(SETTLE.declineRe.test(TRUST_NO_PRESELECTED));
+  for (const [name, screen] of Object.entries({ TRUST_YES_SELECTED, RESUME_PICKER, READY })) {
+    assert.ok(!SETTLE.declineRe.test(screen), name + ' must be answered with Enter, not walked');
+  }
+});
+
+test('a trust screen with "No, exit" preselected is walked to Yes before Enter', async () => {
+  const claude = require(path.join(__dirname, '..', 'claude-tmux.js'));
+  const { mockTmux } = require('./tmux-mock.js');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-settle-'));
+  const m = mockTmux({ readyTail: [TRUST_NO_PRESELECTED, TRUST_YES_SELECTED, READY] });
+  try {
+    await claude.spawn(dir, 'hi', { session: 'bc-w', stateDir: dir, installHooks: false });
+    const keys = m.calls.filter((c) => c.fn === 'sendKey').map((c) => c.args[1]);
+    // Enter #1 submits the launch line; after that, Down must come before any Enter.
+    const afterLaunch = keys.slice(1);
+    assert.strictEqual(afterLaunch[0], 'Down', `Enter on "No, exit" quits claude (keys: ${keys.join(',')})`);
+    assert.ok(afterLaunch.includes('Enter'), 'and the Yes is then accepted');
+  } finally {
+    m.restore();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------- codex ----------
+// The strings below are pinned against the codex 0.155.1 binary (`strings`),
+// not recalled: the login picker, the update modal, and a resume of a thread
+// codex has no rollout for.
+const codexSettle = require(path.join(__dirname, '..', 'codex-tmux.js')).SETTLE;
+const CODEX_READY = '\n>_ OpenAI Codex (v0.155.1)\n\n  YOLO mode\n\n› Ask Codex to do anything\n';
+const CODEX_FATAL = {
+  missing: 'zsh: command not found: codex',
+  login: 'Sign in with ChatGPT to use Codex as part of your paid plan\n  2. Provide your own API key',
+  update: '✨ Update available! 0.155.1 -> 0.156.0\n\n› 1. Update now (runs `brew upgrade codex`)\n  2. Skip\n  3. Skip until next version',
+  resume: 'Error: No saved session found with ID 019f49a7-81f4-7ad3-822d-3acf8cf81ed6',
+};
+
+test('codex: the screens that can never come up are fatal', () => {
+  for (const [name, screen] of Object.entries(CODEX_FATAL)) {
+    assert.ok(codexSettle.fatalRe.test(screen), name + ' must end the wait at once');
+  }
+});
+
+test('codex: the ready UI and the trust prompt are not fatal', () => {
+  assert.ok(codexSettle.readyRe.test(CODEX_READY));
+  assert.ok(!codexSettle.fatalRe.test(CODEX_READY));
+  const trust = '> You are in /tmp/x\n\n  Do you trust the contents of this directory?\n\n› 1. Yes, continue\n  2. No, quit';
+  assert.ok(codexSettle.trustRe.test(trust));
+  assert.ok(!codexSettle.fatalRe.test(trust));
+  assert.ok(!codexSettle.declineRe, 'codex preselects Yes; Enter answers its trust prompt');
+});
+
+// codex 0.157.1 reworded the trust screen, and its menu cursor is the composer glyph.
+test('codex: the 0.157 folder-access screen is the trust prompt, not the ready UI', () => {
+  const trust = '  Folder access\n  /private/tmp/x\n\n  Trust this folder? Codex can read, edit, and run files here.\n\n'
+    + '› 1. Trust and continue\n  2. Quit\n\n  enter continue · esc quit';
+  assert.ok(codexSettle.trustRe.test(trust));
+  assert.ok(!codexSettle.readyRe.test(trust), 'a menu cursor is not the composer');
+  assert.ok(!codexSettle.fatalRe.test(trust));
+  assert.ok(codexSettle.readyRe.test('some output\n› '), 'the bare composer glyph still reads as ready');
+});
+
+// codex 0.157 flashes a composer-like frame (~200ms) before its trust screen.
+// A loop that trusts one read types the brief into the menu that follows.
+test('codex: a ready frame that does not hold is not ready — the trust screen after it is answered', async () => {
+  const codex = require(path.join(__dirname, '..', 'codex-tmux.js'));
+  const { mockTmux } = require('./tmux-mock.js');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-settle-'));
+  const FLASH = '\n›\n';
+  const TRUST = '  Folder access\n\n  Trust this folder? Codex can read, edit, and run files here.\n\n› 1. Trust and continue\n  2. Quit';
+  const m = mockTmux({ readyTail: [FLASH, TRUST, TRUST, CODEX_READY] });
+  try {
+    await codex.spawn(dir, 'go', { session: 'bc-flash', window: 'w-1', stateDir: dir });
+    const enters = m.calls.filter((c) => c.fn === 'sendKey' && c.args[1] === 'Enter');
+    assert.ok(enters.length >= 2, `the trust screen was never answered (${enters.length} Enter sent)`);
+    const typedBrief = m.calls.findIndex((c) => c.fn === 'submit');
+    const answeredTrust = m.calls.findIndex((c, i) => i > 0 && c.fn === 'sendKey' && c.args[1] === 'Enter'
+      && m.calls.slice(0, i).some((x) => x.fn === 'sendLiteral'));
+    assert.ok(answeredTrust > -1 && typedBrief > answeredTrust, 'the brief goes in after the trust screen, not into it');
+  } finally {
+    m.restore();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

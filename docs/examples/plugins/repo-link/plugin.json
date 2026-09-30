@@ -1,0 +1,21 @@
+{
+  "id": "repo-link",
+  "name": "Repo link",
+  "description": "A header button and a palette command that open the repository on GitHub. Manifest only: copy it and change the url.",
+  "version": "1.0.0",
+  "contributes": {
+    "commands": [
+      {
+        "id": "repo-link.open",
+        "title": "Open the repo on GitHub",
+        "icon": "🐙",
+        "description": "Open the repository in a new tab.",
+        "run": { "open": "https://github.com/digaobarbosa/bridge-commander" }
+      }
+    ],
+    "menus": {
+      "topbar/v1": [{ "command": "repo-link.open" }],
+      "palette/v1": [{ "command": "repo-link.open" }]
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "id": "boom",
+  "activation": "boot",
+  "server": "server.js"
+}

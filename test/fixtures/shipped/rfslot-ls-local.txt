@@ -1,0 +1,7 @@
+router  up on :443
+you     digao (lease owner; RFSLOT_OWNER sets it)
+slot1   container up    loaded: mirror of /w/CMD-40 (watching pid 812)    lease: CMD-40 until 2026-09-26 18:00  RAM: 7.9 GB     services: emulators app
+slot2   container down  loaded: master                                    lease: free                          RAM: n/a        services: none
+slot3   container up    loaded: master                                    lease: expired (CMD-12)              RAM: 5.1 GB     services: emulators
+slot4   container up    loaded: master                                    lease: free                          RAM: 4.0 GB     services: none
+cloud digao-a    suspended  owner: digao         loaded: master                            lease: expired (digao)               iad performance-8x/16384MB  $0,006/h  services: (suspended: emulators app)

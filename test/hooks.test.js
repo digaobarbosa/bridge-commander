@@ -1,19 +1,30 @@
 'use strict';
-// Card-lifecycle hooks — the workspace's own executable scripts in
-// .bridge-commander/hooks/<event>/ run on worker-done / worker-died /
+// Hooks — the workspace's own executable scripts under .bridge-commander/hooks/.
+//
+// Lifecycle hooks live in hooks/<event>/ and run on worker-done / worker-died /
 // card-archived, alphabetical, sequential, context via BC_* env, fire-and-
 // forget (per-hook timeout then kill). Results land as timeline events:
 // hook-ran (level 2) / hook-failed (level 1 — the bell). The one ordering
 // guarantee: card-archived hooks finish BEFORE the worktree release.
+//
+// Named hooks are executable files DIRECTLY in hooks/: nothing fires them but a
+// caller. Directory means event, file means name, and listHooks() only ever
+// reads the directories, so the two cannot collide. `bc-axi hook run <name>`,
+// the board's ▶ and a schedule are the three callers: one code path, and the
+// trace line is identical but for which one it was.
+//
+// The trace is .bridge-commander/hookruns.jsonl, written by the RUNNER — so the
+// lifecycle hooks a workspace already had land in it too and stop being
+// invisible — and read back from the TAIL.
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const { runHooks } = require('../server/hooks.js');
-const { startServerWithLieutenant, startServer, withOwner, sleep, LT } = require('./helper');
-const { lieutenantSession, workerWindow } = require('../server/names.js');
+const { runHooks, runNamedHook, runTeardown, listAllHooks, listHooks, readRuns } = require('../server/hooks.js');
+const { startServerWithLieutenant, startServerWithProject, startServer, withOwner, runCli, sleep, until, makeRepo, LT } = require('./helper');
+const { lieutenantSession, workerWindow } = require('../server/layout.js');
 
 // A worker's harness key: a WINDOW in its lieutenant's session — the form the
 // fake harness's marker files carry, so a test can make a session dead.
@@ -21,6 +32,8 @@ function workerKey(dir, cardId) {
   return lieutenantSession(dir, LT) + ':' + workerWindow(cardId);
 }
 
+// event '' writes a named hook (a file directly in hooks/); any other event
+// writes a lifecycle hook into hooks/<event>/.
 function writeHook(ws, event, name, body, mode = 0o755) {
   const dir = path.join(ws, '.bridge-commander', 'hooks', event);
   fs.mkdirSync(dir, { recursive: true });
@@ -33,19 +46,15 @@ function shHook(ws, event, name, script, mode) {
   return writeHook(ws, event, name, '#!/bin/sh\n' + script + '\n', mode);
 }
 
-async function until(what, fn, ms = 6000) {
-  const deadline = Date.now() + ms;
-  for (;;) {
-    const v = await fn();
-    if (v) return v;
-    if (Date.now() > deadline) throw new Error('timeout waiting for: ' + what);
-    await sleep(50);
-  }
+function scratchWs() { return fs.mkdtempSync(path.join(os.tmpdir(), 'bc-hooks-')); }
+function runsFile(ws) { return path.join(ws, '.bridge-commander', 'hookruns.jsonl'); }
+function lines(ws) {
+  return fs.readFileSync(runsFile(ws), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
 }
 
-// ---------- unit: runHooks against a scratch workspace ----------
+// ================= unit: server/hooks.js against a scratch workspace =================
 
-function scratchWs() { return fs.mkdtempSync(path.join(os.tmpdir(), 'bc-hooks-')); }
+// ---------- runHooks: the lifecycle runner ----------
 
 test('runHooks: missing hooks dir is a no-op', async () => {
   const ws = scratchWs();
@@ -93,38 +102,19 @@ test('runHooks: alphabetical order, sequential; non-executable skipped silently'
   } finally { fs.rmSync(ws, { recursive: true, force: true }); }
 });
 
-test('runHooks: failing hook reports ok:false + exit code, later hooks still run', async () => {
+// The runner is shared by lifecycle and named hooks (runOne + traceRun), so a
+// failure, a timeout and a broken interpreter are each pinned once.
+test('runHooks: failing hook reports ok:false + exit code and is traced; later hooks still run', async () => {
   const ws = scratchWs();
   try {
     shHook(ws, 'worker-done', '1-bad.sh', 'echo boom >&2\nexit 3');
     shHook(ws, 'worker-done', '2-good.sh', 'exit 0');
-    const results = await runHooks('worker-done', { workspace: ws, card: 'c1' });
-    assert.deepStrictEqual(results.map((r) => [r.hook, r.ok, r.code]),
-      [['1-bad.sh', false, 3], ['2-good.sh', true, 0]]);
+    const results = await runHooks('worker-done', { workspace: ws, card: 'c1' }); // resolves — a bad exit is a RESULT
+    assert.deepStrictEqual(results.map((r) => [r.hook, r.ok, r.code, r.timedOut]),
+      [['1-bad.sh', false, 3, false], ['2-good.sh', true, 0, false]]);
     assert.strictEqual(results[0].output, 'boom'); // stderr captured too
-  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
-});
-
-test('runHooks: broken interpreter is a failed result, not a crash', async () => {
-  const ws = scratchWs();
-  try {
-    writeHook(ws, 'worker-done', 'broken.sh', '#!/no/such/interpreter\necho hi\n');
-    const results = await runHooks('worker-done', { workspace: ws, card: 'c1' });
-    assert.strictEqual(results.length, 1);
-    assert.strictEqual(results[0].ok, false);
-    assert.ok(results[0].error || results[0].code !== 0, 'spawn failure surfaced');
-  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
-});
-
-test('runHooks: timeout kills the hook (injectable timeoutMs)', async () => {
-  const ws = scratchWs();
-  try {
-    shHook(ws, 'worker-done', 'hang.sh', 'sleep 30');
-    const t0 = Date.now();
-    const results = await runHooks('worker-done', { workspace: ws, card: 'c1' }, { timeoutMs: 300 });
-    assert.ok(Date.now() - t0 < 5000, 'did not wait for the sleep');
-    assert.strictEqual(results[0].ok, false);
-    assert.strictEqual(results[0].timedOut, true);
+    assert.deepStrictEqual(lines(ws).map((r) => [r.hook, r.ok, r.code, r.output]),
+      [['1-bad.sh', false, 3, 'boom'], ['2-good.sh', true, 0, '']], 'the exit code and output tail are on the trace');
   } finally { fs.rmSync(ws, { recursive: true, force: true }); }
 });
 
@@ -139,32 +129,303 @@ test('runHooks: output capped at a few KB', async () => {
   } finally { fs.rmSync(ws, { recursive: true, force: true }); }
 });
 
-// ---------- integration: the server fires hooks on lifecycle events ----------
+// ---------- the namespace ----------
 
-function makeRepo(root) {
-  const repo = path.join(root, 'srcrepo');
-  fs.mkdirSync(repo, { recursive: true });
-  execFileSync('git', ['init', '-q', '-b', 'main', repo], { stdio: ['ignore', 'pipe', 'pipe'] });
-  fs.writeFileSync(path.join(repo, 'README.md'), 'hi\n');
-  execFileSync('git', ['-C', repo, 'add', '.'], { stdio: ['ignore', 'pipe', 'pipe'] });
-  execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'],
-    { stdio: ['ignore', 'pipe', 'pipe'] });
-  return repo;
+test('directory means event, file means name — the two live in one hooks/ and never collide', async () => {
+  const ws = scratchWs();
+  try {
+    shHook(ws, '', 'gh-watch', 'echo named');
+    shHook(ws, 'worker-done', 'sweep.sh', 'echo lifecycle');
+    assert.deepStrictEqual(listAllHooks(ws).map((h) => [h.name, h.event]),
+      [['gh-watch', ''], ['sweep.sh', 'worker-done']]);
+    // the lifecycle side is unchanged: worker-done still runs its own dir, and
+    // the named hook sitting one level up is not part of any event
+    const r = await runHooks('worker-done', { workspace: ws, card: 'c1' });
+    assert.deepStrictEqual(r.map((x) => [x.hook, x.output]), [['sweep.sh', 'lifecycle']]);
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+test('a non-executable file in hooks/ is not a named hook, and neither is a name that is not an id', async () => {
+  const ws = scratchWs();
+  try {
+    const f = shHook(ws, '', 'inert', 'echo nope');
+    fs.chmodSync(f, 0o644);
+    shHook(ws, '', 'real', 'echo yes');
+    assert.deepStrictEqual(listAllHooks(ws).map((h) => h.name), ['real']);
+    await assert.rejects(() => runNamedHook(ws, 'inert', {}), (e) => e.code === 'ENOHOOK');
+    await assert.rejects(() => runNamedHook(ws, '../real', {}), (e) => e.code === 'ENOHOOK');
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+// The listing is what the tab and `hook list` read, and every row it prints
+// carries a ✎ that goes through the artifact gate — which matches the board's id
+// shape. A lifecycle hook the gate would refuse is left off the listing rather
+// than offered with a pencil that 404s; the RUNNER is untouched and still runs
+// whatever the workspace installed.
+test('a lifecycle hook whose name the editor gate would refuse is not listed — but still runs', async () => {
+  const ws = scratchWs();
+  try {
+    shHook(ws, 'worker-done', '10 deploy.sh', 'echo spacey');
+    shHook(ws, 'worker-done', 'sweep.sh', 'echo fine');
+    assert.deepStrictEqual(listAllHooks(ws).map((h) => [h.name, h.event]), [['sweep.sh', 'worker-done']]);
+    assert.deepStrictEqual(listHooks(ws, 'worker-done').map((f) => path.basename(f)),
+      ['10 deploy.sh', 'sweep.sh'], 'the runner still sees both');
+    const r = await runHooks('worker-done', { workspace: ws, card: 'c1' });
+    assert.deepStrictEqual(r.map((x) => x.output), ['spacey', 'fine']);
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+test('an unknown name is an error naming the hooks directory, never a silent success', async () => {
+  const ws = scratchWs();
+  try {
+    shHook(ws, '', 'real', 'echo yes');
+    await assert.rejects(() => runNamedHook(ws, 'ghost', {}), (e) => {
+      assert.strictEqual(e.code, 'ENOHOOK');
+      assert.match(e.message, /no hook "ghost"/);
+      assert.ok(e.message.includes(path.join(ws, '.bridge-commander', 'hooks')), 'the directory is named');
+      return true;
+    });
+    assert.ok(!fs.existsSync(runsFile(ws)), 'and nothing was traced for a hook that never ran');
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+// ---------- env and the trace ----------
+
+test('a named hook gets its OWN name in BC_EVENT, empty card context, and bc-axi on its PATH', async () => {
+  const ws = scratchWs();
+  try {
+    shHook(ws, '', 'gh-watch',
+      'echo "$BC_EVENT|$BC_CARD|$BC_WORKTREE|$BC_BRANCH" > env.out\n'
+      + 'command -v bc-axi > cli.out');
+    const run = await runNamedHook(ws, 'gh-watch', {});
+    assert.strictEqual(run.ok, true);
+    assert.strictEqual(fs.readFileSync(path.join(ws, 'env.out'), 'utf8').trim(), 'gh-watch|||');
+    assert.match(fs.readFileSync(path.join(ws, 'cli.out'), 'utf8').trim(), /bc-axi$/,
+      'a hook is bash with the board CLI on its PATH — that is the whole API');
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+// The PATH guarantee is *reachable*, not *mine*: a `bc-axi` the operator put
+// earlier on PATH is the one that runs. Shadowing it would make a hook resolve
+// a name differently from the shell he tested it in.
+test('the CLI is APPENDED to PATH, so an operator-installed bc-axi still wins', async () => {
+  const ws = scratchWs();
+  const mine = path.join(ws, 'bin');
+  const savedPath = process.env.PATH;
+  try {
+    fs.mkdirSync(mine, { recursive: true });
+    fs.writeFileSync(path.join(mine, 'bc-axi'), '#!/bin/sh\necho operator\n');
+    fs.chmodSync(path.join(mine, 'bc-axi'), 0o755);
+    process.env.PATH = mine + path.delimiter + savedPath;
+    shHook(ws, '', 'which-cli', 'command -v bc-axi > cli.out');
+    const run = await runNamedHook(ws, 'which-cli', {});
+    assert.strictEqual(run.ok, true);
+    assert.strictEqual(fs.readFileSync(path.join(ws, 'cli.out'), 'utf8').trim(),
+      path.join(mine, 'bc-axi'), 'the board makes its CLI reachable, it does not take the name');
+  } finally {
+    process.env.PATH = savedPath;
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('a card supplied by the caller fills BC_CARD/BC_WORKTREE/BC_BRANCH', async () => {
+  const ws = scratchWs();
+  try {
+    shHook(ws, '', 'ctx', 'echo "$BC_CARD|$BC_WORKTREE|$BC_BRANCH" > env.out');
+    await runNamedHook(ws, 'ctx', { card: 'MNC-9', worktree: '/w', branch: 'bc/MNC-9' });
+    assert.strictEqual(fs.readFileSync(path.join(ws, 'env.out'), 'utf8').trim(), 'MNC-9|/w|bc/MNC-9');
+    assert.strictEqual(lines(ws)[0].card, 'MNC-9');
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+test('a lifecycle hook firing appends a trace line with trigger = its event', async () => {
+  const ws = scratchWs();
+  try {
+    shHook(ws, 'worker-done', 'sweep.sh', 'echo swept');
+    shHook(ws, 'card-archived', 'bury.sh', 'echo buried');
+    await runHooks('worker-done', { workspace: ws, card: 'c1' });
+    await runHooks('card-archived', { workspace: ws, card: 'c1' });
+    assert.deepStrictEqual(lines(ws).map((r) => [r.hook, r.trigger, r.card, r.ok, r.code]), [
+      ['sweep.sh', 'worker-done', 'c1', true, 0],
+      ['bury.sh', 'card-archived', 'c1', true, 0],
+    ]);
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+test('a hook that hangs past the timeout lands timedOut with what it managed to say', async () => {
+  const ws = scratchWs();
+  try {
+    shHook(ws, '', 'hang', 'echo starting\nsleep 30');
+    const t0 = Date.now();
+    const run = await runNamedHook(ws, 'hang', {}, { timeoutMs: 300 });
+    assert.ok(Date.now() - t0 < 5000, 'did not wait for the sleep');
+    assert.strictEqual(run.timedOut, true);
+    assert.strictEqual(run.ok, false);
+    const rec = lines(ws)[0];
+    assert.strictEqual(rec.timedOut, true);
+    assert.match(rec.output, /starting/, 'the output tail is on the line');
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+test('a broken interpreter is a traced failure, not a crash', async () => {
+  const ws = scratchWs();
+  try {
+    writeHook(ws, '', 'broken', '#!/no/such/interpreter\necho hi\n');
+    const run = await runNamedHook(ws, 'broken', {});
+    assert.strictEqual(run.ok, false);
+    assert.ok(run.error, 'the spawn failure is on the record');
+    assert.ok(lines(ws)[0].error, 'and on the trace line');
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+// ---------- one run per name ----------
+
+test('a second run of a name already in flight is refused, naming the one that is running', async () => {
+  const ws = scratchWs();
+  try {
+    shHook(ws, '', 'slow', 'sleep 1');
+    const first = runNamedHook(ws, 'slow', { card: 'MNC-1' }, { trigger: 'schedule' });
+    await sleep(150);
+    await assert.rejects(() => runNamedHook(ws, 'slow', {}, { trigger: 'board' }), (e) => {
+      assert.strictEqual(e.code, 'EBUSY');
+      assert.match(e.message, /already running/);
+      assert.match(e.message, /trigger schedule/, 'it says WHAT is running');
+      assert.match(e.message, /card MNC-1/);
+      return true;
+    });
+    await first;
+    // …and once it is done the name is free again
+    const again = await runNamedHook(ws, 'slow', {}, { trigger: 'board', timeoutMs: 300 });
+    assert.ok(again, 'the lock released with the run');
+    assert.strictEqual(lines(ws).length, 2, 'the refusal traced nothing — it never ran');
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+// ---------- reading the trace off the tail ----------
+
+test('readRuns answers off the TAIL — a huge trace is never loaded whole', async () => {
+  const ws = scratchWs();
+  try {
+    fs.mkdirSync(path.join(ws, '.bridge-commander'), { recursive: true });
+    // ~3MB of history, then the three runs anybody cares about
+    const filler = [];
+    for (let i = 0; i < 12000; i++) {
+      filler.push(JSON.stringify({ hook: 'old', trigger: 'cli', card: '', started: '2020-01-01T00:00:00.000Z',
+        ms: 1, code: 0, ok: true, timedOut: false, output: 'x'.repeat(200) }));
+    }
+    fs.writeFileSync(runsFile(ws), filler.join('\n') + '\n');
+    for (const [hook, code] of [['a', 0], ['b', 3], ['a', 0]]) {
+      fs.appendFileSync(runsFile(ws), JSON.stringify({ hook, trigger: 'cli', card: '',
+        started: '2026-01-01T00:00:00.000Z', ms: 5, code, ok: code === 0, timedOut: false, output: '' }) + '\n');
+    }
+    assert.ok(fs.statSync(runsFile(ws)).size > 2e6, 'the trace is genuinely large');
+
+    // The proof, not a stopwatch: slurping the file is the thing readRuns must
+    // not do, so make slurping the file impossible.
+    const real = fs.readFileSync;
+    fs.readFileSync = () => { throw new Error('readRuns read the whole file'); };
+    let newest, mine;
+    try {
+      newest = readRuns(ws, { limit: 3 });
+      mine = readRuns(ws, { hook: 'b', limit: 5 });
+    } finally { fs.readFileSync = real; }
+
+    assert.deepStrictEqual(newest.map((r) => [r.hook, r.code]), [['a', 0], ['b', 3], ['a', 0]].reverse());
+    assert.deepStrictEqual(mine.map((r) => r.hook), ['b']);
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+test('a torn line is skipped, and the rest of the trace still reads', async () => {
+  const ws = scratchWs();
+  try {
+    fs.mkdirSync(path.join(ws, '.bridge-commander'), { recursive: true });
+    fs.writeFileSync(runsFile(ws),
+      JSON.stringify({ hook: 'a', trigger: 'cli', code: 0, ok: true }) + '\n'
+      + '{"hook":"torn","trig\n'
+      + JSON.stringify({ hook: 'c', trigger: 'cli', code: 0, ok: true }) + '\n');
+    assert.deepStrictEqual(readRuns(ws, { limit: 10 }).map((r) => r.hook), ['c', 'a']);
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+// ---------- runTeardown: a playbook's teardown ----------
+// The per-playbook counterpart of a hook: the command that stops what THAT
+// playbook's run started, run in the worktree immediately before the release.
+// Best effort in every direction — the release makes its own decision, as it
+// always has.
+
+test('runTeardown: a shell command line, cwd = the worktree, BC_* env, BC_EVENT=teardown', async () => {
+  const ws = scratchWs();
+  try {
+    const wt = path.join(ws, 'wt');
+    fs.mkdirSync(wt);
+    const r = await runTeardown('echo "$BC_EVENT|$BC_CARD|$BC_BRANCH" > env.out && pwd && echo stopped',
+      { workspace: ws, card: 'c1', repo: '/r', worktree: wt, branch: 'bc/c1' });
+    assert.strictEqual(r.ok, true);
+    assert.strictEqual(r.code, 0);
+    assert.match(r.output, /stopped/);
+    assert.ok(r.ms >= 0, 'the run is timed');
+    // written relative to cwd — the worktree, not the workspace
+    assert.strictEqual(fs.readFileSync(path.join(wt, 'env.out'), 'utf8').trim(), 'teardown|c1|bc/c1');
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+test('runTeardown: non-zero exit and a timeout are RESULTS, never throws', async () => {
+  const ws = scratchWs();
+  try {
+    const bad = await runTeardown('echo down the drain >&2; exit 4', { workspace: ws, card: 'c1' });
+    assert.deepStrictEqual([bad.ok, bad.code], [false, 4]);
+    assert.strictEqual(bad.output, 'down the drain');
+
+    const t0 = Date.now();
+    const hung = await runTeardown('sleep 30', { workspace: ws, card: 'c1' }, { timeoutMs: 300 });
+    assert.ok(Date.now() - t0 < 5000, 'did not wait for the sleep');
+    assert.deepStrictEqual([hung.ok, hung.timedOut], [false, true]);
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+test('runTeardown: output keeps the TAIL — where a teardown gives up is the end', async () => {
+  const ws = scratchWs();
+  try {
+    const r = await runTeardown(
+      'i=0; while [ $i -lt 2000 ]; do echo aaaaaaaaaaaaaaaa; i=$((i+1)); done; echo LAST-LINE',
+      { workspace: ws, card: 'c1' });
+    assert.strictEqual(r.truncated, true);
+    assert.ok(r.output.length <= 4096, 'capped');
+    assert.match(r.output, /LAST-LINE$/, 'the tail survived, not the head');
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+test('runTeardown is traced like every run: hook teardown, trigger teardown, the card', async () => {
+  const ws = scratchWs();
+  try {
+    fs.mkdirSync(path.join(ws, '.bridge-commander'));
+    const r = await runTeardown('echo stopping; exit 3', { workspace: ws, card: 'c7' });
+    assert.strictEqual(r.hook, 'echo stopping; exit 3', 'the caller still gets the runner result');
+    const [rec] = lines(ws);
+    assert.deepStrictEqual([rec.hook, rec.trigger, rec.card, rec.ok, rec.code, rec.output],
+      ['teardown', 'teardown', 'c7', false, 3, 'stopping']);
+  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
+});
+
+test('runOne streams every chunk through opts.onOutput, past the result cap', async () => {
+  const { runOne } = require('../server/hooks.js');
+  const chunks = [];
+  const r = await runOne('big', '/bin/sh', ['-c', 'i=0; while [ $i -lt 1000 ]; do echo 0123456789; i=$((i+1)); done; echo é >&2'],
+    process.env, os.tmpdir(), 10000, { onOutput: (c) => chunks.push(c) });
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.truncated, true, 'the result keeps its 4 KB cap');
+  const all = chunks.join('');
+  assert.strictEqual(all.split('\n').filter((l) => l === '0123456789').length, 1000, 'the stream is whole');
+  assert.match(all, /é/, 'utf8 decoded');
+});
+
+// ================= integration: through a real server =================
+
+function bootWithProject(env = {}) {
+  return startServerWithProject({ prefix: 'bc-hooks-int-', env });
 }
 
-async function bootWithProject(extraEnv = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-hooks-int-'));
-  const repo = makeRepo(root);
-  const s = await startServerWithLieutenant({
-    env: Object.assign({
-      BC_FAKE_STATE: path.join(root, 'fake'), BC_WORKTREE_TOOL: 'git',
-      BC_SUPERVISE_INTERVAL_MS: '0', BC_PRWATCH_INTERVAL_MS: '0',
-    }, extraEnv),
-  });
-  await s.api('POST', '/api/projects', { source: repo, name: 'proj' });
-  const teardown = async () => { await s.stop(); fs.rmSync(root, { recursive: true, force: true }); };
-  return { s, root, teardown };
-}
+// ---------- lifecycle hooks fire on card events ----------
 
 test('worker-done hooks: env context from the worker record, hook-ran level-2 card event', async () => {
   const { s, root, teardown } = await bootWithProject();
@@ -367,13 +628,118 @@ test('card-archived hooks run BEFORE the worktree release on the merged-PR path'
   }
 });
 
-// ---------- a playbook's teardown ----------
-// The per-playbook counterpart of a hook: the command that stops what THAT
-// playbook's run started, run in the worktree immediately before the release.
-// Best effort in every direction — the release makes its own decision, as it
-// always has.
+// ---------- named hooks: the three callers ----------
 
-const { runTeardown } = require('../server/hooks.js');
+test('CLI and board produce identical trace lines but for the trigger', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    shHook(s.dir, '', 'gh-watch', 'echo checked');
+    const cli = await runCli(['hook', 'run', 'gh-watch', '--workspace', s.dir, '--port', String(s.port)]);
+    assert.strictEqual(cli.code, 0, cli.stderr);
+    assert.match(cli.stdout, /checked/);
+    assert.match(cli.stdout, /exit 0/);
+
+    const board = await s.api('POST', '/api/hooks/run', { name: 'gh-watch', trigger: 'board' });
+    assert.strictEqual(board.status, 200, JSON.stringify(board.body));
+
+    const [a, b] = lines(s.dir);
+    assert.strictEqual(a.trigger, 'cli');
+    assert.strictEqual(b.trigger, 'board');
+    const same = (r) => ({ hook: r.hook, card: r.card, ok: r.ok, code: r.code, timedOut: r.timedOut, output: r.output });
+    assert.deepStrictEqual(same(a), same(b), 'the trigger is the ONLY difference');
+    assert.deepStrictEqual(same(a),
+      { hook: 'gh-watch', card: '', ok: true, code: 0, timedOut: false, output: 'checked' });
+  } finally { await s.stop(); }
+});
+
+test('hook run over the CLI: a failing hook exits 1 and the trace says why; a busy name is refused', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    shHook(s.dir, '', 'boom', 'echo nope >&2\nexit 4');
+    // Three seconds, where the in-process refusal test upstairs needs one: this
+    // assertion has to outlive a COLD node spawning the CLI — config read, port
+    // resolution, the request — before the 409 can be observed at all. The two
+    // tests do not pay the same cost, so they do not carry the same margin.
+    // Three seconds of wall in one test is nothing; a flake costs an hour every
+    // time it fires, on a branch whose author has no reason to suspect it.
+    shHook(s.dir, '', 'slow', 'sleep 3');
+    const ws = ['--workspace', s.dir, '--port', String(s.port)];
+
+    const bad = await runCli(['hook', 'run', 'boom', ...ws]);
+    assert.strictEqual(bad.code, 1, 'the caller inherits the hook’s failure');
+    assert.match(bad.stdout, /exit 4/);
+
+    const ghost = await runCli(['hook', 'run', 'ghost', ...ws]);
+    assert.strictEqual(ghost.code, 1);
+    assert.match(ghost.stderr, /no hook "ghost"/);
+
+    const inFlight = s.api('POST', '/api/hooks/run', { name: 'slow', trigger: 'schedule' });
+    await sleep(200);
+    const clash = await runCli(['hook', 'run', 'slow', ...ws]);
+    assert.strictEqual(clash.code, 1);
+    assert.match(clash.stderr, /already running/);
+    await inFlight;
+  } finally { await s.stop(); }
+});
+
+test('hook list and hook runs read the workspace and the trace', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    shHook(s.dir, '', 'gh-watch', 'echo checked');
+    shHook(s.dir, 'worker-done', 'sweep.sh', 'exit 0');
+    const ws = ['--workspace', s.dir, '--port', String(s.port)];
+
+    let list = await runCli(['hook', 'list', ...ws]);
+    assert.match(list.stdout, /gh-watch\tnamed\tnever ran/);
+    assert.match(list.stdout, /sweep\.sh\tworker-done\tnever ran/);
+
+    await runCli(['hook', 'run', 'gh-watch', '--trigger', 'cron', ...ws]);
+    list = await runCli(['hook', 'list', ...ws]);
+    assert.match(list.stdout, /gh-watch\tnamed\tran .* · exit 0/);
+    assert.match(list.stdout, /sweep\.sh\tworker-done\tnever ran/, 'a run of one is not a run of the other');
+
+    const runs = await runCli(['hook', 'runs', ...ws]);
+    assert.match(runs.stdout, /gh-watch\s+cron\s+exit 0/);
+    const mine = await runCli(['hook', 'runs', 'sweep.sh', ...ws]);
+    assert.match(mine.stdout, /no runs recorded for sweep\.sh/);
+  } finally { await s.stop(); }
+});
+
+test('hook run --card hands the hook the card’s real worktree and branch', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    const out = path.join(s.dir, 'ctx.out');
+    shHook(s.dir, '', 'ctx', 'echo "$BC_CARD|$BC_BRANCH" > ' + JSON.stringify(out));
+    await s.api('POST', '/api/cards', withOwner({ title: 'Watched', id: 'watched' }));
+    const r = await runCli(['hook', 'run', 'ctx', '--card', 'watched',
+      '--workspace', s.dir, '--port', String(s.port)]);
+    assert.strictEqual(r.code, 0, r.stderr);
+    assert.strictEqual(fs.readFileSync(out, 'utf8').trim(), 'watched|');
+
+    const unknown = await s.api('POST', '/api/hooks/run', { name: 'ctx', card: 'nope' });
+    assert.strictEqual(unknown.status, 404);
+  } finally { await s.stop(); }
+});
+
+test('GET /api/hooks: every hook, its kind, and its newest trace line', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    shHook(s.dir, '', 'gh-watch', 'exit 2');
+    shHook(s.dir, 'worker-done', 'sweep.sh', 'exit 0');
+    await s.api('POST', '/api/hooks/run', { name: 'gh-watch', trigger: 'board' });
+    const r = await s.api('GET', '/api/hooks');
+    assert.strictEqual(r.status, 200);
+    assert.strictEqual(r.body.dir, path.join(s.dir, '.bridge-commander', 'hooks'));
+    const by = Object.fromEntries(r.body.hooks.map((h) => [h.name, h]));
+    assert.strictEqual(by['gh-watch'].event, '');
+    assert.deepStrictEqual([by['gh-watch'].last.trigger, by['gh-watch'].last.code, by['gh-watch'].last.ok],
+      ['board', 2, false]);
+    assert.strictEqual(by['sweep.sh'].event, 'worker-done');
+    assert.strictEqual(by['sweep.sh'].last, null, 'it has not fired');
+  } finally { await s.stop(); }
+});
+
+// ---------- a playbook's teardown at the release points ----------
 
 function writePlaybook(s, id, text) {
   const dir = path.join(s.dir, '.bridge-commander', 'playbooks');
@@ -381,48 +747,6 @@ function writePlaybook(s, id, text) {
   fs.writeFileSync(path.join(dir, id + '.md'), text);
   return id;
 }
-
-test('runTeardown: a shell command line, cwd = the worktree, BC_* env, BC_EVENT=teardown', async () => {
-  const ws = scratchWs();
-  try {
-    const wt = path.join(ws, 'wt');
-    fs.mkdirSync(wt);
-    const r = await runTeardown('echo "$BC_EVENT|$BC_CARD|$BC_BRANCH" > env.out && pwd && echo stopped',
-      { workspace: ws, card: 'c1', repo: '/r', worktree: wt, branch: 'bc/c1' });
-    assert.strictEqual(r.ok, true);
-    assert.strictEqual(r.code, 0);
-    assert.match(r.output, /stopped/);
-    assert.ok(r.ms >= 0, 'the run is timed');
-    // written relative to cwd — the worktree, not the workspace
-    assert.strictEqual(fs.readFileSync(path.join(wt, 'env.out'), 'utf8').trim(), 'teardown|c1|bc/c1');
-  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
-});
-
-test('runTeardown: non-zero exit and a timeout are RESULTS, never throws', async () => {
-  const ws = scratchWs();
-  try {
-    const bad = await runTeardown('echo down the drain >&2; exit 4', { workspace: ws, card: 'c1' });
-    assert.deepStrictEqual([bad.ok, bad.code], [false, 4]);
-    assert.strictEqual(bad.output, 'down the drain');
-
-    const t0 = Date.now();
-    const hung = await runTeardown('sleep 30', { workspace: ws, card: 'c1' }, { timeoutMs: 300 });
-    assert.ok(Date.now() - t0 < 5000, 'did not wait for the sleep');
-    assert.deepStrictEqual([hung.ok, hung.timedOut], [false, true]);
-  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
-});
-
-test('runTeardown: output keeps the TAIL — where a teardown gives up is the end', async () => {
-  const ws = scratchWs();
-  try {
-    const r = await runTeardown(
-      'i=0; while [ $i -lt 2000 ]; do echo aaaaaaaaaaaaaaaa; i=$((i+1)); done; echo LAST-LINE',
-      { workspace: ws, card: 'c1' });
-    assert.strictEqual(r.truncated, true);
-    assert.ok(r.output.length <= 4096, 'capped');
-    assert.match(r.output, /LAST-LINE$/, 'the tail survived, not the head');
-  } finally { fs.rmSync(ws, { recursive: true, force: true }); }
-});
 
 test('teardown runs at the handoff, in the worktree, and lands an event even when it worked', async () => {
   const { s, root, teardown } = await bootWithProject();

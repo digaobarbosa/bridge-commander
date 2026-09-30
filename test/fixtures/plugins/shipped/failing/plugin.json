@@ -1,0 +1,7 @@
+{
+  "id": "failing",
+  "server": "server.js",
+  "contributes": {
+    "commands": [{ "id": "failing.x", "title": "X", "run": "server" }]
+  }
+}

@@ -3,16 +3,21 @@
 // OWN box, so the same percentage background-position works at any element
 // size — no per-size pixel math, and no 64-file slice to maintain.
 export const AVATAR_COUNT = 64;
-const AVATAR_COLS = 8;
+export const AVATAR_COLS = 8;
+
+/** The avatar index if `a` is a real one (integer in the sheet), else null — the colour dot. */
+export function validAvatar(a) {
+  return Number.isInteger(a) && a >= 0 && a < AVATAR_COUNT ? a : null;
+}
 
 export function avatarPosition(idx) {
   const col = idx % AVATAR_COLS, row = Math.floor(idx / AVATAR_COLS);
   return (col * 100 / (AVATAR_COLS - 1)).toFixed(3) + '% ' + (row * 100 / (AVATAR_COLS - 1)).toFixed(3) + '%';
 }
-// idx is a trusted in-range number here (callers gate with Number.isInteger);
-// position is computed, never interpolated from user input — no esc() needed.
+// position is computed from a validated index, never interpolated from user
+// input — no esc() needed.
 export function avatarHtml(idx, cls) {
-  if (!Number.isInteger(idx) || idx < 0 || idx >= AVATAR_COUNT) return '';
+  if (validAvatar(idx) === null) return '';
   return '<span class="avatar' + (cls ? ' ' + cls : '') + '" style="background-position:' + avatarPosition(idx) + '"></span>';
 }
 // picker grid: a "none" cell (clears the avatar) + all 64 heads. Selection is

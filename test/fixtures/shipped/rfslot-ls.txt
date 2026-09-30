@@ -1,0 +1,3 @@
+router  down
+you     digao (lease owner; RFSLOT_OWNER sets it)
+cloud digao-a    suspended  owner: digao         loaded: master                            lease: expired (digao)               iad performance-8x/16384MB  $0,006/h  services: (suspended: emulators app)

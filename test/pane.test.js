@@ -9,41 +9,15 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
-const os = require('node:os');
 const path = require('node:path');
-const { execFileSync } = require('node:child_process');
-const { startServerWithLieutenant, withOwner, sleep, LT } = require('./helper');
-const { lieutenantSession, workerWindow } = require('../server/names.js');
+const { startServerWithProject, withOwner, sleep, LT } = require('./helper');
+const { lieutenantSession, workerWindow } = require('../server/layout.js');
 
-function git(dir, ...args) {
-  return execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-}
-function makeRepo(root, name = 'srcrepo') {
-  const repo = path.join(root, name);
-  fs.mkdirSync(repo, { recursive: true });
-  execFileSync('git', ['init', '-q', '-b', 'main', repo], { stdio: ['ignore', 'pipe', 'pipe'] });
-  fs.writeFileSync(path.join(repo, 'README.md'), 'hello\n');
-  git(repo, 'add', '.');
-  git(repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init');
-  return repo;
-}
 
 // One temp tree per boot: fake-harness state + source repo + workspace.
 // BC_FAKE_PANE_MS keeps fake frames fast so tests never wait a real second.
 async function boot(extraEnv = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-pane-'));
-  const repo = makeRepo(root);
-  const fdir = path.join(root, 'fake');
-  const s = await startServerWithLieutenant({
-    env: Object.assign({
-      BC_FAKE_STATE: fdir, BC_WORKTREE_TOOL: 'git', BC_FAKE_PANE_MS: '25',
-      BC_SUPERVISE_INTERVAL_MS: '0', BC_PRWATCH_INTERVAL_MS: '0',
-    }, extraEnv),
-  });
-  const r = await s.api('POST', '/api/projects', { source: repo, name: 'proj' });
-  assert.strictEqual(r.status, 200, JSON.stringify(r.body));
-  const teardown = async () => { await s.stop(); fs.rmSync(root, { recursive: true, force: true }); };
-  return { s, root, repo, fdir, teardown };
+  return startServerWithProject({ prefix: 'bc-pane-', env: Object.assign({ BC_FAKE_PANE_MS: '25' }, extraEnv) });
 }
 
 // Start a fake worker on a fresh card and return its harness pane key.
@@ -220,6 +194,15 @@ test('no live worker / card not Working / unknown targets → no-pane', async ()
     ev = await c.waitFor('no-pane');
     assert.match(ev.data.reason, /no live session/);
     c.close();
+  } finally { await teardown(); }
+});
+
+// BR2-4: the browser retries a dropped pane in 1s, not Chrome's 3s default.
+test('a pane stream opens with retry: 1000, guard events included', async () => {
+  const { s, teardown } = await boot();
+  try {
+    const text = await (await fetch(s.base + '/api/cards/never-was/pane/stream')).text();
+    assert.match(text, /^retry: 1000\nevent: no-pane\n/);
   } finally { await teardown(); }
 });
 

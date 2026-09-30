@@ -5,11 +5,18 @@
 // Run the suite with:
 //   node --test test/*.test.js
 // (Node 24 does not expand a bare directory argument for --test.)
-const { spawn } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
 const net = require('node:net');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+
+// macOS hands out a temp dir under /var, a symlink to /private/var. The server
+// realpaths its workspace and refuses to write through a symlink, so a test
+// that builds paths from the linked form sees 403s and /private/var mismatches.
+// Resolve it once here: every test that requires the helper, and every child it
+// spawns, then gets the real path from os.tmpdir().
+process.env.TMPDIR = fs.realpathSync(os.tmpdir());
 
 const SERVER_JS = path.join(__dirname, '..', 'server', 'server.js');
 const CLI = path.join(__dirname, '..', 'cli', 'bc-axi');
@@ -206,4 +213,72 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-module.exports = { startServer, startServerWithLieutenant, withOwner, runCli, freePort, reservePort, retryOnPortClash, sleep, COLUMNS, LT, SERVER_JS, CLI };
+// Poll an async probe until it returns something truthy, and hand that back.
+// The server acts on its own timers (supervision, hooks, SSE), so a test waits
+// for the effect instead of sleeping a guessed amount.
+async function until(what, fn, ms = 6000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() > deadline) throw new Error('timeout waiting for: ' + what);
+    await sleep(50);
+  }
+}
+
+// Write a board.json before the server boots (pass as startServer's `seed`),
+// for states the API cannot reach directly: a dead worker, a legacy record.
+function seedBoard(dir, board) {
+  const sd = path.join(dir, '.bridge-commander');
+  fs.mkdirSync(sd, { recursive: true });
+  fs.writeFileSync(path.join(sd, 'board.json'), JSON.stringify(Object.assign({
+    title: 'seeded', seq: 0, lieutenants: [], cards: [], events: [], labels: [], reads: {}, kinds: {},
+    projects: [], workers: [],
+  }, board), null, 2));
+}
+
+function git(dir, ...args) {
+  return execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}
+
+// A one-commit repo on `main` for a project to clone. The identity is inline so
+// the test does not depend on the machine's git config.
+function makeRepo(root, name = 'srcrepo') {
+  const repo = path.join(root, name);
+  fs.mkdirSync(repo, { recursive: true });
+  execFileSync('git', ['init', '-q', '-b', 'main', repo], { stdio: ['ignore', 'pipe', 'pipe'] });
+  fs.writeFileSync(path.join(repo, 'README.md'), 'hello\n');
+  git(repo, 'add', '.');
+  git(repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init');
+  return repo;
+}
+
+// A board that can start cards: lieutenant `ada`, project `proj` cloned from a
+// fresh repo, the file-backed fake harness (state in <root>/fake), git
+// worktrees, and the supervision and PR-watch loops off unless `env` turns them
+// on. teardown() stops the server and removes the whole temp tree.
+async function startServerWithProject(opts = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), opts.prefix || 'bc-proj-'));
+  const repo = makeRepo(root);
+  const fdir = path.join(root, 'fake');
+  const s = await startServerWithLieutenant({
+    seed: opts.seed,
+    env: Object.assign({
+      BC_FAKE_STATE: fdir, BC_WORKTREE_TOOL: 'git',
+      BC_SUPERVISE_INTERVAL_MS: '0', BC_PRWATCH_INTERVAL_MS: '0',
+    }, opts.env || {}),
+  });
+  const r = await s.api('POST', '/api/projects', { source: repo, name: 'proj' });
+  if (r.status !== 200) {
+    await s.stop();
+    throw new Error('project setup failed: ' + JSON.stringify(r.body));
+  }
+  const teardown = async () => { await s.stop(); fs.rmSync(root, { recursive: true, force: true }); };
+  return { s, root, repo, fdir, teardown };
+}
+
+module.exports = {
+  startServer, startServerWithLieutenant, startServerWithProject, withOwner, runCli,
+  freePort, reservePort, retryOnPortClash, sleep, until, seedBoard, makeRepo, git,
+  COLUMNS, LT, SERVER_JS, CLI,
+};

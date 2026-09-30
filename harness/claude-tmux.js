@@ -1,55 +1,36 @@
 'use strict';
-// claude-tmux — the claude implementation of the harness port, over tmux.
+// claude-tmux — the claude PROFILE of the tmux adapter (tmux-adapter.js runs
+// the verbs). This file holds only claude facts: the launch line, the screens
+// a launch walks through, the Stop-hook install, and the claude-only slash
+// commands.
 //
-// HarnessRef: { harness: 'claude', session: 'bc-<id>', window?, cwd, resumeId? }
-//   session  — tmux session name (predictable `bc-*`, the captain's attach escape hatch)
-//   window   — when present, the agent lives in a named WINDOW of that session
-//              instead of owning the whole session (papercut #8: workers as
-//              windows inside their lieutenant's session). Window names must
-//              start with a letter — a numeric name would be parsed by tmux as
-//              a window INDEX — and every tmux call addresses the pane with the
-//              exact-match `=session:=window` form. Lifecycle coupling is
-//              accepted design: the session dying takes its windows with it.
-//   resumeId — the claude session uuid. Set deterministically at spawn via
-//              `--session-id <uuid>` (verified claude 2.1.202), refreshed from
-//              Stop-hook payloads. `claude --resume <resumeId>` keeps the SAME
-//              id (no fork by default), so the ref survives any number of
-//              death/resume cycles.
+// HarnessRef: { harness: 'claude', session: 'bc-<id>', window?, cwd, resumeId }
+//   resumeId — the claude session uuid, set at spawn via `--session-id <uuid>`
+//              (verified 2.1.202) and refreshed from Stop-hook payloads.
 //
-// Session/window/pane plumbing is shared with the other tmux adapters —
-// see tmux-session.js. This module owns only what is claude-specific:
-// launch line, screen signatures, the Stop-hook install, and resume.
+// Launch: `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude
+// --permission-mode <mode> --session-id <uuid>` (mined from firstmate's
+// fm-spawn.sh). <mode> is opts.permissionMode (default 'auto'); 'bypass' is the
+// old `--dangerously-skip-permissions` launch. Every other mode keeps claude's
+// permission prompts, and the PermissionRequest hook relays them to the board.
+// A fresh cwd shows the folder-trust dialog in every mode; the settle accepts it.
 //
-// Verified launch template (mined from firstmate's fm-spawn.sh):
-//   CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions \
-//     --session-id <uuid>
-//   - CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false kills the dim "ghost text"
-//     prompt suggestion that otherwise reads as pending composer input.
-//   - the prompt is NEVER passed on the command line — claude launches bare,
-//     and once launch-settle confirms the composer is up, the prompt is typed
-//     into it via the same verified-submit machinery send() uses (t.submit).
-//     A prompt riding in argv would sit in that process's command line for
-//     the life of the session — visible to `ps`/`pgrep -f`, and a broad
-//     pattern-kill run BY that very agent (matching its own argv) could
-//     freeze or kill itself. The prompt file in stateDir stays the source of
-//     truth; only the delivery mechanism changed.
-//   - a fresh cwd triggers claude's folder-trust dialog even with
-//     --dangerously-skip-permissions (verified); spawn auto-accepts it.
-//
-// Turn boundaries: spawn installs a Stop hook in <cwd>/.claude/settings.local.json
-// running harness/turnend-hook.js, which appends to <stateDir>/<session>.turnend.jsonl
-// (and optionally POSTs to a callback URL). onTurnEnd() tails that file.
+// Turn boundaries: prepare() installs a Stop hook in
+// <cwd>/.claude/settings.local.json running harness/turnend-hook.js, which
+// appends to <stateDir>/<key>.turnend.jsonl and POSTs the callback URL. With a
+// callback URL it also installs the PermissionRequest hook running
+// harness/permission-hook.js, which holds the prompt open on /api/permission.
 
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { execFile } = require('node:child_process');
-const t = require('./tmux.js');
-const s = require('./tmux-session.js');
-const { claudeStatus, SLASH_COMMANDS, helpText, formatStatus } = require('./agent-status.js');
+const { claudeStatus } = require('./agent-status.js');
+const { tmuxAdapter } = require('./tmux-adapter.js');
+const { shellQuote } = require('./util.js');
+const { installHooks, installStatusLine, writeOutputStyle } = require('./claude-settings.js');
+const onboard = require('./claude-onboard.js');
 
-const HOOK_SCRIPT = path.join(__dirname, 'turnend-hook.js');
 const TRUST_RE = /Yes, I trust this folder|Quick safety check/;
 
 // RESUME_RE — the picker `claude --resume` shows when the transcript is big
@@ -72,13 +53,15 @@ const TRUST_RE = /Yes, I trust this folder|Quick safety check/;
 const RESUME_RE = /Resume from summary|Resume full session as-is/;
 
 // UI_READY_RE matches signatures only the main UI renders (composer prompt,
-// busy footer, permission-mode footer) and the trust screen does not.
+// busy footer, permission-mode footer) and the trust screen does not. The
+// footer depends on the mode: "bypass permissions on", "auto mode on",
+// "accept edits on"; default mode shows none, so only `\n❯` catches it.
 //
 // ⚠ It is nearly wrong on the resume picker, which draws its own `❯` — and is
 // saved only by `\n❯` demanding column zero while the picker indents. Do not
 // relax that anchor: the picker would then read as READY and every unattended
 // revival would leave a lieutenant sitting on an unanswered menu forever.
-const UI_READY_RE = /bypass permissions|esc (to )?interrupt|\n❯/i;
+const UI_READY_RE = /bypass permissions|auto mode on|accept edits on|esc (to )?interrupt|\n❯/i;
 
 // FATAL_RE — what a pane shows when this launch is never going to come up, so
 // waiting the remaining 44 seconds only delays a wrong guess:
@@ -92,89 +75,21 @@ const UI_READY_RE = /bypass permissions|esc (to )?interrupt|\n❯/i;
 //              for them.
 //   missing    the shell answering "command not found" — no binary at all.
 //   bypass     the one-time "WARNING: Claude Code running in Bypass Permissions
-//              mode" consent modal, raised BY --dangerously-skip-permissions.
+//              mode" consent modal, raised BY --dangerously-skip-permissions
+//              (permissionMode 'bypass' only; other modes never show it).
 //              Its preselected option is `1. No, exit`, so it is emphatically
 //              not one to answer with a blind Enter, and it is not ours to
 //              accept on anyone's behalf: it is a person saying yes to an agent
 //              that skips permission prompts on their machine.
-const FATAL_RE = /cannot be used with root\/sudo privileges|Choose the text style|To change this later, run \/theme|claude: command not found|command not found: claude|Bypass Permissions mode|Yes, I accept/;
-const SETTLE = { trustRe: TRUST_RE, resumeRe: RESUME_RE, readyRe: UI_READY_RE, fatalRe: FATAL_RE, label: 'claude' };
-
-// mergeLocalSettings(cwd, mutate) — the read-modify-write of
-// <cwd>/.claude/settings.local.json, in ONE place.
-//
-// Two writers own this file: installHooks (the Stop hook every turn boundary on
-// the board rides on) and writeOutputStyle. Neither may clobber the other, so
-// both read first and write the whole object back — and every decision about
-// HOW that is done has to be the same on both sides. Kept apart, the second
-// copy is free to drift: a different indent, or a corrupt file that one hand
-// recovers from and the other throws on, and the drift shows up as a lieutenant
-// that stopped reporting turn ends.
-//
-// A file that is missing, unparseable, or not a JSON object is replaced by {}:
-// there is nothing to preserve in bytes nothing can read, and refusing to write
-// would leave the caller with no hook and no style either.
-function mergeLocalSettings(cwd, mutate) {
-  const dir = path.join(cwd, '.claude');
-  const file = path.join(dir, 'settings.local.json');
-  fs.mkdirSync(dir, { recursive: true });
-  let settings;
-  try {
-    settings = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    settings = null;
-  }
-  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) settings = {};
-  mutate(settings);
-  fs.writeFileSync(file, JSON.stringify(settings, null, 2) + '\n');
-  return file;
-}
-
-// excludeLocalSettings(cwd) — hide .claude/settings.local.json from git
-// (info/exclude) when cwd is a repo, so a file we wrote never dirties someone's
-// worktree. Sits next to mergeLocalSettings for the same reason: every writer of
-// that file has to make the same decisions about it, and a writer that skipped
-// this step left the untracked file this step exists to prevent. Best-effort —
-// not a repo, no permission, nothing to exclude, and the write still stands.
-async function excludeLocalSettings(cwd) {
-  try {
-    const gitDir = (await new Promise((resolve, reject) => {
-      execFile('git', ['-C', cwd, 'rev-parse', '--git-path', 'info/exclude'],
-        { encoding: 'utf8' }, (err, stdout) => (err ? reject(err) : resolve(stdout)));
-    })).trim();
-    const excl = path.isAbsolute(gitDir) ? gitDir : path.join(cwd, gitDir);
-    fs.mkdirSync(path.dirname(excl), { recursive: true });
-    const cur = fs.existsSync(excl) ? fs.readFileSync(excl, 'utf8') : '';
-    if (!cur.split('\n').includes('.claude/settings.local.json')) {
-      fs.appendFileSync(excl, '.claude/settings.local.json\n');
-    }
-  } catch {
-    // not a git repo — nothing to exclude
-  }
-}
-
-// installHooks — write/merge the Stop hook into <cwd>/.claude/settings.local.json.
-// Idempotent; preserves any existing settings/hooks. Also hides the file from
-// git (info/exclude) when cwd is a repo, so it never dirties a worktree.
-async function installHooks(cwd, session, stateDir, callbackUrl) {
-  const command = ['node', s.shellQuote(HOOK_SCRIPT), s.shellQuote(stateDir), s.shellQuote(session)]
-    .concat(callbackUrl ? [s.shellQuote(callbackUrl)] : [])
-    .join(' ');
-  mergeLocalSettings(cwd, (settings) => {
-    if (!settings.hooks || typeof settings.hooks !== 'object') settings.hooks = {};
-    if (!Array.isArray(settings.hooks.Stop)) settings.hooks.Stop = [];
-    const ours = settings.hooks.Stop.some((m) =>
-      Array.isArray(m.hooks) && m.hooks.some((h) => h.command === command));
-    if (!ours) {
-      // Drop stale bc hook entries (e.g. a previous session in this cwd) first.
-      settings.hooks.Stop = settings.hooks.Stop.filter((m) =>
-        !(Array.isArray(m.hooks) && m.hooks.some((h) =>
-          typeof h.command === 'string' && h.command.includes(HOOK_SCRIPT))));
-      settings.hooks.Stop.push({ hooks: [{ type: 'command', command }] });
-    }
-  });
-  await excludeLocalSettings(cwd);
-}
+// (`env: claude: No such file` is the missing binary under a profile with
+// env, whose launch runs through `exec env`.)
+const FATAL_RE = /cannot be used with root\/sudo privileges|Choose the text style|To change this later, run \/theme|claude: command not found|command not found: claude|env: .?claude.?: No such file|Bypass Permissions mode|Yes, I accept/;
+// DECLINE_RE — a menu whose cursor sits on a "No". Claude 2.1.282 preselects
+// "No, exit" on the folder-trust screen, where Enter quits claude to the shell
+// and the launch times out at 45s. The settle walks the cursor off it first.
+const DECLINE_RE = /❯\s*(\d+\.\s*)?No\b/;
+const SETTLE = { trustRe: TRUST_RE, resumeRe: RESUME_RE, readyRe: UI_READY_RE, fatalRe: FATAL_RE,
+  declineRe: DECLINE_RE, label: 'claude' };
 
 // sandboxPrefix(allowRoot) — claude refuses --dangerously-skip-permissions as
 // uid 0 and exits, so as root there is no session to have unless the caller has
@@ -187,187 +102,27 @@ function sandboxPrefix(allowRoot) {
   return asRoot ? 'IS_SANDBOX=1 ' : '';
 }
 
-// spawn(cwd, prompt, opts?) -> HarnessRef
-// opts: { session?, window?, stateDir?, callbackUrl?, extraArgs?: string[], installHooks?: boolean }
-// window: birth the agent as a named window inside `session` (which must then
-// be given too) instead of owning a whole session; the session is created on
-// demand when it is not up yet.
-// installHooks: false skips the per-spawn Stop-hook install — for sessions born
-// into a cwd that already carries a workspace-level hook (installing another
-// would clobber it: installHooks keeps ONE bc entry per settings file).
-async function spawn(cwd, prompt, opts = {}) {
-  const cwdAbs = path.resolve(cwd);
-  if (!fs.existsSync(cwdAbs)) throw new Error(`spawn cwd does not exist: ${cwdAbs}`);
-  const { session, window } = await s.claimPaneNames(opts);
-  const stateDir = s.stateDirOf(opts);
-  const resumeId = crypto.randomUUID();
-  const key = s.stateKey(session, window);
-
-  if (opts.installHooks !== false) {
-    await installHooks(cwdAbs, key, stateDir, opts.callbackUrl || process.env.BC_TURNEND_URL || '');
-  }
-
-  const promptFile = path.join(stateDir, `${key}.prompt`);
-  fs.writeFileSync(promptFile, prompt);
-  // Recorded so resume() can replay them — a worker pinned to a model by its
-  // playbook must not come back on the default one (tmux-session.js).
-  s.recordSpawnArgs(stateDir, key, opts);
-
-  await s.createPane(session, window, cwdAbs);
-  try {
-    const extra = (opts.extraArgs || []).map(s.shellQuote).join(' ');
-    const launchCmd = sandboxPrefix(opts.allowRoot)
-      + 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false '
-      + `claude --dangerously-skip-permissions --session-id ${resumeId}`
-      + (extra ? ' ' + extra : '');
-    await s.launchAndSettle(s.paneTarget(session, window), launchCmd, SETTLE);
-    await deliverPrompt(s.paneTarget(session, window), prompt);
-    // Returning is a claim that there is a session here. Check it, once, against
-    // the pane — a settle that matched a modal's own wording is exactly how a
-    // spawn came to report success over a consent screen nobody had answered.
-    await s.verifyLive(s.paneTarget(session, window), SETTLE);
-  } catch (err) {
-    await s.killPane(session, window);
-    try { fs.unlinkSync(promptFile); } catch { /* best-effort */ }
-    throw err;
-  }
-
-  const ref = { harness: 'claude', session, cwd: cwdAbs, resumeId };
-  if (window) ref.window = window;
-  return ref;
+// launchPrefix(mode, allowRoot) — everything on a claude line before the
+// session flags: the sandbox consent, the switch that kills claude's dim
+// prompt-suggestion ghost text (it would read as pending composer input), and
+// the permission flags. Only bypass needs the root escape hatch: claude's uid-0
+// refusal is about skipping permissions, and no other mode skips them.
+function launchPrefix(mode, allowRoot) {
+  const bypass = mode === 'bypass';
+  return (bypass ? sandboxPrefix(allowRoot) : '')
+    + 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude '
+    + (bypass ? '--dangerously-skip-permissions' : '--permission-mode ' + shellQuote(mode));
+}
+// A spawn without a mode, or a record from before modes existed, runs in 'auto'.
+function permissionModeOf(v) {
+  return typeof v === 'string' && v ? v : 'auto';
 }
 
-// deliverPrompt(target, prompt) — type the brief into the just-settled
-// composer with verified submission (t.submit — same mechanism send() uses:
-// type once, retry only Enter, never retype). Runs once, right after
-// launchAndSettle confirms the main UI is up, so the brief never rides in
-// argv (see the file-header note on why that matters).
-async function deliverPrompt(target, prompt) {
-  const verdict = await t.submit(target, prompt, {
-    retries: Number(process.env.BC_SEND_RETRIES || 3),
-    enterSleep: Number(process.env.BC_SEND_SLEEP_MS || 400),
-  });
-  if (verdict === 'pending' || verdict === 'send-failed') {
-    // The pane rides on THIS failure too. A launch that settles and then will
-    // not take the brief is the interesting case — the screen underneath is
-    // usually a login prompt or a trust dialog wearing a composer's clothes —
-    // and without the tail the caller is left with nothing to diagnose from.
-    throw new Error((verdict === 'pending'
-      ? 'brief not submitted at spawn (Enter swallowed; text left in composer)'
-      : 'brief not sent at spawn (tmux send failed)') + '; pane tail:\n' + (await paneTailSafe(target)));
-  }
-}
-async function paneTailSafe(target) {
-  try { return (await t.capture(target, 20)) || ''; } catch (e) { return ''; }
-}
-
-// send(ref, text) — type into the session with verified submission.
-// Enter is retried, never the text. Throws when the submit provably failed.
-async function send(ref, text) {
-  const name = s.stateKey(ref.session, ref.window);
-  if (!(await alive(ref))) throw new Error(`session ${name} is not alive`);
-  const verdict = await t.submit(s.paneTarget(ref.session, ref.window), text, {
-    retries: Number(process.env.BC_SEND_RETRIES || 3),
-    enterSleep: Number(process.env.BC_SEND_SLEEP_MS || 400),
-  });
-  if (verdict === 'pending') {
-    throw new Error(`text not submitted to ${name} (Enter swallowed; text left in composer)`);
-  }
-  if (verdict === 'send-failed') {
-    throw new Error(`text not sent to ${name} (tmux send failed)`);
-  }
-  // 'empty' = confirmed; 'unknown' = pane unreadable, assume sent (lenient —
-  // an unreadable pane must not turn a normal send into a false error).
-  await t.sleep(1000); // let the turn spin up so an immediate capture sees it working
-}
-
-// alive(ref) — the ref's session (and window, for window-granular refs) exists
-// AND its pane is still running the agent (a pane sitting back at a bare shell
-// means claude exited).
-async function alive(ref) {
-  // STRICT: this answer is what the board drops worker records on, so a tmux it
-  // could not read must throw rather than pass for "the pane is gone".
-  if (!(await s.paneExists(ref.session, ref.window, { strict: true }))) return false;
-  const cmd = await s.paneCommand(s.paneTarget(ref.session, ref.window), { strict: true });
-  return cmd !== null && !s.SHELLS.has(cmd);
-}
-
-// resumable(ref, opts?) -> bool — would resume(ref) restore memory? True when a
-// resume id is recoverable: ref.resumeId, or the hook-recorded session-id file
-// in the state dir. Introspection only, no side effects beyond ensuring the
-// state dir exists — the server uses it to pick resume vs relaunch-with-charter.
-async function resumable(ref, opts = {}) {
-  if (ref.resumeId) return true;
-  try {
-    return !!fs.readFileSync(path.join(s.stateDirOf(opts), `${s.stateKey(ref.session, ref.window)}.session-id`), 'utf8').trim();
-  } catch {
-    return false;
-  }
-}
-
-// resume(ref) -> HarnessRef — reincarnate a dead session with memory when possible.
-// Prefers the hook-recorded session id (ground truth) over ref.resumeId, kills
-// any leftover dead tmux session, relaunches `claude --resume <id>` in a fresh
-// session under the same name. Without any resume id, launches fresh (memory lost).
-async function resume(ref, opts = {}) {
-  if (await alive(ref)) return { ...ref };
-  const stateDir = s.stateDirOf(opts);
-  const key = s.stateKey(ref.session, ref.window);
-  let resumeId = ref.resumeId;
-  try {
-    const rec = fs.readFileSync(path.join(stateDir, `${key}.session-id`), 'utf8').trim();
-    if (rec) resumeId = rec;
-  } catch {
-    // no recorded id — fall back to the ref's
-  }
-  await s.killPane(ref.session, ref.window); // clear any dead pane still holding the name
-
-  if (opts.installHooks !== false) {
-    await installHooks(ref.cwd, key, stateDir, opts.callbackUrl || process.env.BC_TURNEND_URL || '');
-  }
-  await s.createPane(ref.session, ref.window, ref.cwd);
-  try {
-    // The spawn's launch facts are replayed, not rebuilt: --model/--effort came
-    // from the card's playbook and a resume that drops them is a worker quietly
-    // moved to another model, and a root session that comes back without
-    // IS_SANDBOX=1 does not come back at all. opts, when given, wins over the
-    // record. A missing or corrupt record is no flags and no prefix, never a throw.
-    const rec = s.recordedSpawnArgs(stateDir, key);
-    const extra = (opts.extraArgs || rec.args).map(String);
-    const parts = ['claude', '--dangerously-skip-permissions'];
-    if (resumeId) parts.push('--resume', resumeId);
-    for (const a of extra) parts.push(s.shellQuote(a));
-    const launchCmd = sandboxPrefix(opts.allowRoot || rec.allowRoot)
-      + 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false ' + parts.join(' ');
-    await s.launchAndSettle(s.paneTarget(ref.session, ref.window), launchCmd, SETTLE);
-  } catch (err) {
-    await s.killPane(ref.session, ref.window);
-    throw err;
-  }
-  const out = { harness: 'claude', session: ref.session, cwd: ref.cwd, resumeId };
-  if (ref.window) out.window = ref.window;
-  return out;
-}
-
-// kill(ref) — end the agent's pane for good. Idempotent: killing a dead or
-// missing one is a no-op. Session-granular refs take the whole session;
-// window-granular refs take ONLY their window (the lieutenant and sibling
-// workers cohabit the session). Harness state files are left behind on
-// purpose — resumeId and the turn-end log are cheap, and a later resume(ref)
-// can still reincarnate the conversation if the kill turns out premature.
-async function kill(ref) {
-  await s.killPane(ref.session, ref.window);
-}
-
-// ---------- slash commands + status (OPTIONAL capability verbs — port.js) ----------
-// status(ref) reads the session transcript claude already writes
-// (~/.claude/projects/<slug(cwd)>/<resumeId>.jsonl — agent-status.js); no
-// resumeId yet or no transcript → null, never a throw.
+// ---------- slash commands ----------
 // /autocompact is claude-specific (verified against the 2.1.207 binary — the
-// public docs lag behind); like /compact it is a PASS-THROUGH: the literal
-// command line (args included) is typed into the session via verified submit
-// and claude's own implementation runs in-place.
-const PASSTHROUGH = new Set(['/compact', '/autocompact']);
+// public docs lag behind); like /compact it is a PASS-THROUGH typed into the
+// session via verified submit. status reads the transcript claude already
+// writes (agent-status.js).
 
 // ---------- /output-style (claude only, and NOT a pass-through) ----------
 // claude USED to answer `/output-style`; it does not any more. Verified against
@@ -473,80 +228,181 @@ function outputStyles(opts = {}) {
   return out;
 }
 
-// writeOutputStyle — one key, through the shared merge, because installHooks
-// writes its Stop hook into this very file and must survive the write.
-async function writeOutputStyle(cwd, style) {
-  mergeLocalSettings(cwd, (settings) => { settings.outputStyle = style; });
-  await excludeLocalSettings(cwd);
-}
-
 // commands(ref?) — the ref is what makes the style list this SESSION's list: a
 // style installed in the worker's own worktree is offered to that worker and to
-// nobody else. Without a ref (a bare /help, a caller with no session in hand)
-// only the user-level directory is scanned, as before.
-function commands(ref) {
-  return SLASH_COMMANDS.map((c) => ({ ...c })).concat([
+// nobody else. Without a ref only the user-level directory is scanned.
+function ownCommands(ref) {
+  return [
     { name: '/autocompact', description: 'set how full the context gets before auto-compaction' },
     {
       name: OUTPUT_STYLE,
       description: 'set this session\'s output style (applies on its next conversation)',
       args: outputStyles({ cwd: ref && ref.cwd }),
     },
-  ]);
-}
-async function status(ref) {
-  return claudeStatus(ref);
-}
-async function runCommand(ref, command, opts = {}) {
-  const line = String(command || '').trim();
-  const name = line.split(/\s+/)[0];
-  const key = s.stateKey(ref.session, ref.window);
-  if (name === '/help') return helpText(commands(ref));
-  if (name === '/status') {
-    const st = await status(ref);
-    if (!st) throw new Error('no status for ' + key + ' — session transcript not found');
-    return formatStatus(st);
-  }
-  if (name === OUTPUT_STYLE) {
-    // Everything after the command name is ONE style name — a style file may
-    // carry spaces in its `name:`, so the argument is not tokenized.
-    const want = line.slice(name.length).trim();
-    const styles = outputStyles({ stylesDir: opts.stylesDir, cwd: ref.cwd });
-    const available = styles.map((st) => st.value).join(', ');
-    // The bare form is refused rather than typed: claude has no /output-style
-    // to answer it, and the whole point is that nobody has to remember the list.
-    if (!want) throw new Error(OUTPUT_STYLE + ' needs a style name — available: ' + available);
-    const hit = styles.find((st) => st.value.toLowerCase() === want.toLowerCase());
-    // Refused before anything is written: a bad name must not silently sit in
-    // the settings file waiting to surprise the next conversation.
-    if (!hit) throw new Error('unknown output style "' + want + '" — available: ' + available);
-    await writeOutputStyle(ref.cwd, hit.value);
-    return 'output style set to ' + hit.value
-      + ' — it applies the next time this session starts';
-  }
-  if (PASSTHROUGH.has(name)) {
-    await send(ref, line); // verified submit; claude's own command runs in-session
-    return '"' + line + '" submitted to ' + key + ' — the session runs it in-place';
-  }
-  throw new Error('unknown command ' + name + ' (see /help)');
+  ];
 }
 
-// onTurnEnd / openPane / paneSnapshot / paneInput / adoptWindow — the shared
-// implementations verbatim (tmux-session.js): the Stop-hook relay writes the
-// same turnend.jsonl shape every tmux adapter tails, pane viewing is pure
-// capture-pane, pane input is pure send-keys, and adoption is pure
-// rename-window.
-const { onTurnEnd, openPane, paneSnapshot, paneInput, adoptWindow } = s;
+async function setOutputStyle(ref, line, opts) {
+  // Everything after the command name is ONE style name — a style file may
+  // carry spaces in its `name:`, so the argument is not tokenized.
+  const want = line.slice(OUTPUT_STYLE.length).trim();
+  const styles = outputStyles({ stylesDir: opts.stylesDir, cwd: ref.cwd });
+  const available = styles.map((st) => st.value).join(', ');
+  // The bare form is refused rather than typed: claude has no /output-style
+  // to answer it, and the whole point is that nobody has to remember the list.
+  if (!want) throw new Error(OUTPUT_STYLE + ' needs a style name — available: ' + available);
+  const hit = styles.find((st) => st.value.toLowerCase() === want.toLowerCase());
+  // Refused before anything is written: a bad name must not silently sit in
+  // the settings file waiting to surprise the next conversation.
+  if (!hit) throw new Error('unknown output style "' + want + '" — available: ' + available);
+  await writeOutputStyle(ref.cwd, hit.value);
+  return 'output style set to ' + hit.value + ' — it applies the next time this session starts';
+}
 
-// installHooks is exported beyond the seven port verbs so `bc-axi init` can
-// install the workspace-level Stop hook (session-agnostic; the server dedupes
-// turn-end POSTs by session_id). openPane/paneSnapshot/paneInput and
-// commands/runCommand/status are OPTIONAL capability verbs (port.js).
-module.exports = { spawn, send, alive, resumable, resume, kill, onTurnEnd, installHooks,
-  openPane, paneSnapshot, paneInput, commands, runCommand, status, adoptWindow,
+// The launch modes config.json may name. Anything else reads as the first
+// one: a typo must not turn into a flag claude refuses to start on.
+const PERMISSION_MODES = ['auto', 'default', 'acceptEdits', 'bypass'];
+
+// describe(request) — one line the captain can judge a permission ask from:
+// the field that carries the risk for the tools that have one. '' lets the
+// core fall back to the input itself.
+function describePermission(req) {
+  const tool = req && req.tool_name;
+  const i = req && req.tool_input && typeof req.tool_input === 'object' ? req.tool_input : {};
+  const pick = (k) => (typeof i[k] === 'string' && i[k].trim() ? i[k].trim() : '');
+  if (tool === 'Bash') return pick('command');
+  if (tool === 'Edit' || tool === 'Write' || tool === 'Read' || tool === 'MultiEdit' || tool === 'NotebookEdit') {
+    return pick('file_path') || pick('notebook_path');
+  }
+  if (tool === 'WebFetch') return pick('url');
+  return '';
+}
+
+// Context window per model — matched by substring so versioned ids
+// (claude-fable-5, claude-opus-4-8, …) hit without an exhaustive list. A
+// derived profile prepends its own pairs; unknown models get the default.
+const CONTEXT_WINDOWS = [
+  ['fable', 1000000],
+  ['opus', 200000],
+  ['sonnet', 200000],
+  ['haiku', 200000],
+];
+
+// ---------- interrupt: the queued input claude would submit after the Esc ----------
+// Messages typed into a busy claude wait in a queue, and an Esc submits every
+// one of them as a new turn (verified 2.1.283). The board's own wake lines are
+// what piles up there, and a lieutenant woken by one re-drains the order the
+// captain just stopped. So before the Esc: pull the queue into the composer
+// (Up, which claude offers only while the composer is EMPTY) and clear it when
+// every line is a board nudge. Anything else is someone's words: it stays in
+// the composer, where the Esc does not submit it.
+const QUEUED_HINT_RE = /Press up to edit queued messages/;
+// The lines server/delivery.js types (wakeLine, the respawn nudge).
+const NUDGE_RE = /^\[bridge-commander\] .* — run: bc-axi drain$/;
+const RULE_RE = /^─{10,}\s*$/;
+
+// composerLines(screen) -> the text lines inside the composer box: between the
+// last two horizontal rules, prompt glyph and indent stripped, blanks dropped.
+function composerLines(screen) {
+  const lines = String(screen || '').split('\n');
+  const rules = [];
+  lines.forEach((l, i) => { if (RULE_RE.test(l)) rules.push(i); });
+  if (rules.length < 2) return null;
+  return lines.slice(rules[rules.length - 2] + 1, rules[rules.length - 1])
+    .map((l) => l.replace(/^❯\s?/, '').trim()).filter(Boolean);
+}
+
+async function beforeInterrupt(target, t) {
+  const before = composerLines(await t.capture(target, 0));
+  if (!before || before.length !== 1 || !QUEUED_HINT_RE.test(before[0])) return;
+  await t.sendKey(target, 'Up');
+  await t.sleep(300);
+  const queued = composerLines(await t.capture(target, 0));
+  if (!queued || !queued.length || !queued.every((l) => NUDGE_RE.test(l))) return;
+  // C-u clears the cursor's line; BSpace then joins it to the one above.
+  for (let i = queued.length - 1; i >= 0; i--) {
+    await t.sendKey(target, 'C-u');
+    if (i) await t.sendKey(target, 'BSpace');
+  }
+}
+
+const profile = {
+  name: 'claude',
+  sessionProvider: 'claude',
+  beforeInterrupt,
+  settle: SETTLE,
+  // `--session-id <uuid>` makes the resume id known at birth (verified 2.1.202).
+  idAtBirth: () => crypto.randomUUID(),
+  // opts.installHooks: false — the cwd already carries workspace-level hooks,
+  // and a settings file holds only ONE bc entry per event (claude-settings.js).
+  async prepare(cwd, key, ctx) {
+    if (ctx.opts.installHooks !== false) await installHooks(cwd, key, ctx.stateDir, ctx.callbackUrl);
+  },
+  launch: (ctx) => launchPrefix(permissionModeOf(ctx.permissionMode), ctx.allowRoot)
+    + ` --session-id ${ctx.resumeId}`
+    + (ctx.extra ? ' ' + ctx.extra : ''),
+  // `--resume <id>` keeps the SAME id (no fork), so the ref survives any number
+  // of death/resume cycles. No id: a fresh claude, memory lost. The mode is the
+  // spawn's (replayed by the adapter), so an agent never comes back looser.
+  resumeLaunch: (id, ctx) => launchPrefix(permissionModeOf(ctx.permissionMode), ctx.allowRoot)
+    + (id ? ` --resume ${id}` : '')
+    + (ctx.extra ? ' ' + ctx.extra : ''),
+  // ctx.profile is the MERGED profile, so a derived one's windows apply.
+  status: (ref, ctx) => claudeStatus(ref, {
+    contextWindows: ctx && ctx.profile && ctx.profile.contextWindows,
+    windowOverrides: ctx && ctx.profile && ctx.profile.windowOverrides,
+  }),
+  noStatusHint: 'session transcript not found',
+  commands: ownCommands,
+  handlers: { [OUTPUT_STYLE]: setOutputStyle },
+  passthrough: ['/autocompact'],
+
+  // ---- typed options: --model / --effort (both verified in `claude --help`) ----
+  options: ['model', 'effort'],
+  modelArgs: ({ model, effort } = {}) => [].concat(model ? ['--model', model] : [], effort ? ['--effort', effort] : []),
+
+  // ---- data the core reads through profileInfo() ----
+  permissions: { modes: PERMISSION_MODES, describe: describePermission },
+  requirements: { bins: ['claude'], tmux: true, rootBypass: true },
+  installHint: onboard.INSTALL_HINT,
+  contextWindows: CONTEXT_WINDOWS,
+  // What a human types to reopen a conversation by hand: none of the board's
+  // launch flags, since the captain runs it in their own terminal.
+  handResume: 'claude --resume',
+
+  // ---- first run (cli/firstrun.js frames these) ----
+  handRunLine: onboard.handRunLine,
+  setupScreens: onboard.setupScreens,
+  rootBlock: onboard.rootBlock,
+  diagnose: onboard.diagnose,
+
+  // detectSelf(env) — claude exports CLAUDECODE (and CLAUDE_SESSION_ID when it
+  // has one) to the commands it runs; that is how `bc-axi init` knows its caller.
+  detectSelf: (env) => (env && (env.CLAUDECODE || env.CLAUDE_SESSION_ID)
+    ? { resumeId: env.CLAUDE_SESSION_ID || '' } : null),
+  // Where the worker-duties skill is linked so a claude worker can load it.
+  skillsDir: (home) => path.join(home || os.homedir(), '.claude', 'skills'),
+  // The workspace-level Stop + PermissionRequest hooks and the statusLine, for
+  // every claude whose cwd is the workspace (the founder included).
+  async installWorkspace(ws, env = {}) {
+    await installHooks(ws, 'ws', env.stateDir, env.callbackUrl);
+    await installStatusLine(ws);
+    return [
+      'turn-end + permission hooks installed (.claude/settings.local.json -> /api/turn-end, /api/permission)',
+      'statusLine installed (.claude/settings.local.json -> real context window sidecar)',
+    ];
+  },
+  // `bc-axi open` self-heals the statusLine wiring on every open.
+  refreshWorkspace: (ws) => installStatusLine(ws),
+};
+
+module.exports = { ...tmuxAdapter(profile),
+  // The JS base a derived JSON profile `extends` (harness/profiles.js).
+  profile, PERMISSION_MODES, describePermission,
   // Exported for the tests that pin the style list against a temp directory and
   // the built-ins against the binary.
   outputStyles, BUILTIN_OUTPUT_STYLES,
+  composerLines, NUDGE_RE,
   // Exported for the test that pins them against REAL captured screens. These
   // regexes decide whether an unattended revival works or sits on a menu until
   // it is given up on, and that is not a judgement to make by reading them.

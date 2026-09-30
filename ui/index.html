@@ -12,37 +12,14 @@
 <header id="topbar">
   <h1 id="b-title">bridge command</h1>
   <div id="b-subtitle"></div>
-  <span id="filter-wrap">
-    <!-- mobile only: the text filter collapses to this 🔍; tapping it expands
-         the input over the whole row (desktop shows the input directly) -->
-    <button id="filter-open" title="search cards">
-      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
-           stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <circle cx="11" cy="11" r="7"></circle>
-        <line x1="21" y1="21" x2="16" y2="16"></line>
-      </svg>
-    </button>
-    <input id="filter" placeholder="filter ( / )" autocomplete="off">
-    <!-- the richer filters live in a popup; the badge counts what's active in there -->
-    <button id="filter-btn" title="filters">
-      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
-           stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
-      </svg>
-      <span id="filter-btn-n" class="badge-n" hidden></span>
-    </button>
-    <!-- mobile only: leaves search mode (the filter itself stays applied) -->
-    <button id="filter-close" title="done">✕</button>
-  </span>
-  <!-- board ⇄ table over the live cards; 🧊 is the archived cards' own mode;
-       ⚡ is the clock and the scripts it fires, which are watched rather than
-       configured and so are a mode of their own rather than a config tab -->
-  <span id="view-seg" role="group" aria-label="board view">
-    <button id="vs-board" class="on" title="kanban board">▦</button>
-    <button id="vs-table" title="table view">☰</button>
-    <button id="vs-arch" title="archived cards">🧊</button>
-    <button id="vs-auto" title="hooks &amp; schedules">⚡</button>
-  </span>
+  <!-- the view switcher: one button per switcher view in the main/v1 registry
+       (views.js), in rank order — ▦ kanban, ☰ table, 🧊 archived, ⚡ automation,
+       then any plugin view. main.js builds the buttons. -->
+  <span id="view-seg" role="group" aria-label="board view"></span>
+  <!-- topbar/v1: plugin command buttons (topbar.js), card-less; hidden while
+       there are none. Then the ⌘ that opens the command palette (palette.js). -->
+  <span id="topbar-cmds" role="group" aria-label="plugin commands" hidden></span>
+  <button id="palette-btn" type="button" title="commands (⌘K / Ctrl+K)" aria-label="command palette">⌘</button>
   <span id="status-dot" title="connecting…"></span>
   <button id="bell" title="notifications">🔔<span id="bell-n" class="badge-n" hidden></span></button>
   <button id="gear" title="settings">⚙️</button>
@@ -50,10 +27,6 @@
 
 <!-- filter popup (filterpop.js renders its content) -->
 <div id="filter-panel" hidden></div>
-
-<!-- mobile board-mode dropdown: the collapsed ▦☰🧊⚡ switcher opens this
-     (main.js renders the four modes, current one marked) -->
-<div id="mode-menu" hidden></div>
 
 <!-- notifications dropdown -->
 <div id="notif-panel" hidden>
@@ -93,6 +66,13 @@
     </div>
     <div id="ns-list"></div>
   </div>
+  <!-- per browser: the terminal is a fact about this machine, and a phone has
+       none. Off renders nothing; on, the 👁 drawer gets a ⌨ that opens the
+       agent's tmux session outside the board. -->
+  <div class="sp-title">terminal</div>
+  <div class="sp-row">
+    <select id="term-opener" title="how the 👁 drawer's ⌨ opens an agent's session in a real terminal"></select>
+  </div>
   <div class="sp-title">monitoring</div>
   <div class="sp-row">
     <button id="mon-open" title="live machine & per-agent load (samples only while open)">📈 machine load</button>
@@ -114,7 +94,10 @@
 </div>
 
 <main id="layout">
-  <!-- chat: left, full height, always open on desktop -->
+  <!-- chat: left, full height, always open on desktop. It is the built-in
+       filler of the sidebar/v1 slot (sidebar.js): a plugin sidebar gets a
+       .bc-sidebar sibling here and shows instead when the overlay switches
+       `sidebar:chat` off. -->
   <section id="chat">
     <div id="chat-head">
       <button id="chat-back" hidden>←</button>
@@ -144,24 +127,56 @@
       <input id="chat-file" type="file" multiple hidden>
       <button type="button" id="chat-attach" class="composer-attach" title="attach files (images & any type)">📎</button>
       <textarea id="chat-input" rows="1" placeholder="message your lieutenant…" autocomplete="off"></textarea>
+      <!-- ⏹ shows only while this conversation's agent is busy (interrupt.js) -->
+      <button type="button" id="chat-stop" class="composer-stop" title="stop the agent's turn (Esc in an empty composer)" aria-label="stop the agent" hidden>⏹</button>
       <button type="submit" title="send">➤</button>
     </form>
     <div class="pane-resize" id="chat-resize" title="drag to resize · double-click to reset"></div>
   </section>
 
-  <!-- board: right — one region, six modes (kanban | table | archived |
-       automation | file | settings). The first four are the switcher and are
-       remembered; the file and settings screens are not in it (you enter them
-       by opening a file, or from the gear). All of them take the board's place
-       with the chat still at its side. -->
+  <!-- board: right — one region, one view at a time from the main/v1
+       registry (views.js): kanban | table | archived | automation, then any
+       plugin view — the switcher, remembered — and the file and settings
+       screens, which are not in it (you enter them by opening a file, or from
+       the gear). All of them take the board's place with the chat still at
+       its side. -->
   <section id="board-wrap">
-    <div id="board"><div class="empty">waiting for board…</div></div>
-    <div id="table"></div>
-    <div id="archive"></div>
-    <div id="filepane"></div>
+    <!-- every view below is a .bc-view: views.js marks the one on screen
+         .view-on. Plugin views get a div of their own, inserted before the
+         taskbar. -->
+    <!-- the filter row sits on top of every view, so it starts where the
+         kanban's first column starts whatever the chat pane's width -->
+    <div id="filter-wrap">
+      <!-- mobile only: the text filter collapses to this 🔍; tapping it expands
+           the input over the whole filter row (desktop shows the input directly) -->
+      <button id="filter-open" title="search cards">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="7"></circle>
+          <line x1="21" y1="21" x2="16" y2="16"></line>
+        </svg>
+      </button>
+      <input id="filter" placeholder="filter ( / )" autocomplete="off">
+      <!-- the richer filters live in a popup; the badge counts what's active in there -->
+      <button id="filter-btn" title="filters">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"></polygon>
+        </svg>
+        <span id="filter-btn-n" class="badge-n" hidden></span>
+      </button>
+      <!-- one removable chip per active filter (filterpop.js) -->
+      <div id="filter-chips"></div>
+      <!-- mobile only: leaves search mode (the filter itself stays applied) -->
+      <button id="filter-close" title="done">✕</button>
+    </div>
+    <div id="board" class="bc-view"><div class="empty">waiting for board…</div></div>
+    <div id="table" class="bc-view"></div>
+    <div id="archive" class="bc-view"></div>
+    <div id="filepane" class="bc-view"></div>
     <!-- the config screen: one section per thing the BOARD owns, as opposed to
          the browser looking at it — labels, playbooks, projects, lieutenants. -->
-    <div id="settings-screen">
+    <div id="settings-screen" class="bc-view">
       <!-- the heading row carries the tabs: one button per section, wearing the
            same segmented look as the ▦☰🧊⚡ switcher. data-tab pairs with the
            section's data-sec — that pairing IS the switching logic, so a new
@@ -177,6 +192,7 @@
           <button type="button" data-tab="playbooks">playbooks</button>
           <button type="button" data-tab="projects">projects</button>
           <button type="button" data-tab="lieutenants">lieutenants</button>
+          <button type="button" data-tab="plugins">plugins</button>
         </span>
       </div>
       <section class="ss-sec on" id="ss-labels" data-sec="labels">
@@ -216,6 +232,13 @@
         <div class="ss-title">lieutenants</div>
         <div id="lt-list"></div>
       </section>
+      <!-- plugins: what the server found (shipped + the workspace's own), each
+           switched on or off, its config, and what it adds. Writes go to the
+           workspace overlay, .bridge-commander/plugins.json. -->
+      <section class="ss-sec" id="ss-plugins" data-sec="plugins">
+        <div class="ss-title">plugins</div>
+        <div id="pl-list"></div>
+      </section>
     </div>
     <!-- automation (⚡): the board's clock and the scripts it fires. A schedule
          fires a hook, so the two are ONE screen rather than two tabs — the
@@ -223,7 +246,7 @@
          names what fires it) instead of being inferred across a tab switch.
          Anything red is what this screen is opened for, so it sorts to the top
          of its column and the masthead counts it. -->
-    <div id="auto-screen">
+    <div id="auto-screen" class="bc-view">
       <div class="au-masthead">
         <div class="au-head">automation</div>
         <!-- the one line that answers "is anything wrong" without scrolling -->
@@ -292,6 +315,9 @@
         </section>
       </div>
     </div>
+    <!-- the taskbar (activities.js): tracked command runs — running ones with a
+         spinner, the last few that ended with ✓ / ✗. Hidden while there are none. -->
+    <div id="taskbar" hidden></div>
   </section>
 </main>
 
@@ -313,11 +339,15 @@
       <div class="dt-sub" id="dt-sub"></div>
     </div>
     <button id="dt-talk" title="talk in this card's thread">💬 talk</button>
+    <button id="dt-session" title="open or resume session" hidden>👁</button>
     <button id="dt-menu-btn" title="move / archive">⋯</button>
     <!-- archived snapshots only: the one action a frozen card offers -->
     <button id="dt-unarch" class="tv-unarch" hidden>🧟 unarchive</button>
     <button id="dt-close" title="close">✕</button>
   </div>
+  <!-- plugin buttons (detail.actions/v1), painted by detail.js: a row of their
+       own, so any number of them wraps instead of squeezing the title -->
+  <div id="dt-pactions"></div>
   <!-- the collapsed line: PR state and the tail of the timeline, one row, no wrap.
        Clicking it opens #dt-fold below, which holds the full attribute list,
        the labels and the whole timeline. -->
@@ -336,6 +366,7 @@
       <div class="dt-events" id="dt-events"></div>
     </div>
     <div class="dt-artifacts" id="dt-artifacts"></div>
+    <section class="dt-checkpoint" id="dt-checkpoint" aria-label="Session checkpoint" hidden></section>
     <div class="dt-body md" id="dt-body"></div>
     <button id="dt-body-edit" type="button" title="edit description">✎ edit</button>
     <div id="dt-body-editor" hidden>
@@ -348,17 +379,10 @@
     <!-- archived snapshots: the frozen thread, inline (live cards chat on the left) -->
     <div class="dt-events-head" id="dt-thread-head" hidden>thread (frozen)</div>
     <div id="dt-thread" hidden></div>
+    <!-- plugin sections (detail.sections/v1), below every built-in one -->
+    <div id="dt-sections"></div>
   </div>
 </aside>
-
-<!-- move / actions menu (detail ⋯ and tile long-press) -->
-<div id="move-menu" hidden></div>
-
-<!-- owner menu (detail ✎ on the lieutenant chip — reassign the owning lieutenant) -->
-<div id="owner-menu" hidden></div>
-
-<!-- playbook menu (detail ✎ on the playbook chip — pick what card start renders) -->
-<div id="playbook-menu" hidden></div>
 
 <!-- lieutenant settings modal (switcher ⋯ → settings): everything about a
      lieutenant the BOARD owns. Every field commits on pick. The charter is not
@@ -375,15 +399,26 @@
     <!-- What this lieutenant RUNS ON. Changing the harness is not cosmetic: it
          kills the session and respawns it, so it asks first. The model is a
          free-text box on purpose — the board keeps no list of model names, the
-         string goes straight to the harness CLI. -->
-    <div class="lt-row">
-      <select id="ls-harness" title="agent harness — changing this respawns the lieutenant">
-        <option value="claude">claude</option>
-        <option value="codex">codex</option>
-      </select>
-      <input id="ls-model" placeholder="model (harness default)" autocomplete="off" spellcheck="false"
-             title="passed to the harness as --model on every spawn and resume; empty = the harness default">
+         string goes straight to the harness CLI. Effort is free text for the
+         same reason. -->
+    <div class="lt-row ls-run">
+      <label class="ls-field">harness
+        <!-- options: the harnesses GET /api/plugins lists (plugins.js fills them) -->
+        <select id="ls-harness" title="agent harness — changing this respawns the lieutenant"></select>
+      </label>
+      <label class="ls-field ls-grow">model
+        <input id="ls-model" list="ls-models" placeholder="harness default" autocomplete="off" spellcheck="false"
+               title="passed to the harness as its model flag on every spawn and resume; empty = the harness default">
+      </label>
+      <label class="ls-field">effort
+        <input id="ls-effort" list="ls-efforts" placeholder="default" autocomplete="off" spellcheck="false"
+               title="reasoning effort (low, medium, high, …) passed to the harness on every spawn and resume; empty = the harness default">
+      </label>
+      <!-- suggestions only, from the harness's own model list when it keeps one -->
+      <datalist id="ls-models"></datalist>
+      <datalist id="ls-efforts"></datalist>
     </div>
+    <div id="ls-model-warn" hidden></div>
     <div id="ls-grid"></div>
     <div class="nc-actions">
       <button type="button" id="ls-cancel">close</button>
@@ -420,10 +455,7 @@
     <div class="lt-row">
       <input id="lt-color" type="color" value="#58b6ff" title="lieutenant color">
       <input id="lt-name" placeholder="name" autocomplete="off" required>
-      <select id="lt-harness" title="agent harness">
-        <option value="claude" selected>claude</option>
-        <option value="codex">codex</option>
-      </select>
+      <select id="lt-harness" title="agent harness"></select>
     </div>
     <div id="lt-avatar-grid"></div>
     <div class="nc-actions">
@@ -441,6 +473,8 @@
       <span class="pane-live-lbl">live</span>
       <span class="pane-title" id="pane-title"></span>
       <span class="pane-hint" id="pane-hint">click the screen to type</span>
+      <button id="pane-copy" hidden title="copy a command to reach this session from a terminal, or open it in a desktop app">📋</button>
+      <a id="pane-term" hidden title="open this session in a real terminal">⌨</a>
       <button id="pane-close" title="close">✕</button>
     </div>
     <!-- One window, no tabs — the drawer looks exactly as it always has. A card
@@ -451,6 +485,7 @@
          the pane (including Escape, which is why the head carries the way out) -->
     <pre id="pane-body" tabindex="0"></pre>
     <div id="pane-msg" hidden></div>
+    <div class="pane-tabs" id="pane-sessions" hidden></div>
   </div>
 </div>
 

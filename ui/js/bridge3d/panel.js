@@ -203,7 +203,7 @@ export class Panel {
   }
 
   // A paragraph of prose. Returns the Text so a caller can rewrite it in place
-  // rather than rebuilding the panel, which is what the 5 s refresh does.
+  // rather than rebuilding the panel, which is what every pushed board does.
   addText(text, { size = W.TYPE.body, color = COL.text, weight = undefined } = {}) {
     const t = new Text({
       text: safe(text), fontSize: fontFor(size, this.spec.distM), color,

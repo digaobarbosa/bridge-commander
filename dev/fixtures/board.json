@@ -27,64 +27,15 @@
     "card:fix-flaky-sysload": "seen",
     "lieutenant:quill": "queued"
   },
-  "archiveFill": { "count": 42 },
-  "archive": [
-    {
-      "ts": "T-400000", "actor": "user", "reason": "merged",
-      "card": {
-        "id": "onboarding-checklist", "title": "First-run onboarding checklist", "type": "implementation", "playbook": "default",
-        "owner": "quill", "column": "review", "labels": ["ux", "docs"],
-        "attributes": { "repo": "bridge-commander", "prs": [{ "url": "https://github.com/tonylampada/bridge-commander/pull/30", "state": "merged" }] },
-        "body": "A first-run checklist in the empty board: create a lieutenant → register a project → make a card. Landed in PR #30.",
-        "created": "T-900000", "updated": "T-400000",
-        "events": [
-          { "seq": 1, "ts": "T-900000", "level": 2, "kind": "created", "text": "card created", "actor": "user" },
-          { "seq": 2, "ts": "T-410000", "level": 1, "kind": "landed", "text": "merged & deployed", "actor": "quill" }
-        ],
-        "thread": [
-          { "author": "quill", "text": "landed — the checklist collapses itself once all three steps are done", "ts": "T-410000" }
-        ]
-      }
-    },
-    {
-      "ts": "T-350000", "actor": "user", "reason": "killed", "note": "superseded by the SSE approach",
-      "card": {
-        "id": "websocket-transport-spike", "title": "Spike: websocket transport", "type": "investigation", "playbook": "investigation",
-        "owner": "rex", "column": "working", "labels": ["spike", "infra"],
-        "attributes": { "repo": "bridge-commander" },
-        "body": "Would websockets beat SSE for the board push? (Answer: no — SSE + refetch-on-open is simpler and reconnects for free.)",
-        "created": "T-800000", "updated": "T-350000",
-        "events": [
-          { "seq": 3, "ts": "T-800000", "level": 2, "kind": "created", "text": "card created", "actor": "user" },
-          { "seq": 4, "ts": "T-360000", "level": 1, "kind": "question", "text": "SSE already covers reconnect — kill this?", "actor": "rex" }
-        ],
-        "thread": [
-          { "author": "rex", "text": "verdict: SSE wins. Recommend killing the card.", "ts": "T-360000" },
-          { "author": "user", "text": "agreed, kill it", "ts": "T-355000" }
-        ]
-      }
-    },
-    {
-      "ts": "T-150000", "actor": "user", "reason": "merged",
-      "card": {
-        "id": "rate-limit-dashboard", "title": "Rate-limit dashboard row", "type": "implementation",
-        "owner": "monica", "column": "review", "labels": ["ux"],
-        "attributes": { "repo": "bridge-commander", "prs": [{ "url": "https://github.com/tonylampada/bridge-commander/pull/44", "state": "merged" }] },
-        "body": "Surface the harness rate-limit windows in the /status reply block.",
-        "created": "T-500000", "updated": "T-150000",
-        "events": [
-          { "seq": 6, "ts": "T-500000", "level": 2, "kind": "created", "text": "card created", "actor": "user" },
-          { "seq": 7, "ts": "T-160000", "level": 1, "kind": "landed", "text": "merged in PR #44", "actor": "monica" }
-        ],
-        "thread": []
-      }
-    }
+  "schedules": [
+    { "name": "nightly-digest", "hook": "digest", "when": "0 7 * * *", "owner": "monica", "created": "T-864000", "lastWindow": "T-3600" },
+    { "name": "pr-sweep", "hook": "digest", "when": "30m", "owner": "rex", "paused": true, "created": "T-400000" }
   ],
   "lieutenants": [
     {
       "id": "monica", "name": "Monica", "color": "#7c5cff", "avatar": 12, "prefix": "MON", "cardSeq": 14,
       "created": "T-864000", "lastTurnEnd": "T-120", "turns": 342,
-      "ref": { "harness": "claude", "session": "bc-lt-monica", "cwd": "/fake/ws" },
+      "ref": { "harness": "claude", "session": "bc-lt-monica", "cwd": "/fake/ws", "resumeId": "5d1f0a2e-7c3b-4e8a-9f61-2b4c8d0e3a17" },
       "chat": [
         { "author": "user", "text": "monica, auth week: you own the oauth refresh and the hooks polish. Small PRs, as always.", "ts": "T-140500" },
         { "author": "monica", "text": "Copy. Sequencing: hooks polish first (it unblocks the CI hook rex needs), oauth right behind it.", "ts": "T-140400" },
@@ -127,7 +78,7 @@
   "workers": [
     {
       "card": "oauth-token-refresh", "project": "bridge-commander", "branch": "bc/oauth-refresh",
-      "ref": { "harness": "claude", "session": "bc-w-oauth", "cwd": "/fake/wt/oauth" },
+      "ref": { "harness": "claude", "session": "bc-w-oauth", "cwd": "/fake/wt/oauth", "resumeId": "a3e9c4b1-0d52-4f7e-8c36-91b7f2d5e604" },
       "worktree": { "path": "/fake/wt/oauth", "tool": "git" },
       "spawnedAt": "T-80000", "turns": 41, "lastTurnEnd": "T-600",
       "agentStatus": { "model": "claude-fable-5", "contextUsed": 88000, "contextWindow": 200000, "ts": "T-600" }
@@ -263,7 +214,7 @@
         { "seq": 58, "ts": "T-4100", "level": 2, "kind": "signal", "text": "coverage gate was counting fixtures — fixing the globs", "actor": "wk-ci-shard" }
       ],
       "thread": [
-        { "author": "rex", "text": "shard timings attached — shard 3 carries the flake. Context is at 86%, I'll `/compact` the worker after the coverage fix.", "ts": "T-4000", "attachments": [{ "id": "att-log1", "name": "worker.log", "mime": "text/plain", "size": 421 }] }
+        { "author": "rex", "text": "shard timings attached — shard 3 carries the flake. Context is at 86%, I'll `/compact` the worker after the coverage fix.", "ts": "T-4000", "attachments": [{ "id": "a77ac0de0002", "name": "worker.log", "mime": "text/plain", "size": 421 }] }
       ],
       "threadStart": "T-4000"
     },
@@ -330,7 +281,7 @@
         { "author": "monica", "text": "`hook deploy-notify timed out after 10s — stderr: connect ETIMEDOUT 10.0.0.7:443`\n\nTruncated at 200 chars, mono in the feed.", "ts": "T-43500" },
         { "author": "user", "text": "good. squash the WIP commits before the PR", "ts": "T-20000" },
         { "author": "monica", "text": "Squashed to 3 logical commits. Running the full suite once more, then PR.", "ts": "T-19000" },
-        { "author": "monica", "text": "PR up: extracted the hook runner, 6 new tests. Screenshot of the new event chips attached. Diff is small, promise 🤞", "ts": "T-5400", "attachments": [{ "id": "att-shot1", "name": "board-screenshot.svg", "mime": "image/svg+xml", "size": 1650 }] }
+        { "author": "monica", "text": "PR up: extracted the hook runner, 6 new tests. Screenshot of the new event chips attached. Diff is small, promise 🤞", "ts": "T-5400", "attachments": [{ "id": "a77ac0de0001", "name": "board-screenshot.svg", "mime": "image/svg+xml", "size": 1650 }] }
       ],
       "threadStart": "T-129000"
     },

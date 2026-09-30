@@ -9,9 +9,11 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   claudeProjectSlug, claudeContextWindow, claudeStatus,
-  claudeSidecarStatus, findBridgeWorkspace,
+  claudeSidecarStatus,
   codexRolloutFile, codexThreadId, codexStatus, formatStatus,
 } = require('../agent-status.js');
+// The windows are the claude PROFILE's data now (claude-tmux.js), not agent-status's.
+const WINDOWS = require('../claude-tmux.js').profile.contextWindows;
 
 function tmpdir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -36,10 +38,12 @@ test('claudeProjectSlug: every non-alphanumeric becomes a dash (verified rule)',
 });
 
 test('claudeContextWindow: fable 1M, opus/sonnet 200k, unknown default', () => {
-  assert.strictEqual(claudeContextWindow('claude-fable-5'), 1000000);
-  assert.strictEqual(claudeContextWindow('claude-opus-4-8'), 200000);
-  assert.strictEqual(claudeContextWindow('claude-sonnet-5'), 200000);
-  assert.strictEqual(claudeContextWindow('some-new-model'), 200000);
+  assert.strictEqual(claudeContextWindow('claude-fable-5', WINDOWS), 1000000);
+  assert.strictEqual(claudeContextWindow('claude-opus-4-8', WINDOWS), 200000);
+  assert.strictEqual(claudeContextWindow('claude-sonnet-5', WINDOWS), 200000);
+  assert.strictEqual(claudeContextWindow('some-new-model', WINDOWS), 200000);
+  // a derived profile's pairs come first, so they win the substring match
+  assert.strictEqual(claudeContextWindow('deepseek-chat', [['deepseek', 128000]].concat(WINDOWS)), 128000);
 });
 
 test('claudeStatus: last assistant line wins; contextUsed sums the four usage fields', () => {
@@ -54,7 +58,7 @@ test('claudeStatus: last assistant line wins; contextUsed sums the four usage fi
       + assistantLine('claude-fable-5', { input_tokens: 1, output_tokens: 1 }) // stale — must not win
       + assistantLine('claude-fable-5', USAGE)
       + JSON.stringify({ type: 'progress' }) + '\n'); // trailing non-assistant noise
-    const st = claudeStatus({ cwd, resumeId: sid }, { projectsDir });
+    const st = claudeStatus({ cwd, resumeId: sid }, { projectsDir, contextWindows: WINDOWS });
     assert.deepStrictEqual(st, { model: 'claude-fable-5', contextUsed: USED, contextWindow: 1000000 });
   } finally {
     fs.rmSync(projectsDir, { recursive: true, force: true });
@@ -191,19 +195,6 @@ test('claudeSidecarStatus: bad JSON / missing window → null (falls through), n
     writeSidecar(ws, 'nowin', { session_id: 'nowin', cwd: ws, model: { id: 'claude-opus-4-8' } });
     assert.strictEqual(claudeSidecarStatus({ cwd: ws, resumeId: 'nowin' }), null);
     assert.strictEqual(claudeSidecarStatus({ cwd: ws, resumeId: 'absent' }), null);
-  } finally {
-    fs.rmSync(ws, { recursive: true, force: true });
-  }
-});
-
-test('findBridgeWorkspace: nearest .bridge-commander/ ancestor, else null', () => {
-  const ws = tmpdir('bc-find-ws-');
-  try {
-    fs.mkdirSync(path.join(ws, '.bridge-commander'), { recursive: true });
-    const deep = path.join(ws, 'x', 'y');
-    fs.mkdirSync(deep, { recursive: true });
-    assert.strictEqual(findBridgeWorkspace(deep), ws);
-    assert.strictEqual(findBridgeWorkspace('/'), null);
   } finally {
     fs.rmSync(ws, { recursive: true, force: true });
   }
@@ -403,4 +394,23 @@ test('formatStatus: claude shape (no rate limits) renders model + context only',
   const text = formatStatus({ model: 'claude-fable-5', contextUsed: 185709, contextWindow: 1000000 });
   assert.strictEqual(text,
     'model: claude-fable-5\n\ncontext: 185,709 / 1,000,000 tokens (19%)');
+});
+
+// A derived profile (deepseek over claude) names its model's window; claude's
+// statusline reports a window sized for models IT knows, so the profile wins.
+test('claudeStatus: a derived profile\'s window override beats the sidecar\'s report', () => {
+  const ws = tmpdir('bc-status-override-');
+  try {
+    fs.mkdirSync(path.join(ws, '.bridge-commander'), { recursive: true });
+    const sid = 'ov-1111';
+    writeSidecar(ws, sid, {
+      session_id: sid, cwd: ws, model: { id: 'deepseek-chat' },
+      context_window: { context_window_size: 200000, total_input_tokens: 5000 },
+    });
+    const st = claudeStatus({ cwd: ws, resumeId: sid }, { windowOverrides: [['deepseek', 128000]] });
+    assert.strictEqual(st.contextWindow, 128000);
+    assert.strictEqual(claudeStatus({ cwd: ws, resumeId: sid }, {}).contextWindow, 200000, 'no override, the report stands');
+  } finally {
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
 });

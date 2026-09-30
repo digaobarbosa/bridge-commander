@@ -10,9 +10,17 @@
 // is involved — keys go out, the polled frames come back, and the server bursts
 // the poll for a moment after input so the echo does not sit behind the 1s
 // baseline.
-import { card, lieutenant } from './state.js';
+import { card, lieutenant, workerFor } from './state.js';
+import { api } from './api.js';
 import { ansiToHtml } from './ansi.js';
 import { keyForEvent } from './panekeys.js';
+import { terminalLink, openerLink, safeAttach, refResume, appResumeLink, cardTarget, lieutenantTarget, cardSessions, sessionNavigation } from './terminal.js';
+import { openPopover, closePopover } from './popover.js';
+import { handResumeOf, appResumeOf, adapterOf } from './plugins.js';
+import { getTerminalMode, onTerminalMode } from './terminalsettings.js';
+import { push as toast } from './toast.js';
+import { keepStream } from './streamkeeper.js';
+import { archivedCard } from './archive.js';
 
 const overlay = document.getElementById('pane-overlay');
 const titleEl = document.getElementById('pane-title');
@@ -20,10 +28,98 @@ const liveEl = document.getElementById('pane-live');
 const preEl = document.getElementById('pane-body');
 const msgEl = document.getElementById('pane-msg');
 const hintEl = document.getElementById('pane-hint');
+const termEl = document.getElementById('pane-term');
+const copyEl = document.getElementById('pane-copy');
+const sessionsEl = document.getElementById('pane-sessions');
 let es = null;
+let keeper = null;               // reopens es while the drawer is open
+// The server pings pane streams every 5s; longer silence means a dead stream.
+const STALE_MS = 12000;
 let inputUrl = null;
+let termTarget = null;          // { session, window } of what the drawer shows
+let resume = null;              // { cmd, cli } when the harness can be resumed by hand
+let app = null;                 // { label, href } when a desktop app opens the conversation
+let acp = false;                // an acp session: no tmux, the ways out are resume and app
+// A second client on a live conversation: the board's agent and it both write.
+const CONFLICT = 'a second client on a live session can conflict';
 
-function stop() { if (es) { es.close(); es = null; } }
+// ---------- ⌨ open in a real terminal ----------
+// Off (the default) or no known session: the button is not there at all.
+function drawTerm() {
+  const mode = getTerminalMode();
+  const link = overlay.hidden ? null
+    : termTarget ? terminalLink(mode, termTarget)
+      : acp && resume ? openerLink(mode, resume.cmd) : null;
+  termEl.hidden = !link;
+  termEl.title = acp && resume
+    ? 'open this conversation with ' + resume.cli + ' in a real terminal — use when the board\'s session is stopped: ' + CONFLICT
+    : 'open this session in a real terminal';
+  termEl.dataset.copy = (link && link.copy) || '';
+  if (link && link.href) termEl.href = link.href; else termEl.removeAttribute('href');
+}
+termEl.onclick = (e) => {
+  const cmd = termEl.dataset.copy;
+  if (!cmd) return;              // an href: the browser hands it to the terminal app
+  e.preventDefault();
+  navigator.clipboard.writeText(cmd).then(
+    () => toast({ emoji: '⌨', text: (termTarget ? 'tmux' : 'resume') + ' command copied — paste it in a terminal' }),
+    () => toast({ emoji: '⌨', text: 'could not copy: ' + cmd }));
+};
+onTerminalMode(drawTerm);
+
+// ---------- 📋 copy a command ----------
+// Independent of the ⌨ setting: copying needs no terminal choice, and it is the
+// way in when the board's own session is gone.
+function copyItems() {
+  const attach = safeAttach(termTarget);
+  const items = [];
+  if (attach) items.push({ label: 'attach tmux', cmd: attach,
+    title: 'join the live session as a grouped session — the agent\'s own view never moves' });
+  if (resume) items.push({ label: 'resume ' + resume.cli, cmd: resume.cmd,
+    title: 'use only when the board\'s session is gone — two ' + resume.cli + ' processes on one conversation conflict' });
+  if (app) items.push({ label: 'open in ' + app.label, href: app.href,
+    title: 'opens this conversation in ' + app.label + ' — ' + CONFLICT + '; prefer it once the board\'s session is stopped' });
+  return items;
+}
+function resumeOf(ref) {
+  const prefix = handResumeOf(ref && ref.harness);
+  const cmd = refResume(ref, prefix);
+  return cmd ? { cmd, cli: prefix.split(' ')[0] } : null;
+}
+function appOf(ref) {
+  const a = appResumeOf(ref && ref.harness);
+  const href = a && ref ? appResumeLink(a, ref.resumeId) : null;
+  return href ? { label: a.label, href } : null;
+}
+// setAgent(target, ref) — what the drawer's ways out address. An acp ref's
+// session name is no tmux session, so it never becomes an attach target.
+function setAgent(target, ref) {
+  acp = adapterOf(ref && ref.harness) === 'acp';
+  termTarget = acp ? null : target;
+  resume = resumeOf(ref);
+  app = appOf(ref);
+}
+function drawCopy() {
+  copyEl.hidden = overlay.hidden || !copyItems().length;
+  if (copyEl.hidden) closePopover('pane-copy-pop');
+}
+function copy(cmd) {
+  navigator.clipboard.writeText(cmd).then(
+    () => toast({ emoji: '📋', text: 'copied — paste it in a terminal' }),
+    () => toast({ emoji: '📋', text: 'could not copy: ' + cmd }));
+}
+copyEl.onclick = () => {
+  if (closePopover('pane-copy-pop')) return; // a second click is a toggle
+  const items = copyItems().map((it) => (it.href
+    ? { label: it.label, title: it.title + '\n\n' + it.href, onClick: () => { window.location.href = it.href; } }
+    : { label: it.label, title: it.title + '\n\n' + it.cmd, onClick: () => copy(it.cmd) }));
+  openPopover(copyEl, items, { id: 'pane-copy-pop', align: 'right' });
+};
+
+function stop() {
+  if (keeper) { keeper.stop(); keeper = null; }
+  if (es) { es.close(); es = null; }
+}
 function setLive(on) {
   liveEl.classList.toggle('on', on);
   liveEl.title = on ? 'live' : 'not streaming';
@@ -52,19 +148,11 @@ const SEND_TIMEOUT_MS = 5000;
 const JUMPS_QUEUE = new Set(['C-c', 'C-d', 'C-z', 'C-\\']);
 
 let sending = Promise.resolve();
+// api.js turns a 4xx/5xx into a rejection: without the flash a rejected
+// keystroke is preventDefaulted away from the browser and vanishes unseen.
 function post(url, payload) {
-  return fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
-  }).then((r) => {
-    // A 4xx/5xx is a RESOLVED fetch, so .catch() never sees it: without this a
-    // rejected keystroke is preventDefaulted away from the browser and then
-    // vanishes with no trace anywhere.
-    if (!r.ok) return r.json().catch(() => ({})).then((b) => { throw new Error(b.error || 'HTTP ' + r.status); });
-    return null;
-  }).catch((e) => { flash(String((e && e.message) || e)); });
+  return api.paneInput(url, payload, SEND_TIMEOUT_MS)
+    .then(() => null, (e) => { flash(String((e && e.message) || e)); });
 }
 function sendInput(payload) {
   if (!inputUrl) return;
@@ -118,6 +206,7 @@ preEl.addEventListener('paste', (e) => {
 
 function open(url, title, inputAt) {
   stop();
+  sessionsEl.hidden = true;
   inputUrl = inputAt;
   titleEl.textContent = title;
   preEl.hidden = false;
@@ -126,8 +215,19 @@ function open(url, title, inputAt) {
   setLive(false);
   overlay.hidden = false;
   setHint();
+  keeper = keepStream({ connect: () => connect(url), staleMs: STALE_MS });
+}
+
+function connect(url) {
+  if (es) es.close();
+  setLive(false);
   es = new EventSource(url);
+  const mine = es;
+  const alive = () => { if (keeper) keeper.alive(); };
+  es.addEventListener('ping', alive);
+  es.onopen = () => { if (keeper) keeper.opened(); };
   es.addEventListener('frame', (e) => {
+    alive();
     let frame;
     try { frame = JSON.parse(e.data); } catch (err) { return; }
     // Frames are whole-screen snapshots: replace, don't append. Stick to the
@@ -138,6 +238,13 @@ function open(url, title, inputAt) {
     if (stick) preEl.scrollTop = preEl.scrollHeight;
     setLive(true);
   });
+  es.addEventListener('caps', (e) => {
+    let c = {};
+    try { c = JSON.parse(e.data); } catch (err) { /* keep the default */ }
+    if (c.input === false) { inputUrl = null; setHint(); }
+    // No tmux session behind an event-log pane: nothing for a terminal to attach to.
+    if (c.attach === false) { termTarget = null; drawTerm(); drawCopy(); }
+  });
   es.addEventListener('unsupported', () => showMsg('this harness has no live pane view'));
   es.addEventListener('busy', () => showMsg('too many live panes open — close one and try again'));
   es.addEventListener('no-pane', (e) => {
@@ -145,7 +252,8 @@ function open(url, title, inputAt) {
     try { reason = (JSON.parse(e.data) || {}).reason || ''; } catch (err) { /* plain message */ }
     showMsg('no live pane' + (reason ? ' — ' + reason : ''));
   });
-  es.onerror = () => setLive(false); // EventSource reconnects on its own
+  // EventSource retries only while CONNECTING; the keeper reopens a CLOSED stream.
+  es.onerror = () => { setLive(false); if (keeper) keeper.error(mine); };
 }
 
 // ---------- tabs ----------
@@ -191,20 +299,121 @@ export function openCardPane(cardId, window_) {
   const base = '/api/cards/' + encodeURIComponent(cardId) + '/pane/';
   const q = pick ? '?window=' + encodeURIComponent(pick) : '';
   drawTabs(names, pick, (name) => openCardPane(cardId, name));
+  const w = workerFor(cardId);
+  setAgent(cardTarget(c, w, pick), w && w.ref);
   open(base + 'stream' + q, String(at.session || (c && c.title) || cardId), base + 'input' + q);
+  drawTerm();
+  drawCopy();
+}
+
+function navigation(s, worker) {
+  const matching = worker && worker.ref && worker.ref.resumeId === s.id;
+  const harness = (matching && worker.ref.harness) || s.harness;
+  return sessionNavigation(s, worker, getTerminalMode(), harness ? {
+    cli: handResumeOf(harness), app: appResumeOf(harness), adapter: adapterOf(harness),
+  } : {});
+}
+function launchSession(nav, cardId) {
+  if (nav.href) { closePane(); window.location.href = nav.href; }
+  else if (nav.copy) copy(nav.copy);
+  else if (nav.watch) openCardPane(cardId);
+}
+
+/** The eye opens the conversation; the separate watch action keeps the live pane. */
+export async function openCardSession(cardId) {
+  const liveCard = card(cardId);
+  let c = liveCard || (archivedCard(cardId) || {}).c;
+  if (!c) return;
+  let sessions = cardSessions(c);
+  if (!sessions.length) { openCardPane(cardId); return; }
+  let worker = liveCard && workerFor(cardId);
+  // Turn completion is not process death. Probe before offering another CLI client.
+  if (worker && sessions.some((s) => s.origin === 'managed' && s.surface !== 'app' && s.id === (worker.ref || {}).resumeId)) {
+    try {
+      const status = await api.sessionStatus(cardId);
+      c = { ...c, sessions: status.sessions, currentSession: status.currentSession };
+      sessions = cardSessions(c);
+      worker = status.worker;
+      if (!sessions.length) return;
+    } catch (e) {
+      worker = { ...worker, live: null };
+    }
+  }
+  const nav = navigation(sessions[0], worker);
+  if (sessions.length === 1 && nav && !nav.reason && (nav.href || nav.copy || nav.watch)) {
+    launchSession(nav, cardId);
+    return;
+  }
+  showSession(c, sessions, sessions[0], worker, !!liveCard);
+}
+
+function showSession(c, sessions, selected, worker, editable) {
+  stop();
+  inputUrl = null;
+  setAgent(null, null);
+  preEl.blur();
+  overlay.hidden = false;
+  preEl.hidden = true;
+  setLive(false);
+  setHint();
+  titleEl.textContent = c.title || c.id;
+  drawTerm();
+  drawCopy();
+  drawTabs(sessions.map((s) => s.key), selected.key, (key) =>
+    showSession(c, sessions, sessions.find((s) => s.key === key), worker, editable));
+  // Full ids and hostnames distinguish sessions with the same provider.
+  [...tabsEl.children].forEach((b, i) => {
+    const s = sessions[i];
+    b.textContent = (s.key === c.currentSession ? '● ' : '') + s.provider + ' · ' + s.id.slice(0, 8);
+    b.title = s.id + ' · ' + s.host;
+  });
+  const nav = navigation(selected, worker);
+  msgEl.hidden = false;
+  msgEl.textContent = `${selected.provider} · ${selected.surface} · ${selected.host}\n${selected.id}\n${selected.cwd}` +
+    (nav && nav.reason ? '\n\n' + nav.reason : '');
+  sessionsEl.textContent = '';
+  sessionsEl.hidden = false;
+  function button(label, run) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'pane-tab';
+    b.textContent = label;
+    b.onclick = run;
+    sessionsEl.appendChild(b);
+  }
+  if (nav) {
+    if (nav.href || nav.watch || nav.copy) button(nav.href ? nav.watch ? 'Attach live terminal' : 'Open in ' + (nav.label || 'terminal')
+      : nav.copy ? nav.watch ? 'Copy attach command' : 'Copy resume command' : 'Watch live session', () => launchSession(nav, c.id));
+    if (nav.cmd && !nav.watch && !nav.copy) button(nav.remote ? 'Copy command for ' + selected.host : 'Copy resume command', () => copy(nav.cmd));
+    if (nav.live && nav.href) button('Watch live session', () => openCardPane(c.id));
+  }
+  if (editable && selected.key !== c.currentSession) button('Make current session', async () => {
+    try {
+      await api.patchCard(c.id, { currentSession: selected.key });
+      c = { ...c, currentSession: selected.key };
+      showSession(c, cardSessions(c), selected, worker, editable);
+    } catch (e) { toast({ emoji: '⚠', text: e.message }); }
+  });
 }
 export function openLieutenantPane(id) {
   const l = lieutenant(id);
   const base = '/api/lieutenants/' + encodeURIComponent(id) + '/pane/';
   drawTabs([], null, () => {}); // a lieutenant is one session, never tabbed
+  setAgent(lieutenantTarget(l), l && l.ref);
   open(base + 'stream', String((l && l.ref && l.ref.session) || (l && l.name) || id), base + 'input');
+  drawTerm();
+  drawCopy();
 }
 export function closePane() {
   stop();
   inputUrl = null;
   drawTabs([], null, () => {});
+  sessionsEl.hidden = true;
+  setAgent(null, null);
   preEl.blur();
   overlay.hidden = true;
+  drawTerm();
+  drawCopy();
 }
 export function paneOpen() { return !overlay.hidden; }
 

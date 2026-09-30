@@ -1,6 +1,9 @@
 'use strict';
-// card.restore — resurrection with frozen state: round-trip, 404/409 paths,
-// most-recent-record selection, derived status on the restored card, CLI.
+// The archive, read and undone. GET /api/archive is the read behind the UI's
+// 🧊 archived mode: limit+offset windows over the append-only jsonl, newest
+// first, plus the total. card.restore is resurrection with frozen state:
+// round-trip, 404/409 paths, most-recent-record selection, derived status on
+// the restored card, CLI.
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
@@ -11,6 +14,55 @@ function archiveRecords(s) {
   return fs.readFileSync(path.join(s.dir, '.bridge-commander', 'archive.jsonl'), 'utf8')
     .split('\n').filter(Boolean).map((l) => JSON.parse(l));
 }
+
+// ---------- GET /api/archive: pages over the log ----------
+
+test('empty archive: {archive: [], total: 0}', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    const r = await s.api('GET', '/api/archive');
+    assert.strictEqual(r.status, 200);
+    assert.deepStrictEqual(r.body.archive, []);
+    assert.strictEqual(r.body.total, 0);
+  } finally {
+    await s.stop();
+  }
+});
+
+test('limit+offset windows, newest first, stable total; offset-less keeps the old meaning', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    for (let i = 1; i <= 5; i++) {
+      await s.api('POST', '/api/cards', withOwner({ title: 'Card ' + i }));
+      const r = await s.api('POST', '/api/cards/card-' + i + '/archive', { reason: i % 2 ? 'killed' : 'merged' });
+      assert.strictEqual(r.status, 200, 'archive card-' + i);
+    }
+    // newest first across the whole log
+    const all = await s.api('GET', '/api/archive');
+    assert.strictEqual(all.body.total, 5);
+    assert.deepStrictEqual(all.body.archive.map((r) => r.card.id),
+      ['card-5', 'card-4', 'card-3', 'card-2', 'card-1']);
+    // windows: contiguous, non-overlapping, each carrying the same total
+    const p1 = await s.api('GET', '/api/archive?limit=2&offset=0');
+    const p2 = await s.api('GET', '/api/archive?limit=2&offset=2');
+    const p3 = await s.api('GET', '/api/archive?limit=2&offset=4');
+    assert.deepStrictEqual(p1.body.archive.map((r) => r.card.id), ['card-5', 'card-4']);
+    assert.deepStrictEqual(p2.body.archive.map((r) => r.card.id), ['card-3', 'card-2']);
+    assert.deepStrictEqual(p3.body.archive.map((r) => r.card.id), ['card-1']);
+    for (const p of [p1, p2, p3]) assert.strictEqual(p.body.total, 5);
+    // past the end: empty window, total intact
+    const past = await s.api('GET', '/api/archive?limit=2&offset=10');
+    assert.deepStrictEqual(past.body.archive, []);
+    assert.strictEqual(past.body.total, 5);
+    // offset-less with a limit = the newest `limit` records (the CLI's call shape)
+    const top = await s.api('GET', '/api/archive?limit=3');
+    assert.deepStrictEqual(top.body.archive.map((r) => r.card.id), ['card-5', 'card-4', 'card-3']);
+  } finally {
+    await s.stop();
+  }
+});
+
+// ---------- card.restore ----------
 
 test('restore round-trip: frozen state intact, level-1 event appended, archive record kept', async () => {
   const s = await startServerWithLieutenant();
@@ -46,16 +98,24 @@ test('restore round-trip: frozen state intact, level-1 event appended, archive r
     assert.deepStrictEqual(card.events.slice(0, frozen.events.length), frozen.events);
     assert.strictEqual(card.events.length, frozen.events.length + 1);
     const ev = card.events[card.events.length - 1];
+    assert.strictEqual(ev.kind, 'resurrected');
     assert.strictEqual(ev.level, 1);
     assert.strictEqual(ev.actor, 'user');
     assert.strictEqual(ev.text, 'resurrected — killed by mistake');
     assert.ok(ev.seq > frozen.events[frozen.events.length - 1].seq); // fresh global seq
 
-    // the archive log stays append-only: the kill record remains for a live card
+    // live again on the board…
+    assert.ok((await s.api('GET', '/api/board')).body.cards.some((c) => c.id === 'revive-me'));
+    // …while the append-only log keeps the kill record, on disk and through the
+    // read the 🧊 mode pages (board is truth for liveness — the UI drops the row
+    // by id, not by the record vanishing)
     const recs = archiveRecords(s);
     assert.strictEqual(recs.length, 1);
     assert.strictEqual(recs[0].card.id, 'revive-me');
     assert.strictEqual(recs[0].reason, 'killed');
+    const arch = await s.api('GET', '/api/archive');
+    assert.strictEqual(arch.body.total, 1);
+    assert.strictEqual(arch.body.archive[0].card.id, 'revive-me');
   } finally {
     await s.stop();
   }

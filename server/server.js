@@ -7,7 +7,10 @@
 //   hookruns.jsonl append-only trace of every hook run (lifecycle and named), read from the tail
 //   eventkeys.json at-most-once keys for `event --key`, per card, pruned at 7 days
 //   chat/<lieutenant>.jsonl  append-only lieutenant main chat (the truth; board.json holds none)
-//   config.json    { port, host?, voices?, tts? } — port default 4780, written on first boot
+//   config.json    { port, host?, voices?, tts?, permissionMode? } — port default 4780, written on first boot;
+//                  permissionMode: auto (default) | default | acceptEdits | bypass — how every agent
+//                  launches; bypass = --dangerously-skip-permissions, the rest ask via the board
+//                  (POST /api/permission holds the hook until the captain decides)
 //   queue/<lieutenant>.jsonl  durable per-lieutenant delivery queue (global seq)
 //   queue/<lieutenant>.ack    committed ack cursor (at-least-once; only ack removes)
 //   server.pid     single server instance per workspace
@@ -23,7 +26,7 @@
 //             projects: [{name, path, mode, source?, added}],   // registered repos (F6)
 //             workers:  [{card, ref, worktree: {path, tool}, branch?, project,
 //                         spawnedAt, done?, outcome?, flagged?, paused?, lastTurnEnd?, lastTurnEndText?,
-//                         lastSignalAt?, lastSignalText?, turns?,
+//                         lastSignalAt?, lastSignalText?, lastPermissionAt?, turns?,
 //                         stopNotified?, staleNotified?, staleNotifiedAt?, staleHits?}],
 //             cards:   [{id, title, type, owner, column, labels[], attributes{}, body,
 //                        created, updated, threadStart, pendingOrder,
@@ -61,25 +64,45 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
+const { readSessionId } = require('../harness/util.js');
+const { createSessions, captureManaged, publicSessions } = require('./sessions.js');
 // The harness port — the ONLY seam the server speaks to agent sessions through
 // (docs/api/overview.md, "harness port"). Lazy builtins: requiring port.js
 // drags in no tmux/claude machinery until a ref is actually dispatched.
-const { isHarnessRef, harnessFor, getHarness } = require(path.join(__dirname, '..', 'harness', 'port.js'));
+const port = require(path.join(__dirname, '..', 'harness', 'port.js'));
+const { isHarnessRef, keyOf, isSpawnableSession } = port;
 const { createWorktree, releaseWorktree, worktreeToolFor } = require(path.join(__dirname, 'worktrees.js'));
-const { runHooks, runTeardown, listAllHooks, runNamedHook, runningHook, readRuns, lastRuns, hookKey,
-  hooksDir, namedHookFile, cancelNamedHook, traceSkip, lastRunsFor,
-  TEARDOWN_TIMEOUT_MS: TEARDOWN_DEFAULT_MS, HOOK_NAME_RE, LIFECYCLE_EVENTS } = require(path.join(__dirname, 'hooks.js'));
-const { parseWhen, nextAfter, dueWindows, pickWindows, describeWhen, normalizeSchedules,
+const { createWorkers } = require(path.join(__dirname, 'workers.js'));
+const { runHooks, runTeardown, runOne: hookRunOne, listAllHooks, runNamedHook, runningHook, readRuns, lastRuns, hookKey,
+  hooksDir, namedHookFile,
+  TEARDOWN_TIMEOUT_MS: TEARDOWN_DEFAULT_MS, HOOK_NAME_RE } = require(path.join(__dirname, 'hooks.js'));
+const { parseWhen, normalizeSchedules,
   NAME_RE: SCHEDULE_NAME_RE, OVERLAP, CATCHUP } = require(path.join(__dirname, 'schedules.js'));
 const { createSampler } = require(path.join(__dirname, 'sysload.js'));
 const { workerBrief, listPlaybooks, resolvePlaybook, playbooksDir, PACKAGED_PLAYBOOKS_DIR, parsePlaybook, attrVar, attrCardKey, PLACEHOLDERS, FRONTMATTER } = require(path.join(__dirname, 'playbooks.js'));
-const names = require(path.join(__dirname, 'names.js'));
-const { STATE_DIR_NAME, migrateStateDir, migrateHomeStateDir } = require(path.join(__dirname, 'statedir.js'));
+// layout.js: where things live in a workspace — the state dir, the charter,
+// and the session names (still read as `names.<fn>` below).
+const names = require(path.join(__dirname, 'layout.js'));
+const { STATE_DIR_NAME, migrateStateDir, migrateHomeStateDir, isId, ONBOARDING_STEPS,
+  charterPath, readCharter, writeCharter } = require(path.join(__dirname, 'layout.js'));
 const gitrev = require(path.join(__dirname, 'gitrev.js'));
-const { charterPath, readCharter, writeCharter } = require(path.join(__dirname, 'charter.js'));
-const { ONBOARDING_STEPS } = require(path.join(__dirname, 'firstrun.js'));
-const { proxyTts } = require(path.join(__dirname, 'ttsproxy.js'));
-const { proxyStt, proxySttUpgrade } = require(path.join(__dirname, 'sttproxy.js'));
+const { makeProxy, engineUrl } = require(path.join(__dirname, 'proxy.js'));
+const { createFileGate } = require(path.join(__dirname, 'filegate.js'));
+const { createClock } = require(path.join(__dirname, 'clock.js'));
+const { createWatchers } = require(path.join(__dirname, 'watchers.js'));
+const { createPrWatch } = require(path.join(__dirname, 'prwatch.js'));
+const manifests = require(path.join(__dirname, 'manifests.js'));
+const { createPluginHost } = require(path.join(__dirname, 'plugins.js'));
+const { createRuns } = require(path.join(__dirname, 'runs.js'));
+const { createChecks } = require(path.join(__dirname, 'checks.js'));
+const { createPluginApi } = require(path.join(__dirname, 'pluginapi.js'));
+const { createConversation, parseTarget, CAPTAIN } = require(path.join(__dirname, 'conversation.js'));
+const { permissionModes, permissionMode, summarize, createPermissions } = require(path.join(__dirname, 'permissions.js'));
+const { readJsonl, sealJsonl } = require(path.join(__dirname, 'jsonl.js'));
+const { createDelivery } = require(path.join(__dirname, 'delivery.js'));
+const feedtext = require(path.join(__dirname, 'feedtext.js'));
+const { createStore } = require(path.join(__dirname, 'store.js'));
 const { execFile, execFileSync } = require('child_process');
 
 // ---------- args ----------
@@ -101,10 +124,10 @@ const opts = parseArgs(process.argv.slice(2));
 
 // ---------- paths (workspace-scoped; no global state) ----------
 // Resolved AND real: every path the board hands out is built from this one, and
-// hookTarget() compares a hook's containing directory against realpathSync of
-// itself. A workspace reached through a symlinked parent (/tmp on macOS,
-// ~/work → /mnt/data/work anywhere) would fail that comparison for the board's
-// OWN hooks, so the link is followed once here rather than at each call site.
+// the file gate (filegate.js) compares a hook's containing directory against
+// realpathSync of itself. A workspace reached through a symlinked parent (/tmp
+// on macOS, ~/work → /mnt/data/work anywhere) would fail that comparison for the
+// board's OWN hooks, so the link is followed once here rather than at each call site.
 // A workspace that is not on disk YET is the same question one level up: `--workspace
 // ~/work/newboard` through a ~/work → /mnt/data/work link has a link to follow even
 // though the board's own directory does not exist. So this resolves the deepest
@@ -112,7 +135,8 @@ const opts = parseArgs(process.argv.slice(2));
 // Worth the walk even though a restart would fix it: until then the whole life of
 // that process answers 404 to every hook on the tab, and nobody would ever connect
 // "the board came up before its directory did" to "the pencil stopped working".
-function realWorkspace(dir) {
+// A card artifact's directory takes the same walk (normalizeArtifactUri).
+function realDir(dir) {
   const missing = [];
   for (let at = dir; ;) {
     try { return path.join(fs.realpathSync(at), ...missing); } catch (e) {}
@@ -122,7 +146,7 @@ function realWorkspace(dir) {
     at = up;
   }
 }
-const WORKSPACE = realWorkspace(path.resolve(opts.workspace || process.cwd()));
+const WORKSPACE = realDir(path.resolve(opts.workspace || process.cwd()));
 // One-shot rename migrations (bridge-command → bridge-commander). Boot-time and
 // idempotent: the server owns this workspace as it starts, so renaming the state
 // dir before any path below is used is safe. Legacy installs survive the flag day.
@@ -146,13 +170,15 @@ const PID_FILE = path.join(STATE_DIR, 'server.pid');
 const UPLOADS_DIR = path.join(STATE_DIR, 'uploads');
 const UI_DIR = path.join(__dirname, '..', 'ui');
 // Harness working state (session ids, prompts, turn-end logs) lives in the
-// WORKSPACE, never in the harness's global last-resort dir — two boards on one
-// machine must never share it. BC_HARNESS_STATE stays an explicit override.
-const HARNESS_STATE_DIR = process.env.BC_HARNESS_STATE || path.join(STATE_DIR, 'harness');
+// WORKSPACE (layout.js harnessStateDir); the port is bound to it below.
+const HARNESS_STATE_DIR = names.harnessStateDir(STATE_DIR);
 fs.mkdirSync(QUEUE_DIR, { recursive: true });
 fs.mkdirSync(CHAT_DIR, { recursive: true });
 fs.mkdirSync(HARNESS_STATE_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+// A crash mid-append leaves a torn last line; end it so the next append starts clean.
+sealJsonl(ARCHIVE_FILE);
+for (const f of fs.readdirSync(CHAT_DIR)) if (f.endsWith('.jsonl')) sealJsonl(path.join(CHAT_DIR, f));
 
 // Upload size cap (decoded bytes). Over-cap uploads are rejected 413.
 const UPLOAD_MAX_BYTES = parseInt(process.env.BC_UPLOAD_MAX_BYTES, 10) > 0
@@ -162,30 +188,11 @@ const UPLOAD_MAX_BYTES = parseInt(process.env.BC_UPLOAD_MAX_BYTES, 10) > 0
 // preview cap; over-cap → 413.
 const ARTIFACT_MAX_BYTES = parseInt(process.env.BC_ARTIFACT_MAX_BYTES, 10) > 0
   ? parseInt(process.env.BC_ARTIFACT_MAX_BYTES, 10) : 25 * 1024 * 1024;
-// Extension → Content-Type for raw artifact byte serving. Images, video, and
-// audio render inline in the viewer; pdf may render inline; everything else
-// downloads.
-const ARTIFACT_MIME = {
-  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
-  '.webp': 'image/webp', '.svg': 'image/svg+xml', '.bmp': 'image/bmp', '.avif': 'image/avif',
-  '.pdf': 'application/pdf',
-  '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
-  '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.wav': 'audio/wav',
-  '.ogg': 'audio/ogg', '.oga': 'audio/ogg', '.opus': 'audio/ogg', '.flac': 'audio/flac',
-  // A rendered page and the things it pulls in beside itself.
-  '.html': 'text/html; charset=utf-8', '.htm': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
-  '.json': 'application/json', '.txt': 'text/plain; charset=utf-8',
-  '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf',
-};
 
 const DEFAULT_PORT = 4780;
 // The one prefix the TTS engine is served under, both ends of it: what the
 // browser is handed as its engine address, and what the proxy strips.
 const TTS_PREFIX = '/api/tts';
-// Same idea for the STT engine, http and websocket both. Nothing is handed to
-// the UI under this one — ui/stt-test.html is the only page that speaks it.
-const STT_PREFIX = '/api/stt';
 // ---------- workspace config (.bridge-commander/config.json) ----------
 function readConfig() {
   try {
@@ -194,9 +201,34 @@ function readConfig() {
   } catch (e) {}
   return {};
 }
+// The launch mode every agent gets, read at launch time so an edit to
+// config.json takes effect on the next spawn. An unknown value launches in the
+// default mode — said once per value, not on every launch.
+const warnedModes = new Set();
+// The modes the harnesses accept (profile data), the default harness's first:
+// its first mode is what an unknown value launches as.
+function harnessModes(c) {
+  const first = (c || readConfig()).harness || port.defaultHarness();
+  const lists = [first].concat(port.listHarnesses().map((h) => h.name)).map((n) => {
+    try { const info = port.profileInfo(n); return (info && info.permissionModes) || []; } catch (e) { return []; }
+  });
+  return permissionModes(lists);
+}
+function configPermissionMode(c) {
+  const cfg = c || readConfig();
+  const raw = cfg.permissionMode;
+  const modes = harnessModes(cfg);
+  const mode = permissionMode(raw, modes);
+  if (raw !== undefined && raw !== mode && !warnedModes.has(String(raw))) {
+    warnedModes.add(String(raw));
+    console.warn(now() + ' config.json permissionMode ' + JSON.stringify(raw)
+      + ' is not one of ' + modes.join('|') + ' — using ' + mode);
+  }
+  return mode;
+}
 function userConfig() {
   const c = readConfig();
-  const out = { voices: null };
+  const out = { voices: null, permissionMode: configPermissionMode(c) };
   if (Array.isArray(c.voices)) {
     const voices = c.voices.filter((v) => typeof v === 'string' && v.trim()).map((v) => v.trim());
     if (voices.length) out.voices = voices;
@@ -216,9 +248,8 @@ function userConfig() {
 // Anything malformed (or a missing url) reads as "not configured".
 function ttsConfig() {
   const t = readConfig().tts;
-  if (!t || typeof t !== 'object' || Array.isArray(t)) return null;
-  const url = typeof t.url === 'string' ? t.url.trim().replace(/\/+$/, '') : '';
-  if (!/^https?:\/\/\S+$/.test(url)) return null;
+  const url = engineUrl(t);
+  if (!url) return null;
   const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
   return {
     url,
@@ -227,17 +258,13 @@ function ttsConfig() {
     params: t.params && typeof t.params === 'object' && !Array.isArray(t.params) ? t.params : {},
   };
 }
-// External STT engine (whisper API), optional: config.json
-//   "stt": { "url": "http://127.0.0.1:8878" }
-// Anything malformed (or a missing url) reads as "not configured", and the
-// /api/stt routes 404 like they were never there.
-function sttConfig() {
-  const t = readConfig().stt;
-  if (!t || typeof t !== 'object' || Array.isArray(t)) return null;
-  const url = typeof t.url === 'string' ? t.url.trim().replace(/\/+$/, '') : '';
-  if (!/^https?:\/\/\S+$/.test(url)) return null;
-  return { url };
-}
+// The engines themselves, on the board's own origin (server/proxy.js). No
+// engine configured means no route at all: the prefix falls through to the
+// ordinary 404. STT is config.json "stt": { "url": "http://127.0.0.1:8878" },
+// and nothing is handed to the UI for it — ui/stt-test.html is the only page
+// that speaks it, over http and websocket both.
+const ttsProxy = makeProxy({ prefix: TTS_PREFIX, idleEnv: 'BC_TTS_IDLE_MS', urlOf: () => engineUrl(readConfig().tts) });
+const sttProxy = makeProxy({ prefix: '/api/stt', idleEnv: 'BC_STT_IDLE_MS', urlOf: () => engineUrl(readConfig().stt) });
 // Port: --port flag > config.json "port" > 4780. The resolved port is written
 // back into config.json when absent, so the CLI and UI can always find it.
 const cfg = readConfig();
@@ -255,6 +282,33 @@ const LOOPBACKS = ['127.0.0.1', 'localhost', '::1'];
 const BIND_HOST = opts.host || configHost() || '127.0.0.1';
 // Turn-end hooks (workspace-level and per-worker-spawn) POST here.
 const TURNEND_URL = 'http://127.0.0.1:' + PORT + '/api/turn-end';
+// The harness port BOUND to this workspace: every verb gets the state dir and
+// the turn-end callback from here, so no call site passes them and none can
+// forget them. The rest of the server asks for harnesses only through these two.
+const HARNESS_ENV = Object.freeze({ stateDir: HARNESS_STATE_DIR, callbackUrl: TURNEND_URL });
+function harnessFor(ref) { return port.harnessFor(ref, HARNESS_ENV); }
+function getHarness(name) { return port.getHarness(name, HARNESS_ENV); }
+// The harnesses plugins contribute as profiles (plugins/*/plugin.json and the
+// workspace's own), registered once, before anything asks for one by name.
+// A bad profile is logged and skipped; it never stops the boot.
+const PLUGINS_DIR = path.join(STATE_DIR, 'plugins');
+// Which profiles a catalog enables, as one comparable string: an overlay change
+// that moves it needs a restart (profiles register once, here).
+function profilesKey(catalog) {
+  return manifests.contributions(catalog).profiles.map((p) => p.plugin + '/' + p.name).sort().join(',');
+}
+const BOOT_PROFILES = (() => {
+  const log = (m) => console.error(now() + ' ' + m);
+  const catalog = manifests.resolveCatalog({ workspaceDir: PLUGINS_DIR, stateDir: STATE_DIR, log });
+  const profiles = manifests.contributions(catalog).profiles;
+  require(path.join(__dirname, '..', 'harness', 'profiles.js')).loadProfiles({
+    profiles,
+    stateDir: STATE_DIR, // where secrets.env lives
+    harnessStateDir: HARNESS_STATE_DIR,
+    log,
+  });
+  return profilesKey(catalog);
+})();
 
 // The commit this process is RUNNING, decided once here at boot and never
 // re-read: a merge into the checkout below moves the files, not this record,
@@ -356,6 +410,7 @@ function normalizeBoard(doc) {
     if (!Array.isArray(c.thread)) c.thread = [];
     if (!Array.isArray(c.labels)) c.labels = [];
     if (!c.attributes || typeof c.attributes !== 'object') c.attributes = {};
+    if (c.sessions !== undefined && !Array.isArray(c.sessions)) c.sessions = [];
     if (!CARD_TYPES.includes(c.type)) c.type = 'implementation';
     // playbook: the id of a file in playbooks/, or '' — cards that predate it
     // have none and cannot start until one is set (card patch --playbook <id>).
@@ -371,6 +426,7 @@ function normalizeBoard(doc) {
       c.status = { worker: ok ? { id: String(w.id), state: w.state, expires: w.expires || null } : null };
     }
   }
+  for (const w of b.workers) captureWorkerSession(b.cards.find((c) => c.id === w.card), w);
   // seq must top every stored event (defensive after hand edits)
   let max = b.seq || 0;
   for (const e of b.events) if (e.seq > max) max = e.seq;
@@ -378,29 +434,54 @@ function normalizeBoard(doc) {
   b.seq = max;
   return b;
 }
-function loadBoard() {
-  try { return normalizeBoard(JSON.parse(fs.readFileSync(BOARD_FILE, 'utf8'))); }
-  catch (e) { return defaultBoard(); }
-}
-let board = loadBoard();
 // What lands on disk: the board MINUS every lieutenant's chat. The main chat is
 // an append-only log of its own (chat/<id>.jsonl, below) — keeping a second copy
 // here is the drift bug, and it is what made every write rewrite megabytes of
 // conversation nobody scrolls to.
-function storedBoard() {
-  return Object.assign({}, board, {
-    lieutenants: board.lieutenants.map((l) => {
+function storedBoard(b) {
+  return Object.assign({}, b, {
+    lieutenants: b.lieutenants.map((l) => {
       const copy = Object.assign({}, l);
       delete copy.chat;
       return copy;
     }),
   });
 }
-function saveBoard() {
-  board.updated = now();
-  const tmp = BOARD_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(storedBoard(), null, 2));
-  fs.renameSync(tmp, BOARD_FILE);
+// The board lives in the store (server/store.js): it is the only writer of
+// board.json, mints every event, and coalesces the SSE push. `board` is the
+// live object for the rest of this file; a change goes through store.mutate
+// (a domain result) or store.commit (a change already made).
+const store = createStore({
+  file: BOARD_FILE, normalize: normalizeBoard, fresh: defaultBoard, serialize: storedBoard,
+  kinds: () => effectiveKinds(), now,
+  publish: () => sseSend('board', publicBoard('user')),
+  log: (m) => console.error(now() + ' ' + m),
+});
+const board = store.load();
+const sessions = createSessions({ board: () => board, findCard, createCard, readArchive, now,
+  managedCard: (session) => {
+    if (session.host !== os.hostname()) return null;
+    const w = board.workers.find((w) => workerProvider(w.ref) === session.provider
+      && (w.ref.resumeId || readSessionId(HARNESS_STATE_DIR, keyOf(w.ref)) || '').toLowerCase() === session.id);
+    return w ? findCard(w.card) : null;
+  },
+  rememberManaged: (card) => captureWorkerSession(card, findWorker(card.id)),
+  event: (card, fields) => store.cardEvent(card, fields),
+});
+
+function workerProvider(ref) {
+  try {
+    const profile = port.profileOf(ref.harness);
+    return profile && profile.sessionProvider || null;
+  } catch {}
+  return null;
+}
+function captureWorkerSession(card, w) {
+  if (!w || !w.ref) return null;
+  const entry = captureManaged(card, w, { provider: workerProvider(w.ref),
+    id: w.ref.resumeId || readSessionId(HARNESS_STATE_DIR, keyOf(w.ref)), now: now() });
+  if (entry) w.ref.resumeId = entry.id;
+  return entry;
 }
 
 // One-time migration, at boot: the charter used to be a board field. Move what
@@ -425,7 +506,7 @@ function saveBoard() {
     delete lt.charter;
     moved = true;
   }
-  if (moved) saveBoard();
+  if (moved) store.save();
 })();
 
 // ---------- events / kinds ----------
@@ -473,6 +554,17 @@ const BUILTIN_KINDS = {
   'harness-switch': { emoji: '🔀', level: 1 },
   'needs-captain': { emoji: '🚨', level: 1 },
   line: { emoji: '📞', level: 2 },
+  // Kinds the server's own verbs emit (/reset, worker send, PR watch, permission
+  // decisions): without
+  // an entry here they render on the timeline with no emoji.
+  reset: { emoji: '🧹', level: 1 },
+  'worker-send': { emoji: '📨', level: 2 },
+  interrupted: { emoji: '⏹️', level: 2 },
+  'pr-merged': { emoji: '🟣', level: 2 },
+  permission: { emoji: '🔐', level: 2 },
+  // A tracked plugin command (an activity) that failed or timed out. Level 1,
+  // like hook-failed: somebody asked for it and it did not happen.
+  'activity-failed': { emoji: '🧯', level: 1 },
 };
 function validKindEntry(v) {
   return !!(v && typeof v === 'object' && typeof v.emoji === 'string' && v.emoji.trim() &&
@@ -489,23 +581,8 @@ function sanitizeKinds(doc) {
   return out;
 }
 function effectiveKinds() { return Object.assign({}, BUILTIN_KINDS, board.kinds); }
-// Level resolution: explicit level wins; else the kind's level from the
-// effective map (registered over built-ins); else the caller's default; else 2.
-function mkEvent(body, defaults) {
-  const kindRaw = body.kind == null ? '' : String(body.kind).trim();
-  const kind = kindRaw ? kindRaw.slice(0, 60) : (defaults.kind || null);
-  const known = kind ? effectiveKinds()[kind] : null;
-  const level = body.level === 2 ? 2 : body.level === 1 ? 1
-    : known ? known.level
-    : (defaults.level === 1 || defaults.level === 2 ? defaults.level : 2);
-  const ev = {
-    seq: ++board.seq, ts: now(), level,
-    text: String(body.text || '').slice(0, 2000),
-    actor: String(body.actor || defaults.actor || 'agent').slice(0, 60),
-  };
-  if (kind) ev.kind = kind;
-  return ev;
-}
+// Events are minted by the store (it owns board.seq); level resolution is there.
+const mkEvent = store.event;
 
 // ---------- label registry (user-owned; persisted in board json) ----------
 const LABEL_PALETTE = ['#4cc2ff', '#2fbf71', '#e2b93b', '#c678dd', '#e2795b', '#56b6c2', '#98c379', '#e06c75'];
@@ -514,6 +591,7 @@ function validColor(c) { return typeof c === 'string' && /^#[0-9a-fA-F]{6}$/.tes
 // 8x8, row-major). Absent = colored-dot fallback everywhere (every existing
 // lieutenant has no avatar).
 function validAvatar(a) { return Number.isInteger(a) && a >= 0 && a <= 63; }
+const BAD_AVATAR = 'avatar must be an integer 0-63';
 // lieutenant voice: an opaque TTS-engine voice id, whatever the engine calls its
 // own. Absent = the board's voice speaks for this lieutenant (the default).
 function validVoice(v) { return typeof v === 'string' && v.trim() ? v.trim().slice(0, 200) : null; }
@@ -528,6 +606,15 @@ function validModel(m) {
   // eslint-disable-next-line no-control-regex
   if (!t || /[\s\u0000-\u001f]/.test(t) || t.length > 100) return null;
   return t;
+}
+// lieutenant effort: the reasoning level (low, high, …). No list here either, for
+// the same reason as the model. Tighter than a model token because codex splices
+// it into a TOML override (`-c model_reasoning_effort=<e>`), where only a bare
+// word parses. Absent = the harness default.
+function validEffort(e) {
+  if (typeof e !== 'string') return null;
+  const t = e.trim();
+  return /^[A-Za-z0-9_-]{1,30}$/.test(t) ? t : null;
 }
 function labelIndex(name) { return board.labels.findIndex((l) => l && l.name === name); }
 function registerCardLabels() {
@@ -587,9 +674,14 @@ function uniquePrefixIn(lts, base, exceptId) {
     if (!taken(cand)) return cand;
   }
 }
+// The id this lieutenant mints next — what createCard will pick, said ahead of
+// it so no client has to repeat the arithmetic.
+function nextCardId(l) { return l.prefix + '-' + ((Number.isInteger(l.cardSeq) ? l.cardSeq : 0) + 1); }
 const BAD_PREFIX = 'bad prefix (1-8 letters/digits starting with a letter — it heads every card id this lieutenant mints)';
 const BAD_MODEL = 'bad model (one token, no spaces or control characters, max 100 chars — '
   + 'it is handed straight to the harness CLI as --model; null clears it back to the harness default)';
+const BAD_EFFORT = 'bad effort (one word of letters, digits, _ or -, max 30 chars — e.g. low, high; '
+  + 'null clears it back to the harness default)';
 function prefixOwner(p, exceptId) {
   return board.lieutenants.find((l) => l.id !== exceptId && l.prefix === p) || null;
 }
@@ -607,6 +699,35 @@ function ensureMinting(lts) {
   }
 }
 
+// ---------- conversation & identity (server/conversation.js) ----------
+// Who is talking — and, from there, what a say sets in motion — lives in one
+// module bound to this board, so every route asks the same question the same way.
+const conversation = createConversation({ board: () => board, now, queuePush, chatAppend, mkEvent });
+
+/**
+ * resolveHookAgent(body) — the agent a turn-end hook POST came from:
+ * { lt, worker } with at most one set. The hook's fields mapped onto identify().
+ */
+function resolveHookAgent(body) {
+  const tmux = typeof body.tmux_session === 'string' ? body.tmux_session : null;
+  const who = conversation.identify({
+    sessionId: body.session_id,
+    key: body.session,
+    session: tmux,
+    // only an OLD hook (no tmux_session field at all) may be adopted by cwd
+    cwd: tmux === null && body.cwd ? path.resolve(String(body.cwd)) : '',
+  });
+  return { lt: who.kind === 'lieutenant' ? who.lt : null, worker: who.kind === 'worker' ? who.worker : null };
+}
+
+/**
+ * callerOf(fields) — identify() for a CLI caller: bc-axi sends its tmux
+ * `session` and `window` (the window is absent from an older bc-axi).
+ */
+function callerOf(fields) {
+  return conversation.identify({ session: fields.session, window: fields.window });
+}
+
 // ---------- the line (the captain's voice channel) ----------
 // The captain talks to the board from his phone with the screen off, through a
 // voice shortcut that has no chat picker: it posts `target: "line"` and names
@@ -622,36 +743,23 @@ function ensureMinting(lts) {
 // FOUNDING lieutenant (first registered — the teleport) holds it by default, so
 // the shortcut works on day one with nothing seeded. Only a board with no
 // lieutenant at all has nobody on the line.
-function lineHolder() {
-  const held = board.line ? findLieutenant(board.line) : null; // a retired holder falls back
-  if (held) return { lieutenant: held, source: 'held' };
-  const first = board.lieutenants[0];
-  if (first) return { lieutenant: first, source: 'default' };
-  return { lieutenant: null, source: 'none' };
-}
-// The line follows the voice the captain last heard. Silent no-op when it is
-// already there, so an answering lieutenant never churns board state.
-function lineFollow(id) {
-  if (!id || board.line === id || !findLieutenant(id)) return false;
-  board.line = id;
-  return true;
-}
+function lineHolder() { return conversation.lineHolder(); }
 
 function createLieutenant(body) {
   const name = String(body.name || '').trim();
-  if (!name) return { error: 'name required' };
+  if (!name) return { error: 'name required', code: 400 };
   const id = body.id ? String(body.id) : lieutenantIdFrom(name);
-  if (!/^[\w][\w.-]*$/.test(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])' };
+  if (!isId(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])', code: 400 };
   if (findLieutenant(id)) return { error: 'lieutenant exists: ' + id, code: 409 };
   if (body.avatar !== undefined && body.avatar !== null && !validAvatar(body.avatar)) {
-    return { error: 'avatar must be an integer 0-63' };
+    return { error: BAD_AVATAR, code: 400 };
   }
   let prefix;
   if (body.prefix === undefined || body.prefix === null || body.prefix === '') {
     prefix = uniquePrefixIn(board.lieutenants, prefixFrom(name), id);
   } else {
     prefix = validPrefix(body.prefix);
-    if (!prefix) return { error: BAD_PREFIX };
+    if (!prefix) return { error: BAD_PREFIX, code: 400 };
     const clash = prefixOwner(prefix, id);
     if (clash) return { error: prefixTakenMsg(prefix, clash), code: 409 };
   }
@@ -663,10 +771,10 @@ function createLieutenant(body) {
   if (validAvatar(body.avatar)) lt.avatar = body.avatar;
   if (validVoice(body.voice)) lt.voice = validVoice(body.voice);
   if (validModel(body.model)) lt.model = validModel(body.model);
+  if (validEffort(body.effort)) lt.effort = validEffort(body.effort);
   if (isHarnessRef(body.ref)) lt.ref = body.ref; // the live-session address, persisted with the board
   board.lieutenants.push(lt);
-  const ev = mkEvent({ text: 'lieutenant ' + lt.name + ' joined the bridge', actor: body.actor || 'user', level: 2 }, {});
-  board.events.push(ev);
+  store.boardEvent({ text: 'lieutenant ' + lt.name + ' joined the bridge', actor: body.actor || 'user', level: 2 });
   return { lieutenant: lt };
 }
 
@@ -731,16 +839,32 @@ function respawnPrompt(lt) {
 }
 
 // The launch options every lieutenant spawn and resume goes out with. The model
-// rides in `extraArgs` exactly the way card.start pins a worker's, so the flag
-// is recorded with the spawn and replayed by a resume — a lieutenant pinned to
-// a model comes back on it, respawn after respawn.
-function ltLaunchOpts(lt, extra) {
+// is the TYPED `model` option, the way card.start pins a worker's: the harness
+// turns it into its own flag and records it with the spawn, so a resume
+// replays it — a lieutenant pinned to a model comes back on it, respawn after
+// respawn. A harness that cannot take a model starts without it, and the
+// board says so once per lieutenant and harness, not on every respawn.
+const ignoredLtOptions = new Set();
+function ltLaunchOpts(lt, extra, harness) {
   const opts = Object.assign(
-    { stateDir: HARNESS_STATE_DIR, callbackUrl: TURNEND_URL, installHooks: false },
+    { installHooks: false, permissionMode: configPermissionMode() },
     extra || {}
   );
-  const model = lt && validModel(lt.model);
-  if (model) opts.extraArgs = ['--model', model];
+  const name = harness || (lt && lt.ref && lt.ref.harness) || readConfig().harness || port.defaultHarness();
+  let impl = null;
+  try { impl = getHarness(name); } catch (e) { return opts; } // the spawn names the unknown harness itself
+  const { opts: typed, ignored } = port.splitOptions(impl, {
+    model: lt && validModel(lt.model),
+    effort: lt && validEffort(lt.effort),
+  });
+  Object.assign(opts, typed);
+  for (const opt of ignored) {
+    const once = (lt && (lt.id || lt.name)) + '|' + name + '|' + opt;
+    if (ignoredLtOptions.has(once)) continue;
+    ignoredLtOptions.add(once);
+    store.boardEvent({ text: 'lieutenant ' + ((lt && (lt.name || lt.id)) || '?') + ': ' + name + ' does not support '
+      + opt + '; started without it', actor: 'server' }, { kind: 'option-ignored' });
+  }
   return opts;
 }
 
@@ -760,19 +884,21 @@ async function respawnFresh(lt, harness) {
   const impl = getHarness(harness || lt.ref.harness);
   // Keep the session name (an incarnation, not a new entity) when it is
   // spawnable; a founder's foreign name gets a workspace-scoped one.
-  const session = /^bc-[A-Za-z0-9_-]+$/.test(lt.ref.session)
+  const session = isSpawnableSession(lt.ref.session)
     ? lt.ref.session : names.lieutenantSession(WORKSPACE, lt.id);
   const window = lt.ref.window || names.LIEUTENANT_WINDOW;
   try { await harnessFor(lt.ref).kill({ ...lt.ref, window }); }
   catch (e) { console.error(now() + ' kill failed relaunching ' + lt.id + ': ' + String((e && e.message) || e)); }
-  return impl.spawn(lt.ref.cwd, respawnPrompt(lt), ltLaunchOpts(lt, { session, window }));
+  const ref = await impl.spawn(lt.ref.cwd, respawnPrompt(lt), ltLaunchOpts(lt, { session, window }, harness || lt.ref.harness));
+  lt.lastInputAt = now(); // the respawn prompt is a turn (agentBusy)
+  return ref;
 }
 
 async function spawnLieutenant(body) {
   const name = String(body.name || '').trim();
-  if (!name) return { error: 'name required' };
+  if (!name) return { error: 'name required', code: 400 };
   const id = body.id ? String(body.id) : lieutenantIdFrom(name);
-  if (!/^[\w][\w.-]*$/.test(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])' };
+  if (!isId(id)) return { error: 'bad lieutenant id (use [A-Za-z0-9_.-])', code: 400 };
   // revive:true is what makes `bc-axi init --onboard` re-runnable: the founding
   // lieutenant already exists, and the question is only whether her session is
   // still up. A live one is left strictly alone (spawning over a live session
@@ -783,34 +909,48 @@ async function spawnLieutenant(body) {
   if (existing && (await sessionState(existing)) === 'live') {
     return { lieutenant: existing, spawned: false };
   }
-  const harnessName = String(body.harness || readConfig().harness || 'claude');
+  const harnessName = String(body.harness || readConfig().harness || port.defaultHarness());
   let impl;
-  try { impl = getHarness(harnessName); } catch (e) { return { error: String(e.message || e) }; }
+  try { impl = getHarness(harnessName); } catch (e) { return { error: String(e.message || e), code: 400 }; }
   if (body.model !== undefined && body.model !== null && body.model !== '' && !validModel(body.model)) {
-    return { error: BAD_MODEL };
+    return { error: BAD_MODEL, code: 400 };
+  }
+  if (body.effort !== undefined && body.effort !== null && body.effort !== '' && !validEffort(body.effort)) {
+    return { error: BAD_EFFORT, code: 400 };
+  }
+  // Checked before the spawn, not after it in createLieutenant: a refusal
+  // there would leave a live session behind with no lieutenant to own it.
+  if (body.avatar !== undefined && body.avatar !== null && !validAvatar(body.avatar)) {
+    return { error: BAD_AVATAR, code: 400 };
   }
   // A revived lieutenant keeps the model it was pinned to unless this call
   // names another; a new one is born on whatever it was given.
   const model = validModel(body.model) || (existing && validModel(existing.model)) || null;
+  const effort = validEffort(body.effort) || (existing && validEffort(existing.effort)) || null;
   const session = names.lieutenantSession(WORKSPACE, id);
   let ref;
   try {
-    ref = await impl.spawn(WORKSPACE, lieutenantPrompt(name, id), ltLaunchOpts({ model }, {
+    ref = await impl.spawn(WORKSPACE, lieutenantPrompt(name, id), ltLaunchOpts({ id, name, model, effort }, {
       session,
-      window: names.LIEUTENANT_WINDOW, // its own window in its own session — see names.js
+      window: names.LIEUTENANT_WINDOW, // its own window in its own session — see layout.js
       // Only the first run sends this, and only when the person said so out
-      // loud: the harness decides what it means (for claude, IS_SANDBOX=1).
+      // loud: the harness decides what it means.
       allowRoot: !!body.allowRoot,
-    }));
+    }, harnessName));
   } catch (e) {
     return { error: 'spawn failed: ' + String((e && e.message) || e), code: 502 };
   }
   if (existing) {
     existing.ref = ref;
+    existing.lastInputAt = now(); // the launch prompt is a turn (agentBusy)
     if (model) existing.model = model; else delete existing.model;
+    if (effort) existing.effort = effort; else delete existing.effort;
     return { lieutenant: existing, spawned: true };
   }
-  return Object.assign({ spawned: true }, createLieutenant(Object.assign({}, body, { id, ref })));
+  const out = Object.assign({ spawned: true }, createLieutenant(Object.assign({}, body, { id, ref })));
+  const born = findLieutenant(id);
+  if (born && !out.error) born.lastInputAt = now();
+  return out;
 }
 
 // lieutenant.retire — explicit only (the DNA). Refuses while the lieutenant
@@ -832,11 +972,7 @@ async function retireLieutenant(id, body) {
   board.lieutenants = board.lieutenants.filter((l) => l.id !== id);
   if (board.line === id) board.line = null; // the line falls back rather than pointing at a ghost
   respawnAttempts.delete(id);
-  nudged.delete(id);
-  // A retired lieutenant can never drain again: its queue files go too.
-  try { fs.unlinkSync(queueFile(id)); } catch (e) { /* none */ }
-  try { fs.unlinkSync(ackFile(id)); } catch (e) { /* none */ }
-  try { fs.unlinkSync(drainedFile(id)); } catch (e) { /* none */ }
+  delivery.forget(id); // a retired lieutenant can never drain again: its queue goes too
   // …and so does its conversation, which used to leave with the record itself:
   // a conversation belongs to the instance that had it. The memory file does
   // NOT leave — lieutenants/<id>/ belongs to the ROLE, hand-written by the
@@ -844,106 +980,112 @@ async function retireLieutenant(id, body) {
   // rather than deleting it, and a same-slug successor inherits it knowingly.
   try { fs.unlinkSync(chatFile(id)); } catch (e) { /* none */ }
   const memory = fs.existsSync(charterPath(WORKSPACE, id)) ? charterPath(WORKSPACE, id) : null;
-  const ev = mkEvent({ text: 'lieutenant ' + lt.name + ' retired',
-    actor: (body && body.actor) || 'user', level: 1 }, {});
-  board.events.push(ev);
+  const ev = store.boardEvent({ text: 'lieutenant ' + lt.name + ' retired',
+    actor: (body && body.actor) || 'user', level: 1 });
   return { ok: true, event: ev, memory };
 }
 
-// ---------- delivery queues (per-lieutenant durable jsonl, GLOBAL seq) ----------
-// One QueueItem = one durable delivery to a lieutenant: captain message,
-// drag-order, or (future) worker event. At-least-once: drain serves everything
-// past the lieutenant's committed ack cursor and never advances it; only
-// POST /api/feed/ack does. Unacked items re-offer forever (dedupe by seq).
-// A second, delivery-neutral cursor rides alongside: <lt>.drained, the high-water
-// seq a drain has SERVED this lieutenant — it feeds the UI's seen/unseen split
-// and nothing else.
-// The durable queue is the write-ahead ground truth; the wake half (one
-// coalesced harness.send per append burst) rides behind it, below.
-function queueFile(lt) { return path.join(QUEUE_DIR, lt + '.jsonl'); }
-function ackFile(lt) { return path.join(QUEUE_DIR, lt + '.ack'); }
-function drainedFile(lt) { return path.join(QUEUE_DIR, lt + '.drained'); }
-function readQueue(lt) {
-  try {
-    return fs.readFileSync(queueFile(lt), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
-  } catch (e) { return []; }
-}
-function queueIds() {
-  const ids = new Set(board.lieutenants.map((l) => l.id));
-  try {
-    for (const f of fs.readdirSync(QUEUE_DIR)) if (f.endsWith('.jsonl')) ids.add(f.slice(0, -6));
-  } catch (e) {}
-  return [...ids];
-}
-// The queue seq is global across every lieutenant's queue (QueueItems are
-// seq-ordered board-wide). Recovered from the files at boot.
-let qseq = 0;
-for (const lt of queueIds()) for (const it of readQueue(lt)) if (it.seq > qseq) qseq = it.seq;
-function readAck(lt) {
-  try { return parseInt(fs.readFileSync(ackFile(lt), 'utf8'), 10) || 0; }
-  catch (e) { return 0; }
-}
-// The drained cursor is a durable high-water mark of the highest seq ever SERVED
-// to this lieutenant by a drain. It never gates delivery (only the ack cursor
-// does — unacked items re-offer forever); it exists purely so the UI can tell
-// "sitting unread in the queue" from "drained and being worked on": drain marks
-// the turn START, ack marks the turn END, and without this file the whole
-// drain→ack working window would still read as queued/unseen.
-function readDrained(lt) {
-  try { return parseInt(fs.readFileSync(drainedFile(lt), 'utf8'), 10) || 0; }
-  catch (e) { return 0; }
-}
-function advanceDrained(lt, seq) {
-  if (seq <= readDrained(lt)) return false;
-  fs.writeFileSync(drainedFile(lt), String(seq));
-  return true;
-}
-// The seen boundary: a seq at or below it has been drained OR acked. Acked
-// implies seen even when the drained file lags (an ack written with no drain
-// on record — e.g. cursors that predate the drained file).
-function seenCursor(lt) { return Math.max(readDrained(lt), readAck(lt)); }
-function queuePush(lt, rec) {
-  const item = Object.assign({ seq: ++qseq, ts: now(), lieutenant: lt }, rec);
-  fs.appendFileSync(queueFile(lt), JSON.stringify(item) + '\n');
-  scheduleWake(lt); // the queue write landed first (write-ahead); now the wake half
-  return item;
-}
-function pendingItems(lt) {
-  const ack = readAck(lt);
-  return readQueue(lt).filter((it) => it.seq > ack);
-}
-function drainItems(lt) {
-  const lts = lt ? [lt] : queueIds();
-  const out = [];
-  for (const id of lts) out.push(...pendingItems(id));
-  out.sort((a, b) => a.seq - b.seq);
-  return out;
-}
-// ack <seq>: commit the cursor of the lieutenant whose queue holds that seq.
-// Committing seq N acks every item <= N in that lieutenant's queue (items are
-// seq-ascending per queue). Acking an already-acked seq is a harmless no-op.
-// When ownerId is set (a session-identified caller), the seq MUST live in that
-// lieutenant's own queue — refuse otherwise, so one lieutenant can never commit
-// (and thereby silently discard) another lieutenant's pending items.
-function commitAck(seq, ownerId) {
-  for (const lt of queueIds()) {
-    const items = readQueue(lt);
-    if (!items.some((it) => it.seq === seq)) continue;
-    if (ownerId && lt !== ownerId) {
-      return { error: 'seq ' + seq + ' is not in your queue (belongs to ' + lt + ')', code: 409 };
-    }
-    const cur = readAck(lt);
-    if (seq > cur) fs.writeFileSync(ackFile(lt), String(seq));
-    return { ok: true, lieutenant: lt, ack: Math.max(cur, seq) };
+/**
+ * lieutenant.patch minus the harness switch: validates every field before any
+ * applies, so a refusal leaves no half-applied lieutenant behind. Names the
+ * harness to switch to (validated, not applied) for the caller to run last.
+ * @returns {{ok: true, harness: string}|{error: string, code: number}}
+ */
+function patchLieutenant(lt, body) {
+  // Prefix is the only field a peer can veto (two lieutenants may not share
+  // one). Past cards keep the id they were minted with — a prefix change is
+  // about what comes next.
+  let prefix;
+  if (body.prefix !== undefined) {
+    prefix = validPrefix(body.prefix);
+    if (!prefix) return { error: BAD_PREFIX, code: 400 };
+    const clash = prefixOwner(prefix, lt.id);
+    if (clash) return { error: prefixTakenMsg(prefix, clash), code: 409 };
   }
-  return { error: 'unknown seq: ' + seq, code: 400 };
+  if (body.ref !== undefined && body.ref !== null && !isHarnessRef(body.ref)) {
+    return { error: 'bad ref (want {harness, session, cwd, resumeId?} or null)', code: 400 };
+  }
+  if (body.avatar !== undefined && body.avatar !== null && !validAvatar(body.avatar)) {
+    return { error: 'avatar must be an integer 0-63 or null', code: 400 };
+  }
+  // null / "" clears the model back to the harness's own default.
+  const clearModel = body.model === null || body.model === '';
+  const model = body.model !== undefined && !clearModel ? validModel(body.model) : null;
+  if (body.model !== undefined && !clearModel && !model) return { error: BAD_MODEL, code: 400 };
+  const clearEffort = body.effort === null || body.effort === '';
+  const effort = body.effort !== undefined && !clearEffort ? validEffort(body.effort) : null;
+  if (body.effort !== undefined && !clearEffort && !effort) return { error: BAD_EFFORT, code: 400 };
+  const harness = body.harness !== undefined && body.harness !== null ? String(body.harness) : '';
+  if (harness) {
+    try { getHarness(harness); } catch (e) { return { error: String((e && e.message) || e), code: 400 }; }
+  }
+
+  if (prefix) lt.prefix = prefix;
+  if (body.ref !== undefined) {
+    // A re-run of `bc-axi init` re-sends the founder's session-granular ref
+    // (the caller's tmux session is all it can see). Keep the window this
+    // lieutenant was already pinned to — losing it would put the ref back
+    // to killing its whole session, worker windows included, on revive.
+    lt.ref = body.ref && !body.ref.window && lt.ref && lt.ref.window
+      && lt.ref.session === body.ref.session
+      ? { ...body.ref, window: lt.ref.window }
+      : body.ref;
+  }
+  if (body.name !== undefined && String(body.name).trim()) lt.name = String(body.name).trim().slice(0, 60);
+  if (body.color !== undefined && validColor(body.color)) lt.color = body.color;
+  if (body.avatar === null) delete lt.avatar;
+  else if (body.avatar !== undefined) lt.avatar = body.avatar;
+  // "" / null clears the pick — the lieutenant is back to the board's voice.
+  if (body.voice !== undefined) {
+    const v = validVoice(body.voice);
+    if (v) lt.voice = v; else delete lt.voice;
+  }
+  // The model is stored, not applied: it rides `--model` on the next spawn
+  // or resume this lieutenant gets. Set BEFORE the harness switch, so a
+  // captain who moves harness and model in one call lands on both.
+  if (clearModel) delete lt.model;
+  else if (model) lt.model = model;
+  if (clearEffort) delete lt.effort;
+  else if (effort) lt.effort = effort;
+  return { ok: true, harness };
 }
+
+// ---------- delivery (server/delivery.js: queues, cursors, wakes, owed) ----------
+// One QueueItem = one durable delivery to a lieutenant: a captain message, a
+// drag-order, a worker event. Write-ahead and at-least-once: the queue write
+// lands first, then ONE coalesced wake line goes to the lieutenant's live
+// session; only an ack removes. A failed wake is non-fatal — the turn-end hook
+// and the supervision sweep re-nudge — and the wake flag is in-memory by
+// design: after a restart the next append or turn-end simply re-nudges.
+const WAKE_TTL_MS = process.env.BC_WAKE_TTL_MS !== undefined
+  ? parseInt(process.env.BC_WAKE_TTL_MS, 10) : 90000;
+const delivery = createDelivery({
+  dir: QUEUE_DIR,
+  wakeTtlMs: WAKE_TTL_MS,
+  send(ltId, text) {
+    const lt = findLieutenant(ltId);
+    if (!lt || !isHarnessRef(lt.ref)) return false;
+    const ref = lt.ref;
+    return Promise.resolve()
+      .then(() => harnessFor(ref).send(ref, text))
+      .then(() => { lt.lastInputAt = now(); })
+      .catch((e) => {
+        console.error(now() + ' wake failed for ' + ltId + ' (' + ref.harness + ':' + ref.session + '): '
+          + String((e && e.message) || e));
+        throw e;
+      });
+  },
+});
+// The names the rest of the server calls.
+function queuePush(lt, rec) { return delivery.push(lt, rec); }
+function pendingItems(lt) { return delivery.pending(lt); }
+function scheduleWake(lt) { delivery.nudge(lt); }
 
 // ---------- lieutenant main chat (append-only files; the FILE is truth) ----------
 // One jsonl per lieutenant, written exactly the way archive.jsonl and the
 // delivery queues are: one message per line, appended, never rewritten. A
 // message is durable the moment the line lands — a crash before the next
-// saveBoard() loses nothing, because the board stores no chat at all.
+// board save loses nothing, because the board stores no chat at all.
 // The server keeps the newest CHAT_TAIL per lieutenant in memory (lt.chat, read
 // from the file at boot) and that is what GET /api/board ships; everything
 // older is paged in over GET /api/chat. No index, no compaction: reading the
@@ -955,16 +1097,7 @@ function chatFile(lt) { return path.join(CHAT_DIR, lt + '.jsonl'); }
 // A crash mid-append can leave one torn line behind. That line is skipped and
 // the rest of the conversation is served — the file is never rewritten to
 // repair it, because append-only means append-only.
-function readChatLog(lt) {
-  let raw;
-  try { raw = fs.readFileSync(chatFile(lt), 'utf8'); } catch (e) { return []; }
-  const out = [];
-  for (const l of raw.split('\n')) {
-    if (!l) continue;
-    try { out.push(JSON.parse(l)); } catch (e) {}
-  }
-  return out;
-}
+function readChatLog(lt) { return readJsonl(chatFile(lt)); }
 // The one writer. Appends the line, then extends the in-memory tail — so the
 // served board reflects the message without re-reading the file.
 function chatAppend(ltId, msg) {
@@ -1008,42 +1141,7 @@ function chatTail(ltId, n) { return chatPage(ltId, '', n); }
     lt.chat = chatTail(lt.id, CHAT_TAIL);
   }
   if (migrated) console.log('[bridge-commander] moved ' + migrated + ' lieutenant chat message(s) out of board.json');
-  if (carried) saveBoard(); // drops the key even when the file was already there
-}
-
-// ---------- wakes (the send half of delivery; the queue is truth) ----------
-// Every queue append for a lieutenant with a live ref sends ONE compact wake
-// line via harness.send. Coalesced: while items are pending-and-nudged, further
-// appends do not stack identical wakes; a drain (or ack) clears the flag, so a
-// new append after a drain nudges again. Wake failures are non-fatal — the
-// durable queue is the ground truth and the turn-end backstop re-nudges — but
-// they clear the flag so a later append can retry, and they are logged.
-// The flag is in-memory by design: after a server restart the next append or
-// turn-end simply re-nudges (at-least-once delivery tolerates a spare wake).
-// Each entry carries the send timestamp: a nudge older than WAKE_TTL_MS no
-// longer suppresses the next wake, because "sent" is not "delivered" — tmux
-// send-keys can land in a busy pane and never become a turn. The supervision
-// sweep re-runs scheduleWake for live lieutenants with pending items, so a
-// lapsed nudge self-heals within one tick instead of hanging forever.
-const WAKE_TTL_MS = process.env.BC_WAKE_TTL_MS !== undefined
-  ? parseInt(process.env.BC_WAKE_TTL_MS, 10) : 90000;
-const nudged = new Map(); // lieutenant id -> epoch-ms of the last wake sent since its last drain
-function wakeLine(n) { return '[bridge-commander] ' + n + ' pending item(s) — run: bc-axi drain'; }
-function scheduleWake(ltId) {
-  const lt = findLieutenant(ltId);
-  if (!lt || !isHarnessRef(lt.ref)) return;
-  const n = pendingItems(ltId).length;
-  if (!n) return;
-  const ts = nudged.get(ltId);
-  if (ts !== undefined && Date.now() - ts <= WAKE_TTL_MS) return;
-  nudged.set(ltId, Date.now());
-  Promise.resolve()
-    .then(() => harnessFor(lt.ref).send(lt.ref, wakeLine(n)))
-    .catch((e) => {
-      nudged.delete(ltId);
-      console.error(now() + ' wake failed for ' + ltId + ' (' + lt.ref.harness + ':' + lt.ref.session + '): '
-        + String((e && e.message) || e));
-    });
+  if (carried) store.save(); // drops the key even when the file was already there
 }
 
 // ---------- card status (the ONE work signal; derived on read) ----------
@@ -1066,56 +1164,16 @@ function lastThreadReadMs(target, user) {
   return ts ? Date.parse(ts) : 0;
 }
 // owed is QUEUE truth, not thread order: the latest captain message delivered
-// to this target has not been ACKED (consumed) by its lieutenant. Thread order
-// lies under interleaving — a captain message sent mid-turn gets buried when
-// the lieutenant replies to an EARLIER batch, and "last thread message is the
-// captain's" would read not-owed while the message sits genuinely unhandled.
-// Only the ack clears owed; a reply alone does not (in the normal reply-then-ack
-// turn the two coincide, so the simple case still clears promptly).
-// owed splits into a tri-state, because "unanswered" hides two very different
-// situations: the captain's message may still sit UNDRAINED in the owner's queue
-// (the lieutenant never saw it), or the lieutenant drained it — its turn started —
-// and simply hasn't replied yet. The boundary is the drained cursor, NOT the ack
-// cursor: a lieutenant drains at the START of a turn and acks at the END, so
-// keying off ack would leave the whole working phase reading as queued/unseen.
-// owedState says which side of the drain the latest captain message is on:
-//   'queued' = owed AND its delivery seq is past the seen cursor (unseen)
-//   'seen'   = owed and drained (turn underway; the reply is owed for real)
-//   null     = not owed
-// `msgSeqs` is the precomputed target -> latest-message-delivery map (one queue
-// scan per serialization); absent, it is derived on the spot.
-function latestMessageSeqs() {
-  const map = new Map(); // target -> {seq, lt} of the latest kind:'message' delivery
-  for (const lt of queueIds()) {
-    for (const it of readQueue(lt)) {
-      if (it.kind !== 'message' || !it.target) continue;
-      const cur = map.get(it.target);
-      if (!cur || it.seq > cur.seq) map.set(it.target, { seq: it.seq, lt });
-    }
-  }
-  return map;
-}
-// Queued = the latest captain message delivered to this target has not crossed
-// its lieutenant's seen cursor. No delivery on record → not queued (a thread
-// message that never became a QueueItem has nothing to sit unseen in).
-function targetQueued(target, msgSeqs) {
-  const m = msgSeqs.get(target);
-  return !!(m && m.seq > seenCursor(m.lt));
-}
-// Owed = the latest captain message delivered to this target is still unacked
-// (not yet consumed). No delivery on record → not owed.
-function targetOwed(target, msgSeqs) {
-  const m = msgSeqs.get(target);
-  return !!(m && m.seq > readAck(m.lt));
-}
-function cardStatus(card, user, msgSeqs) {
+// to this target has not been ACKED by its lieutenant. Thread order lies under
+// interleaving — a captain message sent mid-turn gets buried when the lieutenant
+// replies to an EARLIER batch. Only the ack clears owed; a reply alone does not.
+// owedState splits it by the drained cursor (a lieutenant drains at the START of
+// a turn, acks at the END): 'queued' = not drained yet, the lieutenant never saw
+// it; 'seen' = drained, the turn is underway; null = not owed (delivery.owed).
+function cardStatus(card, user) {
   const thread = card.thread || [];
-  const msgs = msgSeqs || latestMessageSeqs();
-  const owed = targetOwed('card:' + card.id, msgs);
-  let owedState = null;
-  if (owed) {
-    owedState = targetQueued('card:' + card.id, msgs) ? 'queued' : 'seen';
-  }
+  const owedState = delivery.owed('card:' + card.id);
+  const owed = owedState !== null;
   const readMs = lastThreadReadMs('card:' + card.id, user);
   let unread = false;
   for (const m of thread) if (m.author !== 'user' && Date.parse(m.ts) > readMs) { unread = true; break; }
@@ -1136,9 +1194,20 @@ function cardActivity(card) {
 }
 // Serialization view: cards go out with the derived `status` and `activity`
 // attached; the stored board keeps only the raw lease.
-function publicCard(card, user, msgSeqs) {
-  return Object.assign({}, card, { status: cardStatus(card, user, msgSeqs), activity: cardActivity(card) });
+// `ext` is what the running plugins' decorators say about the card, cached by
+// the host per card.updated — absent when no plugin has anything to say.
+function publicCard(card, user) {
+  const out = Object.assign({}, card, { status: cardStatus(card, user), activity: cardActivity(card) });
+  if (card.sessions) out.sessions = publicSessions(card);
+  const ext = pluginHost ? pluginHost.decorations(card, board) : null;
+  if (ext && Object.keys(ext).length) out.ext = ext;
+  return out;
 }
+// Assigned once the plugin host exists (further down); a board served before
+// that simply carries no plugin data.
+let pluginHost = null;
+let runs = null;
+let pluginsVersion = 0;
 // The served board carries the EFFECTIVE kinds map (built-ins merged under the
 // registered entries); the stored board keeps only the registered map.
 // `boot` identifies this server instance: a client seeing it change knows the
@@ -1146,7 +1215,6 @@ function publicCard(card, user, msgSeqs) {
 // the old stream.
 const BOOT_ID = process.pid + '-' + Date.now();
 function publicBoard(user) {
-  const msgSeqs = latestMessageSeqs(); // one queue scan for the whole payload
   const holder = lineHolder().lieutenant;
   return Object.assign({}, board, {
     boot: BOOT_ID,
@@ -1154,32 +1222,42 @@ function publicBoard(user) {
     // The RESOLVED holder, never the raw stored id: a board that never had a
     // conversation still names whoever a `target: "line"` post would reach.
     line: holder ? holder.id : null,
-    cards: board.cards.map((c) => publicCard(c, user, msgSeqs)),
-    workers: board.workers.map(withStatusAge),
+    cards: board.cards.map((c) => publicCard(c, user)),
+    workers: board.workers.map((w) => Object.assign({}, withStatusAge(w),
+      { busy: agentBusy(w), canInterrupt: canInterrupt(w.ref) })),
+    // Held permission asks — in memory only, never in board.json (storedBoard
+    // never sees them): a restart drops the held requests they stand for.
+    permissions: permissions.list(),
+    // Tracked plugin command runs, running first; the log is fetched on demand.
+    activities: runs ? runs.list({ limit: 30 }) : [],
+    // Bumped by every plugin reload: a client refetches /api/plugins on a change.
+    pluginsVersion,
     // chatOwed/chatQueued mirror status.owed/owedState:'queued' for a
     // lieutenant's MAIN chat — both queue-derived, same rules as cards.
     lieutenants: board.lieutenants.map((l) => Object.assign({}, withStatusAge(l), {
-      chatOwed: targetOwed('lieutenant:' + l.id, msgSeqs),
-      chatQueued: targetQueued('lieutenant:' + l.id, msgSeqs),
+      busy: isHarnessRef(l.ref) && agentBusy(l),
+      canInterrupt: canInterrupt(l.ref),
+      chatOwed: delivery.owed('lieutenant:' + l.id) !== null,
+      chatQueued: delivery.owed('lieutenant:' + l.id) === 'queued',
     })),
   });
 }
 
 // status.set — the ONLY writer of card.status.worker.
 function setStatus(card, body) {
-  if (!body || !('worker' in body)) return { error: 'worker required: {id, state} (or null / state "absent" to clear)' };
+  if (!body || !('worker' in body)) return { error: 'worker required: {id, state} (or null / state "absent" to clear)', code: 400 };
   const w = body.worker;
   if (w === null || (w && typeof w === 'object' && w.state === 'absent')) {
     card.status = { worker: null };
   } else {
-    if (!w || typeof w !== 'object') return { error: 'worker must be {id, state} or null' };
-    if (!WORKER_STATES.includes(w.state)) return { error: 'bad worker.state (use ' + WORKER_STATES.join('|') + ')' };
+    if (!w || typeof w !== 'object') return { error: 'worker must be {id, state} or null', code: 400 };
+    if (!WORKER_STATES.includes(w.state)) return { error: 'bad worker.state (use ' + WORKER_STATES.join('|') + ')', code: 400 };
     const id = String(w.id || '').trim();
-    if (!id) return { error: 'worker.id required for state ' + w.state };
+    if (!id) return { error: 'worker.id required for state ' + w.state, code: 400 };
     let ttl = WORKER_TTL_SECS;
     if (body.ttl !== undefined) {
       ttl = Number(body.ttl);
-      if (!Number.isFinite(ttl) || ttl <= 0) return { error: 'bad ttl (seconds > 0)' };
+      if (!Number.isFinite(ttl) || ttl <= 0) return { error: 'bad ttl (seconds > 0)', code: 400 };
     }
     card.status = { worker: { id: id.slice(0, 120), state: w.state, expires: new Date(Date.now() + ttl * 1000).toISOString() } };
   }
@@ -1188,12 +1266,68 @@ function setStatus(card, body) {
 }
 
 // ---------- SSE clients ----------
+// Every stream the board serves (board, pane peek, sysload) opens the same way
+// and speaks the same named-event frame, so a proxy or client quirk is fixed once.
+const SSE_HEADERS = { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' };
+// A line that opens the first frame of the board and pane streams: the browser's
+// own retry after a dropped connection comes in 1s instead of 3s.
+const SSE_RETRY = 'retry: 1000\n';
+/** sseFrame(event, data) -> one named SSE frame; `data` defaults to {}. */
+function sseFrame(event, data) {
+  return 'event: ' + event + '\ndata: ' + JSON.stringify(data === undefined ? {} : data) + '\n\n';
+}
 const sseClients = new Set();
 function sseSend(event, data) {
-  const payload = 'event: ' + event + '\ndata: ' + JSON.stringify(data) + '\n\n';
+  const payload = sseFrame(event, data);
   for (const res of sseClients) res.write(payload);
 }
-function broadcast() { sseSend('board', publicBoard('user')); }
+// Coalesced by the store: N calls in one tick push the board once.
+function broadcast() { store.broadcast(); }
+
+// ---------- permission approvals (see server/permissions.js) ----------
+// Claude Code gives the hook 3600s; answering null a little earlier lets the
+// agent fall back to its own dialog instead of dying on a hook timeout.
+const PERMISSION_CAP_MS = Number(process.env.BC_PERMISSION_TIMEOUT_MS) > 0
+  ? Number(process.env.BC_PERMISSION_TIMEOUT_MS) : 3500 * 1000;
+const permissions = createPermissions({ capMs: PERMISSION_CAP_MS, onChange: permissionChanged });
+function permissionWorker(item) {
+  return item.card ? board.workers.find((w) => w.card === item.card && workerName(w.ref) === item.worker) || null : null;
+}
+// An ask and its end are both activity: the stall ladder starts over from
+// here, not from whenever the worker last spoke before it waited.
+function permissionChanged(item, outcome) {
+  const w = permissionWorker(item);
+  if (w) workers.transition(w, 'permission', { lastPermissionAt: now() });
+  if (outcome === 'allow' || outcome === 'deny') return; // the decide route saves and broadcasts with its event
+  if (w) store.commit();
+  else broadcast();
+}
+function permissionFields(body, lt, w) {
+  const tool = String(body.tool_name || 'unknown').slice(0, 200);
+  const input = body.tool_input && typeof body.tool_input === 'object' && !Array.isArray(body.tool_input)
+    ? body.tool_input : {};
+  // The asking agent's harness knows which field of its tool input carries the
+  // risk; one that does not say (a test double, an unattributed ask) gets the
+  // default harness's reading.
+  const askRef = (w && w.ref) || (lt && lt.ref) || null;
+  const describeOf = (name) => {
+    try { const p = port.profileOf(name); return p && p.permissions && p.permissions.describe; } catch (e) { return null; }
+  };
+  const describe = (askRef && describeOf(askRef.harness)) || describeOf(readConfig().harness || port.defaultHarness());
+  const out = { ts: now(), tool_name: tool, tool_input: input, summary: summarize(tool, input, describe),
+    lieutenant: null, card: null, worker: null, agentLabel: '' };
+  if (w) {
+    const card = findCard(w.card);
+    Object.assign(out, { lieutenant: card ? card.owner : null, card: w.card, worker: workerName(w.ref),
+      agentLabel: 'worker on ' + (card ? card.title : w.card) });
+  } else if (lt) {
+    Object.assign(out, { lieutenant: lt.id, agentLabel: lt.name });
+  } else {
+    out.agentLabel = body.cwd ? path.basename(String(body.cwd)) || String(body.cwd) : 'unknown agent';
+  }
+  return out;
+}
+
 // A file an editor may have open changed on disk (through PUT /api/artifact —
 // the one door). Tiny event on the SAME stream, not a channel of its own: which
 // uri, which version now, and `by` = the writer's own client tag (a random
@@ -1242,34 +1376,79 @@ function paneWindows(card) {
   }
   return out;
 }
-function resolvePaneRef(kind, id, want) {
+// resolveAgentRef(kind, id) -> { ref, reason, card?, worker?, lt? } — the
+// agent's OWN ref, before any pane window: what interrupt addresses.
+function resolveAgentRef(kind, id) {
   if (kind === 'cards') {
     const card = findCard(id);
     const w = card && findWorker(card.id);
     if (!card) return { ref: null, reason: 'unknown card: ' + id };
     if (card.column !== 'working') return { ref: null, reason: 'card is not Working' };
     if (!w) return { ref: null, reason: 'no worker bound to ' + id };
-    // `want` is the caller asking for one of the offered windows by name —
-    // honoured only if the CARD listed it, so a request can never name a window
-    // of its own. Unlisted or absent falls back to the card's first offer, then
-    // to the worker's own window.
-    const offered = paneWindows(card);
-    const win = want && offered.includes(want) ? want : offered[0];
-    if (win) return { ref: Object.assign({}, w.ref, { window: win }), reason: '' };
-    return { ref: w.ref, reason: '' };
+    return { ref: w.ref, reason: '', card, worker: w };
   }
   const lt = findLieutenant(id);
   if (!lt) return { ref: null, reason: 'unknown lieutenant: ' + id };
   if (!isHarnessRef(lt.ref)) return { ref: null, reason: 'lieutenant has no live session' };
-  return { ref: lt.ref, reason: '' };
+  return { ref: lt.ref, reason: '', lt };
+}
+function resolvePaneRef(kind, id, want) {
+  const r = resolveAgentRef(kind, id);
+  if (!r.card) return { ref: r.ref, reason: r.reason };
+  // `want` is the caller asking for one of the offered windows by name —
+  // honoured only if the CARD listed it, so a request can never name a window
+  // of its own. Unlisted or absent falls back to the card's first offer, then
+  // to the worker's own window.
+  const offered = paneWindows(r.card);
+  const win = want && offered.includes(want) ? want : offered[0];
+  if (win) return { ref: Object.assign({}, r.ref, { window: win }), reason: '' };
+  return { ref: r.ref, reason: '' };
+}
+// interruptAgent(kind, id, actor) -> { code, body } — stop the agent's running
+// turn through the harness's optional interrupt verb. The session stays up.
+//
+// Only a BUSY agent, and one request at a time: a second Escape on an idle
+// claude opens its Rewind menu, and on codex it enters backtrack mode, where
+// the next send's Enter rewinds the conversation.
+const interrupting = new Set();
+async function interruptAgent(kind, id, actor) {
+  const { ref, reason, card, worker, lt } = resolveAgentRef(kind, id);
+  if (!ref) return { code: 404, body: { error: reason } };
+  let impl;
+  try { impl = harnessFor(ref); }
+  catch (e) { return { code: 404, body: { error: String((e && e.message) || e) } }; }
+  if (typeof impl.interrupt !== 'function') {
+    return { code: 501, body: { error: 'harness "' + ref.harness + '" cannot interrupt', unsupported: true } };
+  }
+  const key = paneKey(ref);
+  if (interrupting.has(key) || !agentBusy(worker || lt)) {
+    return { code: 409, body: { error: keyOf(ref) + ' is not in a turn — nothing to stop', idle: true } };
+  }
+  interrupting.add(key);
+  try {
+    let up = false;
+    try { up = await impl.alive(ref); } catch { up = false; }
+    if (!up) return { code: 409, body: { error: 'no live session for ' + keyOf(ref) } };
+    try { await impl.interrupt(ref); }
+    catch (e) { return { code: 502, body: { error: String((e && e.message) || e) } }; }
+  } finally { interrupting.delete(key); }
+  if (worker) {
+    workers.transition(worker, 'interrupted', { interruptedAt: now() });
+    store.cardEvent(card, { text: 'worker ' + keyOf(ref) + ' interrupted', actor }, { kind: 'interrupted' });
+  } else {
+    lt.interruptedAt = now();
+    delivery.hush(lt.id); // the pending order must not restart the turn the captain just stopped
+  }
+  store.save();
+  broadcast();
+  return { code: 200, body: { ok: true, session: keyOf(ref) } };
 }
 const panes = new Map(); // paneKey -> { clients: Set<res>, handle, last }
-function paneKey(ref) { return ref.harness + '/' + ref.session + (ref.window ? ':' + ref.window : ''); }
-function paneWrite(res, event, data) {
-  res.write('event: ' + event + '\ndata: ' + JSON.stringify(data === undefined ? {} : data) + '\n\n');
-}
+function paneKey(ref) { return ref.harness + '/' + keyOf(ref); }
+function paneWrite(res, event, data) { res.write(sseFrame(event, data)); }
 function paneStream(req, res, ref, reason) {
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  res.writeHead(200, SSE_HEADERS);
+  res.write(SSE_RETRY);
   if (!ref) { paneWrite(res, 'no-pane', { reason }); return res.end(); }
   let impl;
   try { impl = harnessFor(ref); }
@@ -1308,6 +1487,11 @@ function paneStream(req, res, ref, reason) {
       });
   }
   hub.clients.add(res);
+  // What the viewer may do with it: an event-log pane (the acp family) can be
+  // watched but not typed into, and the drawer must not invite a keystroke.
+  let attach = true;
+  try { attach = !(typeof impl.profileInfo === 'function' && impl.profileInfo().adapter === 'acp'); } catch (e) { /* assume tmux */ }
+  paneWrite(res, 'caps', { input: typeof impl.paneInput === 'function', attach });
   // Immediate paint: late joiners get the hub's last frame; the first
   // subscriber gets a one-shot snapshot when the harness offers one and the
   // live feed hasn't delivered yet (a real frame arriving first wins).
@@ -1343,24 +1527,35 @@ function sysloadTargets() {
     if (w.done || !isHarnessRef(w.ref)) continue;
     const card = findCard(w.card);
     out.push({ kind: 'worker', id: w.card, label: (card && card.title) || w.card,
-      session: w.ref.session, window: w.ref.window || null });
+      session: w.ref.session, window: w.ref.window || null, ref: w.ref });
   }
   for (const lt of board.lieutenants) {
     if (!isHarnessRef(lt.ref)) continue;
     out.push({ kind: 'lieutenant', id: lt.id, label: lt.name,
-      session: lt.ref.session, window: lt.ref.window || null });
+      session: lt.ref.session, window: lt.ref.window || null, ref: lt.ref });
   }
   return out;
 }
-const sysload = createSampler({ workspace: WORKSPACE, targets: sysloadTargets, intervalMs: SYSLOAD_MS });
+// Pane pids come through the port (its optional panePids verb): a harness
+// without it contributes no rows, and an unknown one throws into the sampler,
+// which reads that as no rows too.
+function sysloadPanePids(target) {
+  const impl = harnessFor(target.ref);
+  return typeof impl.panePids === 'function' ? impl.panePids(target.ref) : [];
+}
+const sysload = createSampler({ workspace: WORKSPACE, targets: sysloadTargets, panePids: sysloadPanePids,
+  intervalMs: SYSLOAD_MS });
 
 // Named ping (not an SSE comment): comments are invisible to EventSource, so
 // the client's staleness watchdog couldn't see the stream is alive. Pane
 // streams piggyback on the same ping so proxies don't drop them either.
+// Every 5s so a half-open stream behind a proxy is caught in ~12s, without
+// waking a phone radio as often as a 1-2s ping would.
 setInterval(() => {
-  for (const res of sseClients) res.write('event: ping\ndata: {}\n\n');
-  for (const hub of panes.values()) for (const res of hub.clients) res.write('event: ping\ndata: {}\n\n');
-}, 25000).unref();
+  const ping = sseFrame('ping');
+  for (const res of sseClients) res.write(ping);
+  for (const hub of panes.values()) for (const res of hub.clients) res.write(ping);
+}, 5000).unref();
 
 // ---------- helpers ----------
 // Byte serve shared by the raw artifact and attachment routes. Honors a single
@@ -1384,13 +1579,19 @@ function sendBytes(req, res, data, headers) {
   res.writeHead(200, { ...base, 'Content-Length': data.length });
   res.end(data);
 }
-// Content-derived version for a file the UI may edit: the GET hands it out,
-// the PUT demands it back, and a mismatch is a 409 instead of a lost edit.
-const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 function sendJson(res, code, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
   res.end(body);
+}
+/**
+ * respond(res, r, payload?) — the one mapping from a domain result to HTTP:
+ * `{error, code}` answers `code` (400 when a caller forgot one) with the error;
+ * anything else is a 200 carrying payload(r), or r itself.
+ */
+function respond(res, r, payload) {
+  if (r && r.error) return sendJson(res, r.code || 400, { error: r.error });
+  return sendJson(res, 200, payload ? payload(r) : r);
 }
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -1478,54 +1679,11 @@ function resolveAttachments(list) {
   return out;
 }
 function findCard(id) { return board.cards.find((c) => c.id === id); }
-// Chat targets: lieutenant:<id> (main chat) | card:<id> (card thread).
-// What a target's thread READS as. A card thread is the stored array itself; a
-// lieutenant's is the in-memory tail of its log — a view, never something to
-// push() to. Everything that adds a message goes through appendMessage below.
-function threadFor(target) {
-  let m = /^lieutenant:(.+)$/.exec(target || '');
-  if (m) {
-    const lt = findLieutenant(m[1]);
-    if (lt) return (lt.chat = lt.chat || []);
-    return null;
-  }
-  m = /^card:(.+)$/.exec(target || '');
-  if (m) {
-    const card = findCard(m[1]);
-    if (card) return (card.thread = card.thread || []);
-  }
-  return null;
-}
-// The one door a chat message goes in by: a lieutenant main chat appends to its
-// own append-only log, a card thread pushes to the card. Returns the message,
-// or null when the target does not exist.
-function appendMessage(target, msg) {
-  let m = /^lieutenant:(.+)$/.exec(target || '');
-  if (m) {
-    const lt = findLieutenant(m[1]);
-    return lt ? chatAppend(lt.id, msg) : null;
-  }
-  m = /^card:(.+)$/.exec(target || '');
-  if (m) {
-    const card = findCard(m[1]);
-    if (!card) return null;
-    (card.thread = card.thread || []).push(msg);
-    return msg;
-  }
-  return null;
-}
-// The lieutenant a target's deliveries route to: the lieutenant itself, or the
-// card's owner (a card thread's interlocutor is always the owning lieutenant).
-function targetLieutenant(target) {
-  let m = /^lieutenant:(.+)$/.exec(target || '');
-  if (m) return findLieutenant(m[1]);
-  m = /^card:(.+)$/.exec(target || '');
-  if (m) {
-    const card = findCard(m[1]);
-    if (card) return findLieutenant(card.owner);
-  }
-  return null;
-}
+// Chat targets: lieutenant:<id> (main chat) | card:<id> (card thread) — parsed,
+// read, appended to and routed by server/conversation.js.
+function threadFor(target) { return conversation.threadFor(target); }
+function appendMessage(target, msg) { return conversation.appendMessage(target, msg); }
+function targetLieutenant(target) { return conversation.targetLieutenant(target); }
 // ---------- slash commands (the harness port's OPTIONAL commands/runCommand/status) ----------
 // The session a chat target's slash commands (and /api/commands) address: a
 // lieutenant target is the lieutenant's OWN session; a card target is the
@@ -1534,16 +1692,15 @@ function targetLieutenant(target) {
 // → { ref } | { ref: null, why } (valid target, no live session to address)
 //   | { error, code } (bad/unknown target)
 function commandTargetRef(target) {
-  let m = /^lieutenant:(.+)$/.exec(target || '');
-  if (m) {
-    const lt = findLieutenant(m[1]);
+  const t = parseTarget(target);
+  if (t && t.kind === 'lieutenant') {
+    const lt = findLieutenant(t.id);
     if (!lt) return { error: 'unknown target: ' + target, code: 404 };
     if (!isHarnessRef(lt.ref)) return { ref: null, why: 'lieutenant ' + lt.id + ' has no live session' };
     return { ref: lt.ref };
   }
-  m = /^card:(.+)$/.exec(target || '');
-  if (m) {
-    const card = findCard(m[1]);
+  if (t && t.kind === 'card') {
+    const card = findCard(t.id);
     if (!card) return { error: 'unknown target: ' + target, code: 404 };
     const w = findWorker(card.id);
     if (!w || !isHarnessRef(w.ref)) {
@@ -1570,7 +1727,8 @@ const BOARD_COMMANDS = [
   { name: '/reset', description: 'start this lieutenant over: same identity, no memory of the conversation' },
 ];
 function boardCommands(target) {  // MUTATION-TEST ME
-  return /^lieutenant:/.test(target || '') ? BOARD_COMMANDS : [];
+  const t = parseTarget(target);
+  return t && t.kind === 'lieutenant' ? BOARD_COMMANDS : [];
 }
 
 // /reset — kill the session and bring it back on the launch prompt: doctrine,
@@ -1583,22 +1741,21 @@ function boardCommands(target) {  // MUTATION-TEST ME
 // read it. The agent cannot.
 async function resetLieutenant(id) {
   const lt = findLieutenant(id);
-  if (!lt) return { error: 'unknown lieutenant: ' + id };
-  if (!isHarnessRef(lt.ref)) return { error: 'lieutenant ' + id + ' has no session to reset' };
-  try { getHarness(lt.ref.harness); } catch (e) { return { error: String((e && e.message) || e) }; }
+  if (!lt) return { error: 'unknown lieutenant: ' + id, code: 404 };
+  if (!isHarnessRef(lt.ref)) return { error: 'lieutenant ' + id + ' has no session to reset', code: 409 };
+  try { getHarness(lt.ref.harness); } catch (e) { return { error: String((e && e.message) || e), code: 400 }; }
   try {
     lt.ref = await respawnFresh(lt);
   } catch (e) {
-    return { error: 'reset failed: ' + String((e && e.message) || e) };
+    return { error: 'reset failed: ' + String((e && e.message) || e), code: 502 };
   }
   respawnAttempts.delete(id);
-  nudged.delete(id); // the new session owes a drain — the queue is truth, its memory was a cache
-  board.events.push(mkEvent({
+  delivery.resetNudge(id); // the new session owes a drain — the queue is truth, its memory was a cache
+  // Saved by the caller: /reset only runs inside the chat route's store.mutate.
+  store.boardEvent({
     text: 'lieutenant ' + lt.name + ' was reset by the captain — new session on the launch prompt',
     actor: 'user',
-  }, { kind: 'reset', level: 1 }));
-  saveBoard();
-  broadcast();
+  }, { kind: 'reset', level: 1 });
   if (pendingItems(id).length) scheduleWake(id);
   return { ok: true, session: lt.ref.session };
 }
@@ -1646,7 +1803,7 @@ async function withCycleGuard(id, fn) {
 // a lieutenant that is down is to respawn it — racing this spawn for the pane
 // and telling the captain his lieutenant crashed while he is the one moving it.
 async function switchLieutenantHarness(lt, harness, actor) {
-  try { getHarness(harness); } catch (e) { return { error: String((e && e.message) || e) }; }
+  try { getHarness(harness); } catch (e) { return { error: String((e && e.message) || e), code: 400 }; }
   if (!isHarnessRef(lt.ref)) {
     return { error: 'lieutenant ' + lt.id + ' has no session — a harness is a property of the '
       + 'session it runs in, so there is nothing here to move (spawn one first)', code: 409 };
@@ -1662,14 +1819,13 @@ async function switchLieutenantHarness(lt, harness, actor) {
   // patched: half of an old address is not an address.
   lt.ref = { harness: ref.harness, session: ref.session, cwd: ref.cwd, window: ref.window || names.LIEUTENANT_WINDOW };
   respawnAttempts.delete(lt.id);
-  nudged.delete(lt.id); // the new session owes a drain; its predecessor's memory went with it
-  const ev = mkEvent({
+  delivery.resetNudge(lt.id); // the new session owes a drain; its predecessor's memory went with it
+  const ev = store.boardEvent({
     text: 'lieutenant ' + lt.name + ' moved to ' + harness
       + (validModel(lt.model) ? ':' + validModel(lt.model) : '')
       + ' — respawned as ' + lt.ref.session,
     actor: actor || 'user',
   }, { kind: 'harness-switch', level: 1 });
-  board.events.push(ev);
   if (pendingItems(lt.id).length) scheduleWake(lt.id);
   return { ok: true, switched: true, lieutenant: lt, event: ev };
 }
@@ -1685,13 +1841,7 @@ async function runChatCommand(target, text) {
   // /status reply additionally carries the structured `status` payload so the UI
   // renders a real progress bar instead of regex-parsing the formatted prose.
   const stamp = (author, t, cmd, extra) => {
-    const msg = Object.assign({ author, text: t, ts: now(), cmd }, extra || {});
-    appendMessage(target, msg);
-    const m = /^card:(.+)$/.exec(target);
-    if (m) {
-      const card = findCard(m[1]);
-      if (card) { card.updated = now(); if (!card.threadStart) card.threadStart = msg.ts; }
-    }
+    appendMessage(target, Object.assign({ author, text: t, ts: now(), cmd }, extra || {}));
   };
   const name = text.split(/\s+/)[0];
   const reply = (author, t, extra) => stamp(author, t, { name, reply: true }, extra);
@@ -1702,7 +1852,7 @@ async function runChatCommand(target, text) {
   // harness has no idea what a lieutenant is, and /reset is at its most useful
   // on one whose session has died — bringing it back is the whole point.
   if (boardCommands(target).some((c) => c.name === name)) {
-    const id = /^lieutenant:(.+)$/.exec(target)[1];
+    const id = parseTarget(target).id;
     const out = await withCycleGuard(id, () => resetLieutenant(id));
     if (out.error) reply('bridge', '⚠ ' + name + ' — ' + out.error);
     else reply('bridge', 'reset — ' + id + ' is a new session on the launch prompt (doctrine, charter, and what it owns). The conversation before this one is gone.');
@@ -1725,13 +1875,13 @@ async function runChatCommand(target, text) {
     // the FULL line goes to the harness — pass-through commands (/compact,
     // claude's /autocompact) may carry arguments; `name` only did the match
     const impl = getHarness(r.ref.harness);
-    const result = await impl.runCommand(r.ref, text, { stateDir: HARNESS_STATE_DIR });
+    const result = await impl.runCommand(r.ref, text);
     // /status also fetches the structured status (a cheap transcript read) so the
     // reply carries both the formatted text (fallback) and the payload the UI
     // renders as model + context bar + rate lines — never parsing the prose.
     let extra;
     if (name === '/status' && typeof impl.status === 'function') {
-      try { const st = await impl.status(r.ref, { stateDir: HARNESS_STATE_DIR }); if (st && typeof st === 'object') extra = { status: st }; } catch {}
+      try { const st = await impl.status(r.ref); if (st && typeof st === 'object') extra = { status: st }; } catch {}
     }
     reply(r.ref.harness, String(result == null ? name + ' done' : result), extra);
   } catch (e) {
@@ -1750,7 +1900,7 @@ async function refreshAgentStatus(rec) {
   try { impl = getHarness(rec.ref.harness); } catch { return false; }
   if (typeof impl.status !== 'function') return false;
   try {
-    const st = await impl.status(rec.ref, { stateDir: HARNESS_STATE_DIR });
+    const st = await impl.status(rec.ref);
     if (!st || typeof st !== 'object') return false;
     rec.agentStatus = Object.assign({}, st, { ts: now() });
     return true;
@@ -1769,6 +1919,19 @@ const AGENT_STATUS_STALE_MS = 10 * 60 * 1000;
 // Derived at serialization, never stored: the same untouched record reads
 // fresh and later stale with no writer involved. The flag is all the server
 // says — how (or whether) to show an old reading is the UI's call.
+// agentBusy(rec) — is a lieutenant or worker in a turn? Busy from the last
+// time the board typed into it (brief, send, wake) until a turn-end or an
+// interrupt: claude's Stop hook skips an interrupted turn, so the interrupt
+// stamp has to close it.
+function agentBusy(rec) {
+  if (!rec || rec.done || rec.paused) return false;
+  const at = (k) => (rec[k] ? Date.parse(rec[k]) || 0 : 0);
+  return Math.max(at('lastInputAt'), at('spawnedAt')) > Math.max(at('lastTurnEnd'), at('interruptedAt'));
+}
+// canInterrupt(ref) — its harness offers the optional interrupt verb (the UI hides ⏹ otherwise).
+function canInterrupt(ref) {
+  try { return isHarnessRef(ref) && typeof harnessFor(ref).interrupt === 'function'; } catch { return false; }
+}
 function withStatusAge(rec) {
   const st = rec && rec.agentStatus;
   const at = st && st.ts ? Date.parse(st.ts) : NaN;
@@ -1779,17 +1942,12 @@ function columnTitle(id) {
   const c = board.columns.find((k) => k.id === id);
   return c ? c.title : id;
 }
-// ASCII slug: emoji, ZWJ sequences, and any other non-ASCII are stripped, so
-// derived ids (and the session names built from them) never reach tmux.
-function slugBase(s) {
-  return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
-}
-// Lieutenant id from a display name. A name with no ASCII at all (pure emoji)
-// falls back to 'lt', made unique so a second such lieutenant can still be
-// born; a real slug collision stays a 409 in createLieutenant (same-name
-// duplicates are a caller mistake, not a naming gap).
+// Lieutenant id from a display name (layout.slugBase). A name with no ASCII at
+// all (pure emoji) falls back to 'lt', made unique so a second such lieutenant
+// can still be born; a real slug collision stays a 409 in createLieutenant
+// (same-name duplicates are a caller mistake, not a naming gap).
 function lieutenantIdFrom(name) {
-  const base = slugBase(name);
+  const base = names.slugBase(name);
   if (base) return base;
   if (!findLieutenant('lt')) return 'lt';
   for (let i = 2; ; i++) if (!findLieutenant('lt-' + i)) return 'lt-' + i;
@@ -1847,45 +2005,47 @@ function checkPlaybook(raw) {
   if (!id) return { playbook: '' };
   if (!resolvePlaybook(STATE_DIR, id)) {
     return { error: 'unknown playbook: ' + id + ' — playbooks in ' + path.join(STATE_DIR, 'playbooks')
-      + ': ' + playbooksHint() };
+      + ': ' + playbooksHint(), code: 400 };
   }
   return { playbook: id };
 }
 function createCard(body, actorDefault) {
   const title = String(body.title || '').trim();
-  if (!title) return { error: 'title required' };
+  if (!title) return { error: 'title required', code: 400 };
+  if (body.execution !== undefined && !['managed', 'external'].includes(body.execution)) return { error: 'execution must be managed or external', code: 400 };
   const owner = String(body.owner || '').trim();
-  if (!owner) return { error: 'owner required (every card belongs to exactly one lieutenant)' };
+  if (!owner) return { error: 'owner required (every card belongs to exactly one lieutenant)', code: 400 };
   const lt = findLieutenant(owner);
-  if (!lt) return { error: 'unknown lieutenant: ' + owner };
+  if (!lt) return { error: 'unknown lieutenant: ' + owner, code: 400 };
   const type = body.type ? String(body.type) : 'implementation';
-  if (!CARD_TYPES.includes(type)) return { error: 'bad type (use ' + CARD_TYPES.join('|') + ')' };
+  if (!CARD_TYPES.includes(type)) return { error: 'bad type (use ' + CARD_TYPES.join('|') + ')', code: 400 };
   const pb = checkPlaybook(body.playbook);
-  if (pb.error) return { error: pb.error };
+  if (pb.error) return pb;
   // No id given: the owner mints the next one from its own counter. The counter
   // advances only when the card is actually born (below).
   const minted = body.id ? 0 : (Number.isInteger(lt.cardSeq) ? lt.cardSeq : 0) + 1;
   const id = body.id ? String(body.id) : lt.prefix + '-' + minted;
-  if (!/^[\w][\w.:-]*$/.test(id)) return { error: 'bad card id (use [A-Za-z0-9_.:-])' };
+  if (!/^[\w][\w.:-]*$/.test(id)) return { error: 'bad card id (use [A-Za-z0-9_.:-])', code: 400 };
   // A duplicate is an error, not a case to engineer around: no suffix, no retry,
   // no silently picking the next free number. It can happen when a prefix outlives
   // the lieutenant that used it (retire, recreate, counter back at 1) — rare, and
   // the captain settles it with the lieutenant. What must never happen is a
-  // collision created SILENTLY.
+  // collision created SILENTLY. The fix named is the prefix: every caller has it
+  // (the CLI takes no --id), and it is the one that unwedges the mint for good.
   if (findCard(id)) {
     return { error: minted
       ? 'card exists: ' + id + ' — ' + lt.name + ' would mint that id next (counter at ' + (minted - 1)
-        + '). Create it with an explicit free id, or give ' + lt.name + ' an unused prefix in its settings.'
+        + '). Give ' + lt.name + ' an unused prefix in its settings.'
       : 'card exists: ' + id, code: 409 };
   }
   const column = body.column ? String(body.column) : 'backlog';
-  if (!board.columns.some((c) => c.id === column)) return { error: 'unknown column: ' + column };
+  if (!board.columns.some((c) => c.id === column)) return { error: 'unknown column: ' + column, code: 400 };
   // Working is a fact, not a label: a card is in Working iff a live worker
   // exists for it, and only card.start creates one. Cards are never BORN there.
-  if (column === 'working') return { error: 'cards cannot be created in Working — a card enters Working only through card.start (which spawns its worker)' };
+  if (column === 'working') return { error: 'cards cannot be created in Working — a card enters Working only through card.start (which spawns its worker)', code: 400 };
   // Nor anywhere else: cards are born in Backlog ONLY (review is the handoff,
   // peer is the captain's shelf — both are earned, never a birthplace).
-  if (column !== 'backlog') return { error: 'cards are born in Backlog only — create it there and move it after' };
+  if (column !== 'backlog') return { error: 'cards are born in Backlog only — create it there and move it after', code: 400 };
   const actor = String(body.actor || actorDefault || 'agent').slice(0, 60);
   const card = {
     id, title: title.slice(0, 200), type, owner, column, playbook: pb.playbook,
@@ -1895,11 +2055,13 @@ function createCard(body, actorDefault) {
     created: now(), updated: now(), threadStart: null, pendingOrder: null,
     events: [], thread: [],
   };
-  card.events.push(mkEvent({ text: 'created in ' + columnTitle(column), actor }, { kind: 'created' }));
+  if (body.execution === 'external') card.execution = 'external';
+  // Write-ahead first: a queue append that throws must leave no card behind.
+  if (actor === 'user') queuePush(owner, { kind: 'card-created', card: id, text: card.title, column });
+  store.cardEvent(card, { text: 'created in ' + columnTitle(column), actor }, { kind: 'created' });
   if (minted) lt.cardSeq = minted; // never reissued, never rolled back
   board.cards.push(card);
   registerCardLabels();
-  if (actor === 'user') queuePush(owner, { kind: 'card-created', card: id, text: card.title, column });
   return { card };
 }
 
@@ -1918,74 +2080,71 @@ function createCard(body, actorDefault) {
 // captain rearranging) resolves the order marker.
 function moveCard(card, body, actorDefault) {
   const column = String(body.column || '');
-  if (!board.columns.some((c) => c.id === column)) return { error: 'unknown column: ' + column };
+  if (!board.columns.some((c) => c.id === column)) return { error: 'unknown column: ' + column, code: 400 };
   const actor = String(body.actor || actorDefault || 'agent').slice(0, 60);
   if (column === card.column) return { ok: true, unchanged: true };
   const from = card.column;
 
   if (actor === 'user') {
-    const order = column === 'working' ? 'start-order'
+    const order = card.execution === 'external' ? null : column === 'working' ? 'start-order'
       : from === 'review' && column === 'backlog' ? 'rework-order' : null;
     if (order) {
       const item = queuePush(card.owner, Object.assign(
         { kind: order, card: card.id, from, to: column },
         String(body.text || '').trim() ? { text: String(body.text).slice(0, 2000) } : {}));
       card.pendingOrder = { kind: order, seq: item.seq, ts: item.ts };
-      const ev = mkEvent({ actor, kind: 'ordered',
-        text: (order === 'start-order' ? 'start ordered' : 'rework ordered') + ' (' + columnTitle(from) + ' → ' + columnTitle(column) + ')' }, {});
-      card.events.push(ev);
-      card.updated = now();
+      const ev = store.cardEvent(card, { actor, kind: 'ordered',
+        text: (order === 'start-order' ? 'start ordered' : 'rework ordered') + ' (' + columnTitle(from) + ' → ' + columnTitle(column) + ')' });
       return { ok: true, ordered: order, event: ev, seq: item.seq };
     }
-  } else if (column === 'working') {
+  } else if (column === 'working' && card.execution !== 'external') {
     return { error: 'only card.start moves a card into Working (it spawns the worker) — run: card start ' + card.id, code: 409 };
-  } else if (column !== 'review') {
-    return { error: 'lieutenants move cards only to review (the handoff)' };
+  } else if (column !== 'review' && card.execution !== 'external') {
+    return { error: 'lieutenants move cards only to review (the handoff)', code: 400 };
   }
 
   card.column = column;
   card.pendingOrder = null;
-  card.updated = now();
-  if (from === 'working') {
-    const w = findWorker(card.id);
-    if (w) { delete w.stopNotified; clearStale(w); } // leaving Working ends the stop/stale-state
-  }
+  if (from === 'working') workers.leave(card.id); // leaving Working ends the stop/stale-state
   // A move is a deliberate act: it always lands on the timeline. Default kind:
   // a lieutenant move is a handoff (level 1 from the kinds map — rings the
   // captain); a captain move is `moved` (level 2). `kind` in the body overrides;
   // levels come from the effective kinds map unless an explicit level is given.
-  const ev = mkEvent(
+  const ev = store.cardEvent(card,
     { level: body.level, kind: body.kind, actor, text: columnTitle(from) + ' → ' + columnTitle(column) },
     { kind: actor === 'user' ? 'moved' : 'handoff' });
-  card.events.push(ev);
   if (actor === 'user') queuePush(card.owner, { kind: 'card-moved', card: card.id, from, to: column });
   return { ok: true, event: ev };
 }
 
 function patchCard(card, body) {
+  if (body.currentSession !== undefined && !(card.sessions || []).some((s) => s.key === body.currentSession)) {
+    return { error: 'currentSession must name one of this card\'s sessions', code: 400 };
+  }
+  // Validate every field before applying any: a refused patch must leave nothing
+  // in memory for the next unrelated save to persist.
   // Owner reassignment is allowed ONLY while no worker is bound to the card
   // (live or recorded): a worker's session/worktree belong to the owning
   // lieutenant's supervision, so mid-work handovers stay forbidden.
-  if (body.owner !== undefined) {
-    const newOwner = String(body.owner).replace(/^lieutenant:/, '');
-    if (newOwner !== card.owner) {
-      if (findWorker(card.id)) {
-        return { error: 'owner change refused: card has a worker bound (session/worktree) — finish or archive first' };
-      }
-      if (!board.lieutenants.some((l) => l.id === newOwner)) {
-        return { error: 'unknown lieutenant: ' + newOwner };
-      }
-      const prev = card.owner;
-      card.owner = newOwner;
-      card.events.push(mkEvent(
-        { actor: body.actor, text: 'owner: ' + prev + ' → ' + newOwner }, { kind: 'moved' }));
+  const newOwner = body.owner !== undefined ? String(body.owner).replace(/^lieutenant:/, '') : card.owner;
+  if (newOwner !== card.owner) {
+    if (findWorker(card.id)) {
+      return { error: 'owner change refused: card has a worker bound (session/worktree) — finish or archive first', code: 409 };
+    }
+    if (!board.lieutenants.some((l) => l.id === newOwner)) {
+      return { error: 'unknown lieutenant: ' + newOwner, code: 400 };
     }
   }
-  if (body.playbook !== undefined) {
-    const pb = checkPlaybook(body.playbook);
-    if (pb.error) return { error: pb.error };
-    card.playbook = pb.playbook;
+  const pb = body.playbook !== undefined ? checkPlaybook(body.playbook) : null;
+  if (pb && pb.error) return pb;
+
+  if (newOwner !== card.owner) {
+    const prev = card.owner;
+    card.owner = newOwner;
+    store.cardEvent(card, { actor: body.actor, text: 'owner: ' + prev + ' → ' + newOwner }, { kind: 'moved' });
   }
+  if (pb) card.playbook = pb.playbook;
+  if (body.currentSession !== undefined) card.currentSession = body.currentSession;
   if (body.title !== undefined) card.title = String(body.title).slice(0, 200);
   if (body.body !== undefined) card.body = String(body.body);
   if (body.type !== undefined && CARD_TYPES.includes(body.type)) card.type = body.type;
@@ -2006,16 +2165,28 @@ function patchCard(card, body) {
 // This is the ONLY path (besides the investigation auto-attach) that puts an
 // entry there — a chat upload alone never does. Idempotent by uri, mirroring the
 // investigation auto-attach shape. A bare filesystem path is normalized to a
-// file:// absolute uri; attachment:// and http(s):// / file:// uris pass through.
-function normalizeArtifactUri(raw) {
+// file:// absolute uri; attachment:// and http(s):// uris pass through.
+function literalArtifactUri(raw) {
   const s = String(raw || '').trim();
   if (!s) return '';
   if (/^(attachment|https?|file):\/\//.test(s)) return s;
   return 'file://' + path.resolve(s);
 }
+// The stored uri is the file's REAL directory: the write gate refuses a path
+// whose realpath differs, so `/tmp/x.md` on macOS (/tmp → /private/tmp) would
+// read forever and never save. Only the directory is followed — a symlinked
+// leaf stays as given, and the gate still refuses it. An unclean file:// path
+// stays verbatim so the gate refuses the traversal instead of it being resolved away.
+function normalizeArtifactUri(raw) {
+  const uri = literalArtifactUri(raw);
+  if (!uri.startsWith('file://')) return uri;
+  const file = uri.slice('file://'.length);
+  if (!path.isAbsolute(file) || path.resolve(file) !== file) return uri;
+  return 'file://' + path.join(realDir(path.dirname(file)), path.basename(file));
+}
 function cardArtifactAdd(card, body) {
   const uri = normalizeArtifactUri(body && body.uri);
-  if (!uri) return { error: 'uri required (attachment://id | file://path | path)' };
+  if (!uri) return { error: 'uri required (attachment://id | file://path | path)', code: 400 };
   if (!Array.isArray(card.attributes.artifacts)) card.attributes.artifacts = [];
   const label = String((body && body.label) || '').slice(0, 200);
   const existing = card.attributes.artifacts.find((a) => a && a.uri === uri);
@@ -2030,15 +2201,16 @@ function cardArtifactAdd(card, body) {
   if (am) { const meta = readAttachmentMeta(am[1]); if (meta) defLabel = meta.name; }
   const art = label ? { uri, label } : { uri, label: defLabel };
   card.attributes.artifacts.push(art);
-  card.events.push(mkEvent({ text: 'artifact added: ' + (art.label || uri), actor: (body && body.actor) || 'agent', level: 2 }, {}));
-  card.updated = now();
+  store.cardEvent(card, { text: 'artifact added: ' + (art.label || uri), actor: (body && body.actor) || 'agent', level: 2 });
   return { ok: true, artifact: art };
 }
 function cardArtifactRemove(card, body) {
   const uri = normalizeArtifactUri(body && body.uri);
-  if (!uri) return { error: 'uri required' };
+  if (!uri) return { error: 'uri required', code: 400 };
+  // The literal form too: an entry stored before uris were realpath'd must stay removable.
+  const literal = literalArtifactUri(body && body.uri);
   const arts = Array.isArray(card.attributes.artifacts) ? card.attributes.artifacts : [];
-  const next = arts.filter((a) => !(a && a.uri === uri));
+  const next = arts.filter((a) => !(a && (a.uri === uri || a.uri === literal)));
   const removed = next.length !== arts.length;
   card.attributes.artifacts = next;
   if (removed) card.updated = now();
@@ -2051,11 +2223,7 @@ function uriBasenameServer(uri) {
   return i >= 0 ? s.slice(i + 1) : s;
 }
 
-function readArchive() {
-  try {
-    return fs.readFileSync(ARCHIVE_FILE, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
-  } catch (e) { return []; }
-}
+function readArchive() { return readJsonl(ARCHIVE_FILE); }
 
 function archiveCard(card, body, actorDefault) {
   const actor = String((body && body.actor) || actorDefault || 'agent').slice(0, 60);
@@ -2064,8 +2232,11 @@ function archiveCard(card, body, actorDefault) {
   // the optional `note`, preserved on the archive record.
   const reason = (body && body.reason) || 'killed';
   if (reason !== 'merged' && reason !== 'killed') {
-    return { error: "reason must be 'merged' or 'killed' (free text goes in note)" };
+    return { error: "reason must be 'merged' or 'killed' (free text goes in note)", code: 400 };
   }
+  // The worker's address goes onto the card BEFORE the snapshot freezes: the
+  // record may be dropped later, detached, with no card left to stamp.
+  stampWorkerAddress(card, findWorker(card.id));
   const note = body && body.note ? String(body.note).slice(0, 500) : null;
   const rec = { ts: now(), actor, reason, card };
   if (note) rec.note = note;
@@ -2082,11 +2253,10 @@ function archiveCard(card, body, actorDefault) {
   // reference. Typed by reason: merged = landed (level 1 — worth a bell),
   // killed = killed (level 2 — the captain's own act, no bell). Levels come from
   // the effective kinds map.
-  const ev = mkEvent(
+  const ev = store.boardEvent(
     { level: body && body.level, kind: body && body.kind, actor, text: reason + ': ' + (note || card.title) },
     { kind: reason === 'merged' ? 'landed' : 'killed' });
   ev.card = card.id; ev.cardTitle = card.title; ev.archived = true;
-  board.events.push(ev);
   return { ok: true, event: ev };
 }
 
@@ -2118,13 +2288,11 @@ function restoreCard(id, body) {
   const wasWorking = card.column === 'working';
   if (wasWorking) card.column = 'backlog';
   for (const e of card.events) if (e.seq > board.seq) board.seq = e.seq; // defensive: no seq reuse
-  const ev = mkEvent({
+  const ev = store.cardEvent(card, {
     level: body && body.level, kind: body && body.kind, actor: body && body.actor,
     text: (String((body && body.text) || '').trim() || 'resurrected')
       + (wasWorking ? ' — restored to backlog (was working)' : ''),
   }, { kind: 'resurrected' });
-  card.events.push(ev);
-  card.updated = now();
   board.cards.push(card);
   registerCardLabels();
   return { ok: true, card, event: ev };
@@ -2139,9 +2307,9 @@ function findProject(name) { return board.projects.find((p) => p.name === name);
 const addingProjects = new Set(); // names with a clone in flight (async clone opens racing duplicate adds)
 async function addProject(body) {
   const source = String((body && body.source) || '').trim();
-  if (!source) return { error: 'source required (git URL or local path)' };
+  if (!source) return { error: 'source required (git URL or local path)', code: 400 };
   const name = String((body && body.name) || path.basename(source.replace(/\/+$/, '')).replace(/\.git$/, '')).trim();
-  if (!/^[\w][\w.-]*$/.test(name)) return { error: 'bad project name: ' + name + ' (use [A-Za-z0-9_.-], or pass --name)' };
+  if (!isId(name)) return { error: 'bad project name: ' + name + ' (use [A-Za-z0-9_.-], or pass --name)', code: 400 };
   if (findProject(name)) return { error: 'project exists: ' + name, code: 409 };
   if (addingProjects.has(name)) return { error: 'project add already in progress: ' + name, code: 409 };
   const dest = path.join(WORKSPACE, 'projects', name);
@@ -2161,8 +2329,7 @@ async function addProject(body) {
   }
   const project = { name, path: dest, source: src, added: now() };
   board.projects.push(project);
-  board.events.push(mkEvent({ text: 'project ' + name + ' registered',
-    actor: (body && body.actor) || 'agent', level: 2 }, {}));
+  store.boardEvent({ text: 'project ' + name + ' registered', actor: (body && body.actor) || 'agent', level: 2 });
   return { project };
 }
 
@@ -2202,7 +2369,7 @@ function ownerSession(card) {
   const lt = board.lieutenants.find((l) => l.id === card.owner);
   // Mirror the supervision respawn rule: a founder's foreign session name is
   // not spawnable — those workers get the workspace-scoped lieutenant name.
-  return lt && isHarnessRef(lt.ref) && /^bc-[A-Za-z0-9_-]+$/.test(lt.ref.session)
+  return lt && isHarnessRef(lt.ref) && isSpawnableSession(lt.ref.session)
     ? lt.ref.session
     : names.lieutenantSession(WORKSPACE, card.owner);
 }
@@ -2211,38 +2378,11 @@ function ownerSession(card) {
 // refKey — the harness state key an agent's turn-end hook posts as `session`:
 // the bare tmux session for a session-granular ref, `session:window` for a
 // window-granular one. Lieutenants are window-granular too (their own `lt`
-// window — names.LIEUTENANT_WINDOW), so this is NOT worker-only.
-function refKey(ref) { return ref.window ? ref.session + ':' + ref.window : ref.session; }
-function workerName(ref) { return refKey(ref); }
-function findWorker(cardId) { return board.workers.find((w) => w.card === cardId); }
-
-// The worker lease (card.status.worker) is a WRITTEN signal — status.set is its
-// only writer — so a worker that never writes one reads `absent` while its
-// session is plainly alive, and its card reports an absent worker for the whole
-// run while that same run is emitting milestones. On the SINGLE-card read
-// (card show, status <card>) the truth is one call away, so ask for it: alive()
-// on the card's registry entry, whatever harness it is. The board read stays
-// lease-only and sync — one
-// alive() per card there would be a scan, not a read.
-// A written lease always wins; only `absent` is filled in, and only from a
-// session that answers. Dead-or-gone stays absent, which is the honest word.
-async function statusWithLiveness(card, status) {
-  if (!status || !status.worker || status.worker.state !== 'absent') return status;
-  const w = findWorker(card.id);
-  if (!w) return status;
-  let up = false;
-  try { up = await harnessFor(w.ref).alive(w.ref); } catch (e) { up = false; }
-  if (!up) return status;
-  return Object.assign({}, status, {
-    worker: {
-      id: workerName(w.ref),
-      // done or paused and still alive is a session holding the card without
-      // working it — idle. Anything else alive is working.
-      state: (w.done || w.paused) ? 'idle' : 'working',
-      derived: true, // read off the session, not leased by a worker
-    },
-  });
-}
+// window — names.LIEUTENANT_WINDOW), so this is NOT worker-only. Both are the
+// port's keyOf: the harness owns the key's shape.
+function refKey(ref) { return keyOf(ref); }
+function workerName(ref) { return keyOf(ref); }
+function findWorker(cardId) { return workers.find(cardId); }
 
 // ---------- event dedupe keys (POST /api/cards/<id>/events `key`) ----------
 //
@@ -2375,6 +2515,9 @@ function hookContext(card, w) {
 // call site knows it is leaving: opts.boardLevel) the events land on the
 // board-level stream with a card reference instead of being dropped.
 async function fireHooks(event, card, w, opts) {
+  // The plugins hear the same lifecycle the hooks do, and like the hooks they
+  // only observe: emit never waits on a handler and never fails the event.
+  emitPlugins(event, { card, worker: w ? { card: w.card, ref: w.ref, outcome: w.outcome || null } : null });
   try {
     const results = await runHooks(event, hookContext(card, w),
       HOOK_TIMEOUT_MS ? { timeoutMs: HOOK_TIMEOUT_MS } : undefined);
@@ -2389,7 +2532,7 @@ async function fireHooks(event, card, w, opts) {
         { kind: r.ok ? 'hook-ran' : 'hook-failed' }), opts);
       if (!r.ok) queuePush(card.owner, { kind: 'hook-failed', card: card.id, text: text.slice(0, 2000) });
     }
-    saveBoard(); broadcast();
+    store.commit();
   } catch (e) {
     console.error(now() + ' ' + event + ' hooks for ' + card.id + ' failed: ' + String((e && e.message) || e));
   }
@@ -2403,8 +2546,7 @@ async function fireHooks(event, card, w, opts) {
 function landCardEvent(card, ev, opts) {
   const live = (opts && opts.boardLevel) ? null : findCard(card.id);
   if (live) {
-    live.events.push(ev);
-    live.updated = now();
+    store.pushCardEvent(live, ev);
   } else {
     ev.card = card.id;
     ev.cardTitle = card.title;
@@ -2413,562 +2555,74 @@ function landCardEvent(card, ev, opts) {
   return ev;
 }
 
-// The playbook's `teardown` gets TWO budgets, named apart on purpose: the
-// difference between them is who is waiting.
-//
-// At the handoff and at archive the command is fired UN-AWAITED — `card.move`
-// answers immediately — so it can afford the full five minutes.
+// The playbook's `teardown` gets TWO budgets, named apart by who is waiting:
+// at the handoff and archive nothing waits (the release is detached), so five
+// minutes; at the rework RESTART a `card start` caller is on the line, so one.
+// BC_TEARDOWN_TIMEOUT_MS overrides both (the test knob).
 const TEARDOWN_TIMEOUT_MS = parseInt(process.env.BC_TEARDOWN_TIMEOUT_MS, 10) > 0
   ? parseInt(process.env.BC_TEARDOWN_TIMEOUT_MS, 10) : TEARDOWN_DEFAULT_MS;
-// At the rework RESTART it is awaited inside the `card start` request, ahead of
-// a fetch, a worktree add and a spawn, with a CLI holding the line — so it gets
-// one minute. `compose down` is the use case and does not need more; a stack
-// still wedged past that is exactly the case whose answer is "land the event,
-// carry on, and let releaseWorktree make its own decision".
-//
-// BC_TEARDOWN_TIMEOUT_MS overrides BOTH: it is the test knob, and a test that
-// pins one budget wants the other honest too.
 const RESTART_TEARDOWN_TIMEOUT_MS = parseInt(process.env.BC_TEARDOWN_TIMEOUT_MS, 10) > 0
   ? parseInt(process.env.BC_TEARDOWN_TIMEOUT_MS, 10) : 60000;
-const TEARDOWN_OUTPUT_TAIL = 1200; // of the event text, whose own cap is 2000
+// The alive-but-hung gap: a worker stuck inside one turn emits no end-of-life
+// signal, so long silence on a Working card is the only tell (30 min default).
+const BC_WORKER_STALE_SECS = process.env.BC_WORKER_STALE_SECS !== undefined
+  ? parseInt(process.env.BC_WORKER_STALE_SECS, 10) : 1800;
 
-// In-flight teardowns, by worker record. Deliberately NOT on the worker (and so
-// never persisted): a run interrupted by a server restart is not in flight, and
-// a flag that survived one would block the command forever.
-const teardownInFlight = new WeakSet();
+// The worker lifecycle (server/workers.js): start, the verbs, supervision and
+// the ONE end-of-life path. Everything it touches is injected from here.
+const workers = createWorkers({
+  board: () => board,
+  findCard, findProject, columnTitle,
+  harnessFor,
+  worktrees: {
+    create: (projectPath, cardId) => createWorktree(projectPath, cardId, WORKSPACE),
+    release: releaseWorktree,
+    toolFor: (p) => worktreeToolFor(p, WORKSPACE),
+  },
+  runTeardown, hookContext, fireHooks,
+  mkEvent, landEvent: landCardEvent, queuePush,
+  save: store.commit,
+  planStart, ownerSession, workerWindow: names.workerWindow,
+  refreshStatus: refreshAgentStatus,
+  rememberSession: captureWorkerSession,
+  permissionMode: () => configPermissionMode(),
+  permissionPending: (cardId) => permissions.has((it) => it.card === cardId),
+  log: (m) => console.error(now() + ' ' + m),
+  config: {
+    stateDir: STATE_DIR,
+    teardownMs: TEARDOWN_TIMEOUT_MS, restartTeardownMs: RESTART_TEARDOWN_TIMEOUT_MS,
+    staleSecs: BC_WORKER_STALE_SECS,
+  },
+});
+// Kept for callers outside the worker region.
+function killCardWorker(card, w, opts) { return workers.kill(card, w, opts); }
+function stampWorkerAddress(card, w) { return workers.stamp(card, w); }
 
-// runCardTeardown(card, w, wtPath) — a container that outlives its worktree is
-// the same bug as a worktree that outlives its work, one layer down, and the
-// playbook that started the container is the thing that knows how to stop it.
-// So the command runs HERE: at the handoff, in the worktree, the last thing
-// before the release.
-//
-// BEST EFFORT, always. A non-zero exit or a timeout lands an event and the
-// release goes ahead exactly as if no teardown had been configured — a user's
-// broken script must never wedge a card, and nothing is lost by carrying on:
-// if the container really is still holding the checkout, releaseWorktree
-// refuses on its own and says why. EVERY run is an event, success included —
-// otherwise the only way to know whether a card's container was ever stopped is
-// to go looking for the container.
-//
-// Reported through the hook kinds because it IS one of those: a user-owned
-// command the board runs on a lifecycle moment, whose failure rings the same
-// bell. The text says `teardown`, so the timeline still tells them apart.
-async function runCardTeardown(card, w, wtPath, timeoutMs) {
-  const command = String((w && w.teardown) || '').trim();
-  if (!command) return null;
-  // Nothing left to tear down in a directory that is gone — nor in one that was
-  // RELEASED, whether or not it is still on disk: under `tool: 'treehouse'` a
-  // release is `treehouse return`, which hands the checkout back to a pool that
-  // may have leased it to another card by now, and tearing down a stranger's
-  // ground is worse than tearing down nothing. This is not the retry rule below
-  // being clawed back: a released worktree has no next release point for THIS
-  // card, so there is nothing left to retry against.
-  if (!wtPath || !fs.existsSync(wtPath)) return null;
-  if (w.worktree && w.worktree.released) return null;
-  // A directory that is still THERE, on the other hand, is not a record that
-  // this never ran. That record belongs on the worker, and it records a
-  // SUCCESS: a teardown exists to be run at a release, not once per card, so a
-  // failure or a timeout stays retryable at the next release point — which is
-  // the whole reason the restart runs it.
-  if (w.teardownRan || teardownInFlight.has(w)) return null;
-  teardownInFlight.add(w);
-  try {
-    // The worktree is passed, never re-derived: hookContext() reports a
-    // released worktree as '' and runTeardown would fall back to the workspace
-    // root — the one directory a teardown must not run in.
-    const ctx = Object.assign(hookContext(card, w), { worktree: wtPath });
-    const r = await runTeardown(command, ctx, { timeoutMs });
-    if (r.ok) w.teardownRan = true;
-    const detail = r.timedOut ? 'timed out'
-      : r.error ? String(r.error)
-      : 'exit ' + r.code;
-    const out = r.output.length > TEARDOWN_OUTPUT_TAIL
-      ? '…' + r.output.slice(-TEARDOWN_OUTPUT_TAIL) : r.output;
-    const text = 'teardown `' + command + '` ' + (r.ok ? 'ok' : 'FAILED')
-      + ' (' + detail + ', ' + (r.ms / 1000).toFixed(1) + 's)' + (out ? ': ' + out : '');
-    landCardEvent(card, mkEvent({ text, actor: 'server' },
-      { kind: r.ok ? 'hook-ran' : 'hook-failed' }));
-    if (!r.ok) {
-      console.error(now() + ' teardown for ' + card.id + ' failed (' + detail + '): ' + command);
-      queuePush(card.owner, { kind: 'hook-failed', card: card.id, text: text.slice(0, 2000) });
-    }
-    saveBoard(); broadcast(); // the release may sit behind the clone lock for minutes
-    return r;
-  } catch (e) {
-    console.error(now() + ' teardown for ' + card.id + ' failed: ' + String((e && e.message) || e));
-    return null;
-  } finally {
-    teardownInFlight.delete(w);
-  }
-}
-
-// worktreeHolder(cardId, wtPath) — the OTHER card whose live worker record
-// stands on this path, or null. A pointer is not ownership: git paths are
-// per-card and cannot collide, but a treehouse POOL lease goes to whatever card
-// asks next, and a frozen snapshot (archived after a refused release, then
-// `card.restore`) can still name a lease that now belongs to somebody else. A
-// worker RECORD is the ownership claim; the card attribute is only a pointer,
-// so every path that releases against the attribute alone asks this first.
-function worktreeHolder(cardId, wtPath) {
-  return board.workers.find((x) => x.card !== cardId
-    && x.worktree && x.worktree.path === wtPath && !x.worktree.released) || null;
-}
-
-// recordClaims(w) — whether this record is still the claim on its own path, the
-// other half of the same rule: a record that has RELEASED its worktree gave the
-// ground back, and a pool hands the slot to whoever asks next. So every path
-// releasing on behalf of such a record asks worktreeHolder first, exactly as
-// the ones holding nothing but a pointer do.
-function recordClaims(w) {
-  return !!(w && w.worktree && w.worktree.path && !w.worktree.released);
-}
-
-// releaseCardWorktree(card, w, opts) — the worktree goes when the card LEAVES
-// WORKING, not whenever someone tidies up: a finished card held its checkout
-// until archive, so fifteen finished cards held fifteen worktrees on disk.
-//
-// Leaving Working, not `worker done`, is the moment — `worker done` starts the
-// LIEUTENANT's half, and verifying the work means reading the diff in that very
-// worktree. The card leaves Working when the lieutenant has looked and handed
-// off (`card.move`, opts.honorKeep — a playbook's `keep_worktree: true` never
-// releases automatically), and archive stays the backstop it already was (never
-// kept: the card is gone, there is nothing left to rework). `card.park` is NOT
-// one of them: it shelves a card to be resumed in the same worktree.
-//
-// The archive call site runs its hooks FIRST, so a hook still reaches paths
-// inside $BC_WORKTREE — and because that leaves the release trailing an
-// unbounded wait, the card may have been restored and restarted by the time it
-// fires: a worktree that now belongs to a NEWER worker is never touched.
-//
-// releaseWorktree refuses a worktree still holding work — uncommitted changes,
-// or commits on a HEAD no ref reaches — and that refusal is the feature. It is
-// NOT an error: the directory stays and the timeline says which path and why.
-// Never throws — every call site observes a lifecycle outcome it must not fail.
-async function releaseCardWorktree(card, w, opts = {}) {
-  try {
-    if (opts.honorKeep && w && w.keepWorktree) return null;
-    const cur = findWorker(card.id);
-    if (cur && cur !== w) return null; // a newer worker holds this card (and its path)
-    const attrs = (card && card.attributes) || {};
-    const fromRecord = !!(w && w.worktree && w.worktree.path);
-    const wtRec = fromRecord ? w.worktree
-      : (attrs.worktree
-        ? { path: String(attrs.worktree), tool: worktreeToolFor(String(attrs.worktree), WORKSPACE) }
-        : null);
-    if (!wtRec) return null;
-    const project = findProject(String((w && w.project) || attrs.repo || ''));
-    if (!project) return null; // no clone to release against — leave the directory alone
-    // The record IS the claim on its path; a bare pointer is not, and neither is
-    // a record whose worktree is already marked RELEASED — that one gave the
-    // ground back, and a pool hands the slot to whoever asks next. In both
-    // cases a path some OTHER card's live worker stands on is refused before
-    // anything touches it — the teardown included, since stopping what stands
-    // on that ground would stop that worker's stack, not this card's. Refused
-    // the way every refusal here works: the directory stays and the timeline
-    // says whose it is.
-    const holder = (fromRecord && recordClaims(w)) ? null : worktreeHolder(card.id, wtRec.path);
-    let rel;
-    if (holder) {
-      rel = { released: false, reason: 'it belongs to card ' + holder.card + ', whose worker is live on it' };
-    } else {
-      // The playbook's teardown gets its turn first: the release is the moment
-      // the ground goes, so stopping what stands on it happens immediately
-      // before, never after. Never throws, and its outcome never steers what
-      // follows.
-      await runCardTeardown(card, w, wtRec.path, TEARDOWN_TIMEOUT_MS);
-      // The teardown is an unbounded wait (minutes), so the guard above stopped
-      // being atomic: a rework restart in the meantime re-provisions the SAME
-      // deterministic path, and releasing now would delete a live worker's fresh
-      // checkout. Whoever holds the card holds its path — ask again.
-      const after = findWorker(card.id);
-      if (after && after !== w) return null;
-      rel = await releaseWorktree(wtRec, project.path);
-    }
-    const live = findCard(card.id); // archived in the meantime → the board stream carries it
-    // the attribute is a pointer at a directory: a released one has to stop
-    // pointing, or every reader downstream is sent to a path that is gone —
-    // and `already gone` is the case where the directory is provably absent.
-    // The registry entry keeps the path (worker.send and `card start --resume`
-    // name it when they refuse) but is marked released, so hooks stop being
-    // handed a $BC_WORKTREE that no longer exists.
-    if (rel.released) {
-      if (live && live.attributes) delete live.attributes.worktree;
-      if (w && w.worktree) w.worktree.released = true;
-    }
-    if (!(rel.released && rel.reason === 'already gone')) { // nothing happened, nothing to say
-      const text = rel.released
-        ? 'worktree released: ' + wtRec.path
-        : 'worktree kept (' + rel.reason + '): ' + wtRec.path;
-      if (!rel.released) console.error(now() + ' worktree not released for ' + card.id + ': ' + rel.reason);
-      landCardEvent(card, mkEvent({ text, actor: 'server' }, { level: 2 }));
-    }
-    saveBoard(); broadcast();
-    return rel;
-  } catch (e) {
-    console.error(now() + ' worktree release for ' + card.id + ' failed: ' + String((e && e.message) || e));
-    return null;
-  }
-}
-
-// killCardWorker(card, w, opts) — the handoff is the worker's DEATH, not its
-// retirement. Your review is the standing-room column: the captain is the
-// bottleneck, so a card can sit there for a day, and every card sitting there
-// used to pin one idle agent process for the whole wait. That process served
-// almost nothing — rework after a handoff is a fresh start by the DNA's own
-// rule, and the only thing it could still answer, a stray `worker.send`, had
-// nowhere to write once the same handoff released its worktree.
-//
-// So it goes with the worktree, on the same trigger and with the SAME
-// exceptions, for the same reason: a `keep_worktree: true` playbook reworks its
-// card in place (the conversation is the other half of that checkout), and a
-// worker that never reported done may hold the only copy of what it was doing.
-// A worktree still holding work is NOT one of them — that refusal is about the
-// ground, and a finished worker standing on ground nobody will take is still a
-// finished worker.
-//
-// This verb only KILLS: dropping the record is dropWorkerRecord below, and the
-// split is the point. The registry entry is the only handle anyone has on a
-// live agent process, so it may be dropped ONLY by a path that watched the pane
-// go: kill, then alive() again. A kill that throws, or a pane that answers
-// alive afterwards, keeps the record and says so at level 1 — a leaked session
-// that nothing on the board points at is worse than the idle one this whole
-// change exists to end.
-//
-// The level-1 bell rings ONCE per record. `killFailed` is set the first time a
-// kill cannot be verified and cleared the moment one is — the same shape the
-// stall ladder uses — because the sweep retries at every boot, and a bell that
-// rings for the same dead session on every restart of the board is noise the
-// captain learns to ignore. The console still says so every time.
-//
-// Never throws: every call site observes a lifecycle outcome it must not fail.
-async function killCardWorker(card, w, opts = {}) {
-  try {
-    if (!w) return null;
-    if (opts.honorKeep && w.keepWorktree) return null;
-    if (findWorker(w.card) !== w) return null; // already dropped, or a newer worker holds the card
-    const name = workerName(w.ref);
-    let alive = true;
-    let err = null;
-    let already = false;
-    try {
-      const impl = harnessFor(w.ref);
-      // Asked BEFORE the kill, and it decides what to SAY, never what to do:
-      // alive() is false the moment the agent process ends, while the window
-      // it ran in is still standing there at a shell — and the kill is the one
-      // thing that takes that window away. It is idempotent, so it runs on
-      // every path; only the announcement below is gated on this.
-      already = !(await impl.alive(w.ref));
-      await impl.kill(w.ref);
-      alive = await impl.alive(w.ref);
-    } catch (e) { err = e; }
-    if (alive || err) {
-      const why = err ? String((err && err.message) || err) : 'the pane answered alive() after the kill';
-      const text = 'worker ' + name + ' could NOT be killed (' + why + ') — its record is kept, '
-        + 'so the session is still on the board rather than leaked; end it by hand '
-        + '(tmux kill-window -t ' + name + ') and archive or restart the card';
-      console.error(now() + ' worker kill for ' + card.id + ' failed: ' + why);
-      if (!w.killFailed) {
-        w.killFailed = why;
-        landCardEvent(card, mkEvent({ text, actor: 'server' }, { kind: 'worker-kill-failed' }));
-      }
-      saveBoard(); broadcast();
-      return { killed: false, reason: why };
-    }
-    const rang = !!w.killFailed;
-    delete w.killFailed; // the harness came back — the next failure is news again
-    // A pane that was already gone is killed by definition, and nothing
-    // happened to say so — the same rule the release applies to ground that is
-    // already given back. Only a kill that actually closed a live session earns
-    // the line, or the sweep would re-announce the same closure at every boot
-    // of the board for as long as the record it spares survives.
-    if (already) {
-      if (rang) { saveBoard(); broadcast(); }
-      return { killed: true };
-    }
-    landCardEvent(card, mkEvent({
-      text: 'worker ' + name + ' closed (' + (opts.reason || 'the card left Working') + ')',
-      actor: 'server', level: 2,
-    }, {}));
-    saveBoard(); broadcast();
-    return { killed: true };
-  } catch (e) {
-    console.error(now() + ' worker kill for ' + card.id + ' failed: ' + String((e && e.message) || e));
-    return null;
-  }
-}
-
-// stampWorkerAddress(card, w) — the card's own note of the run: `session` and
-// `resumeId`, so the transcript stays readable long after the window is gone.
-// The ONE writer of that pair, and every path that binds or unbinds a worker
-// goes through it: the spawn, the resume, and dropWorkerRecord as the record
-// goes (archive calls it directly — archiveCard freezes the card into the
-// snapshot synchronously, well before a detached drop could get there, and by
-// then there is no card left to stamp).
-//
-// `resumeId` is SET or DELETED, never left standing: the pair is one address,
-// and a ref born without a resume id (codex) beside a session name from this
-// run would otherwise send forensics to the previous run's conversation. Same
-// shape the `branch` attribute already uses at the spawn, for the same reason.
-function stampWorkerAddress(card, w) {
-  if (!card || !card.attributes || !w) return;
-  card.attributes.session = workerName(w.ref);
-  if (w.ref && w.ref.resumeId) card.attributes.resumeId = w.ref.resumeId;
-  else delete card.attributes.resumeId;
-}
-
-// dropWorkerRecord(card, w) — the registry entry goes, and the address it held
-// outlives it on the card. Call it ONLY behind a verified kill.
-//
-// It is deliberately NOT the second half of that kill. A checkout that refused
-// its release keeps its record, because that record is the last handle on the
-// unfinished business standing on it — the path, and a `teardown` that has not
-// run yet and gets another turn at archive. The window is dead either way; the
-// entry is what the next release point reads.
-//
-// Guarded like its two siblings: a record already spliced, or a NEWER worker
-// holding this card (a rework restart that raced the release's teardown wait),
-// and this dead worker neither drops the live one's record nor stamps its own
-// address over the live one's — the board would then send the lieutenant to a
-// session that no longer exists.
-function dropWorkerRecord(card, w) {
-  if (!w) return null;
-  if (findWorker(w.card) !== w) return null;
-  stampWorkerAddress(findCard(w.card), w);
-  board.workers = board.workers.filter((x) => x !== w);
-  saveBoard(); broadcast();
-  return w;
-}
-
-// sweepStaleWorkers() — one pass at boot over the registry, because a rule that
-// only fires on the move leaves behind everything that was already there: a
-// board upgrading to this carries records for cards long since handed off, and
-// windows whose agent died months ago.
-//
-// A worker outlives neither its card's Working state nor a restart that forgot
-// to notice. Off the board entirely (archived, killed) → it goes, no exceptions,
-// exactly as archive would have done: no card will ever come back for it, so a
-// record spared there is a leak with nothing on the other end. Still on the
-// board but out of Working → the handoff's own rule, exceptions included, since
-// a `keep_worktree` card parked in review is deliberately waiting for its
-// worker.
-//
-// One more exception on the board, and it spares the RECORD only, never the
-// process: a record whose worktree is STILL UNRELEASED is the last handle on
-// the work standing there — `card.park` shelves a card to be resumed in that
-// very checkout, and a release that REFUSED left an unspent `teardown` archive
-// is contracted to retry. The entry is what the next release point reads; the
-// window it names is not, and nothing legitimate wants that window alive.
-// `card.park` is legal only when the worker is absent or dead, a refused
-// release only ever follows a verified kill, and `card.start --resume` rides
-// the record's resumeId rather than a live pane. So the kill runs anyway and
-// only the drop is held back. A record with no worktree at all holds nothing.
-//
-// Runs once, after the listen: nothing here is on the critical path of a boot.
-async function sweepStaleWorkers() {
-  for (const w of [...board.workers]) {
-    const card = findCard(w.card);
-    if (card && card.column === 'working') continue;
-    const stand = card || { id: w.card, title: w.card };
-    let kill;
-    let holdsGround = false;
-    if (card) {
-      if (w.keepWorktree || !w.done) continue;
-      holdsGround = !!(w.worktree && w.worktree.path && !w.worktree.released);
-      kill = await killCardWorker(stand, w,
-        { reason: 'boot sweep: the card is in ' + columnTitle(card.column) + ', not Working' });
-    } else {
-      // Whether the board has already failed to end this one, read BEFORE the
-      // attempt: the attempt itself sets the flag.
-      const abandoned = !!w.killFailed;
-      kill = await killCardWorker(stand, w, { reason: 'boot sweep: the card is no longer on the board' });
-      // The terminal path out of an unverifiable kill. Keeping the record is
-      // there to protect LIVE work — it is the only handle on a session
-      // somebody may still come back for — and nobody is coming back for this
-      // one: its card is off the board. So the record goes, having failed
-      // twice, and the timeline says which session was left running rather
-      // than letting the same bell ring at every boot forever.
-      if (kill && !kill.killed && abandoned) {
-        const name = workerName(w.ref);
-        landCardEvent(stand, mkEvent({
-          text: 'worker ' + name + ' ABANDONED (' + kill.reason + '): its card is off the board, so the '
-            + 'record is dropped — nothing is left to come back for it. End the session by hand if it '
-            + 'is still up (tmux kill-window -t ' + name + ')',
-          actor: 'server', level: 2,
-        }, {}));
-        dropWorkerRecord(stand, w);
-        continue;
-      }
-    }
-    // The sweep is not a release point — it ends processes, it does not touch
-    // ground. So the kill is unconditional and only the DROP waits on the
-    // ground: a record still standing on an unreleased worktree survives its
-    // own kill.
-    if (kill && kill.killed && !holdsGround) dropWorkerRecord(stand, w);
-  }
-}
-
-// The system move into Working — card.start is the ONE way in (invariant:
-// Working ⇔ live worker). Clears any pendingOrder (a start-order just executed).
-function enterWorking(card, text) {
-  const from = card.column;
-  card.column = 'working';
-  card.pendingOrder = null;
-  card.updated = now();
-  const ev = mkEvent({
-    text: text + (from !== 'working' ? ' (' + columnTitle(from) + ' → ' + columnTitle('working') + ')' : ''),
-    actor: 'server',
-  }, { kind: 'started' });
-  card.events.push(ev);
-  return ev;
-}
-
-// attachBriefArtifact(card, ref) — the worker's brief, auto-attached as a card
-// artifact (label "brief") the moment a worker is bound to the card: fresh
-// spawn AND resume both call it. Mirrors the investigation report auto-attach
-// (workerDone): dedup by uri, gated on the file actually existing (a harness
-// that doesn't persist a prompt file at this path simply gets no artifact —
-// best-effort, never an error). The path is the SAME deterministic
-// `<stateDir>/<key>.prompt` the harness port persists as the brief's source
-// of truth (key = workerName(ref) = session or session:window), so a resume
-// — which never regenerates a brief — still points at the original one and
-// the uri-dedup keeps this idempotent across any number of resumes.
-function attachBriefArtifact(card, ref) {
-  const briefFile = path.join(HARNESS_STATE_DIR, workerName(ref) + '.prompt');
-  if (!fs.existsSync(briefFile)) return;
-  if (!Array.isArray(card.attributes.artifacts)) card.attributes.artifacts = [];
-  const uri = 'file://' + briefFile;
-  if (!card.attributes.artifacts.some((a) => a && a.uri === uri)) {
-    // type: the brief is markdown in a `.prompt` file (the harness's resume
-    // contract owns that name) — the hint lets the viewer render it as such
-    card.attributes.artifacts.push({ uri, label: 'brief', type: 'markdown' });
-  }
-}
-
-// card.start — ONE atomic op: provision an isolated worktree, spawn the worker
-// session with the brief as launch prompt (per-spawn hook install is SAFE here
-// precisely because the cwd is an isolated worktree — never the workspace root,
-// whose hook a per-spawn install would clobber), bind {session, worktree,
-// branch} into the card + the worker registry, move the card → Working.
-// body.resume reincarnates a recorded (dead) worker in the same worktree instead.
-//
-// Provisioning + spawn are long async waits (a worktree add on a multi-GB
-// repo, a real agent launch): the per-card in-flight guard keeps a second
-// start of the SAME card from racing the first (different cards interleave
-// freely — that's the point of going async), and the card is re-checked
-// against the board after the spawn so a mid-start archive never leaves an
-// orphan session behind. The response still reports the REAL spawn outcome —
-// the await keeps startCard's success/failure contract synchronous-looking.
-// The attributes the BOARD writes and a human never does: each holds a list of
-// records the board appends to, and `--attr prs=<value>` overwrites that list
-// with a string the next append then has to throw away. Named in a refusal,
+// card.start's playbook half: the card's playbook is resolved and read HERE,
+// at start and only here, so the worker gets the card and the playbook as they
+// stand. No fallback: a card with no playbook does not start. The lifecycle
+// half (worktree, spawn, bind, restart) is workers.start in server/workers.js.
+// The attributes the BOARD writes and a human never does: named in a refusal,
 // never offered as a recipe.
 const BOARD_OWNED_ATTRS = new Set(['prs', 'artifacts']);
-const startingCards = new Set(); // card ids with a start/resume in flight
-async function startCard(card, body) {
-  if (startingCards.has(card.id)) {
-    return { error: 'card start already in progress: ' + card.id, code: 409 };
-  }
-  startingCards.add(card.id);
-  try {
-    return await doStartCard(card, body);
-  } finally {
-    startingCards.delete(card.id);
-  }
-}
-async function doStartCard(card, body) {
-  if (card.type === 'plan') return { error: 'plan cards never start (no worker is spawned for a plan)' };
-  // The second way a card could start is GONE, not merely unsupported. A wire
-  // caller that still asks for it gets told so — silently spawning an agent on
-  // the playbook instead would be the opposite of what it asked for.
-  if (body && body.command !== undefined) {
-    return { error: '--command was removed: a card starts one way, from its playbook. '
-      + 'Pick one with: bc-axi card patch ' + card.id + ' --playbook <id>', code: 400 };
-  }
 
-  let existing = findWorker(card.id);
-  if (body && body.resume) {
-    if (body.brief) {
-      return { error: 'resume does not deliver briefs — the reincarnated worker keeps its own context '
-        + 'and the brief would be silently dropped. To hand a live worker new instructions: '
-        + 'bc-axi worker send ' + card.id + ' --text-file <f|->' };
-    }
-    if (!existing) {
-      return { error: 'nothing to resume: card ' + card.id + ' has no recorded worker — a handoff '
-        + 'ends the worker it hands off, so rework after one is a fresh start (card start ' + card.id
-        + '), and a card that never started has nothing to reincarnate either' };
-    }
-    // A worker paused with --expect-exit is stopped ON PURPOSE and already told
-    // the board the way back — and --resume is not it. Resuming spawns a SECOND
-    // run against a path the first one still holds, and the new session dies on
-    // arrival. Refuse, and quote the recorded reason: the caller reached for
-    // this because it is the move the board teaches everywhere else, so name
-    // the door instead of just the wall.
-    if (existing.expectExit) {
-      return { error: 'refusing to resume ' + card.id + ': its worker stopped with --expect-exit — resuming '
-        + 'would start a second run over the one already in flight. '
-        + 'The way back, as recorded at the pause: ' + (existing.pauseReason || '(no reason recorded)'), code: 409 };
-    }
-    // A resume reincarnates the session in the SAME worktree, so a released one
-    // leaves nothing to reincarnate into. Say that, and name the way out: the
-    // harness would otherwise fail on a missing cwd deep inside tmux.
-    if (existing.worktree && existing.worktree.path && !fs.existsSync(existing.worktree.path)) {
-      return { error: 'cannot resume ' + card.id + ': its worktree is gone (' + existing.worktree.path
-        + ') — released when the card left Working. Start a fresh worker (card start ' + card.id
-        + ' — it spawns over the finished session), or, for a playbook whose cards are reworked in '
-        + 'place, set `keep_worktree: true` in its frontmatter', code: 409 };
-    }
-    let ref;
-    try {
-      ref = await harnessFor(existing.ref).resume(existing.ref, { stateDir: HARNESS_STATE_DIR, callbackUrl: TURNEND_URL });
-    } catch (e) {
-      return { error: 'worker resume failed: ' + String((e && e.message) || e), code: 502 };
-    }
-    if (!findCard(card.id)) { // archived while the resume was in flight
-      Promise.resolve().then(() => harnessFor(ref).kill(ref)).catch(() => {});
-      return { error: 'card left the board during resume: ' + card.id, code: 409 };
-    }
-    existing.ref = ref;
-    stampWorkerAddress(card, existing);
-    existing.done = false;
-    delete existing.outcome;
-    delete existing.flagged;
-    delete existing.stopNotified;
-    clearStale(existing);
-    delete existing.lastTurnEndText;
-    delete existing.lastSignalText;
-    delete existing.paused; // a revived worker is watched again
-    delete existing.killFailed; // reincarnated on a harness that answers
-    attachBriefArtifact(card, ref);
-    enterWorking(card, 'worker ' + workerName(ref) + ' resumed in ' + existing.worktree.path);
-    return { worker: existing, resumed: true };
-  }
-
-  if (card.column === 'working') return { error: 'card is already Working', code: 409 };
-  if (existing && !existing.done) {
-    return { error: 'card already has a worker (' + workerName(existing.ref) + ') — resume it (card start --resume) or archive first', code: 409 };
-  }
-  const repoAttr = card.attributes && card.attributes.repo;
-  if (!repoAttr) return { error: 'card has no repo attribute — set it first: card patch ' + card.id + ' --attr repo=<project>' };
-  const project = findProject(String(repoAttr));
-  if (!project) return { error: 'unregistered project: ' + repoAttr + ' (register it: bc-axi project add <url|path>)' };
-
-  // The playbook is resolved and read HERE — at start, and only here, so the
-  // worker gets the card as it stands and the playbook as it stands. Every
-  // start reads it: there is no second way for a card to begin. No fallback
-  // either — a card with no playbook does not start.
-  // A playbook MAY open with frontmatter (server/playbooks.js) naming what runs
-  // it: harness, model, the attributes it cannot work without, whether it gets
-  // a branch. Parsed here, honored below.
+/**
+ * Resolve what a start runs from the card's playbook: harness, branch, launch
+ * flags, keep_worktree/teardown, and the brief renderer. Refuses BEFORE
+ * anything is provisioned (a missing `requires` attribute, an unknown harness).
+ * @returns {{impl, branch, extraArgs, keepWorktree, teardown, brief: (wtPath) => string}|{error, code}}
+ * `impl` carries the typed model/effort into its spawn.
+ */
+function planStart(card, body, project) {
   const playbookId = String(card.playbook || '').trim();
   if (!playbookId) {
     return { error: 'card ' + card.id + ' has no playbook — pick one before starting it: '
-      + 'bc-axi card patch ' + card.id + ' --playbook <id>. Available: ' + playbooksHint() };
+      + 'bc-axi card patch ' + card.id + ' --playbook <id>. Available: ' + playbooksHint(), code: 400 };
   }
   const playbookFile = resolvePlaybook(STATE_DIR, playbookId);
   if (!playbookFile) {
     return { error: 'card ' + card.id + ' points at playbook "' + playbookId + '", which no file '
-      + 'matches. Available: ' + playbooksHint() };
+      + 'matches. Available: ' + playbooksHint(), code: 400 };
   }
   let raw;
   try { raw = fs.readFileSync(playbookFile, 'utf8'); }
@@ -2976,21 +2630,10 @@ async function doStartCard(card, body) {
   let template = '';
   let meta = {};
   try { ({ meta, body: template } = parsePlaybook(raw)); }
-  catch (e) { return { error: 'playbook ' + playbookFile + ': ' + String((e && e.message) || e) }; }
-  // `requires` — the attributes this playbook cannot work without.
-  // Refused HERE, before a worktree or a session exists: a review playbook with
-  // no pr_url otherwise renders its unresolved placeholder literally — the
-  // right call for a typo — and spawns a worker to discover that for itself.
-  // Matched through playbooks.js's attrVar(), the same normalisation the
-  // placeholder table uses, so a playbook asking for PR_URL is answered by
-  // the card's pr_url — asking for a name the brief could not have read back
-  // is not a requirement anyone means to write.
-  //
-  // The question here is whether the card CARRIES the thing, not whether it
-  // has a text form to render — that second question is briefVars', and it
-  // is why the two rules differ: a review playbook demanding "this card has PRs
-  // recorded" is a real requirement even though the recorded list renders
-  // into nothing. An empty list, though, carries nothing.
+  catch (e) { return { error: 'playbook ' + playbookFile + ': ' + String((e && e.message) || e), code: 400 }; }
+  // `requires`: does the card CARRY the attribute (an empty list carries
+  // nothing), matched through attrVar() like the placeholders, so PR_URL is
+  // answered by pr_url.
   const have = new Set();
   for (const [k, v] of Object.entries((card.attributes || {}))) {
     if (v === null || v === undefined) continue;
@@ -2999,8 +2642,7 @@ async function doStartCard(card, body) {
       : String(v).trim() !== '';
     if (carried) have.add(attrVar(k));
   }
-  // Named back in the form the CARD carries: the uppercase form would earn
-  // the user a second attribute resolving to the placeholder the first owns.
+  // Named back in the form the CARD carries, so nobody sets a second spelling.
   const missing = [...new Set((meta.requires || [])
     .filter((k) => !have.has(attrVar(k)))
     .map((k) => attrCardKey(k)))];
@@ -3018,431 +2660,46 @@ async function doStartCard(card, body) {
         + ' recorded by the board itself and never set by hand — the card has to earn '
         + (ours.length > 1 ? 'them' : 'it') + ' before this playbook can run.';
     }
-    return { error: err };
+    return { error: err, code: 400 };
   }
-  // Harness precedence: explicit CLI --harness wins, then the playbook's
-  // frontmatter, then config/default.
-  const harnessFromPlaybook = !(body && body.harness) && !!meta.harness;
-  const harnessName = String((body && body.harness)
-    || meta.harness || readConfig().harness || 'claude');
+  // Harness and model: explicit flag, then the playbook's frontmatter, then config.
+  const harnessFromPlaybook = !body.harness && !!meta.harness;
+  const harnessName = String(body.harness || meta.harness || readConfig().harness || port.defaultHarness());
   let impl;
-  // A name the playbook asked for names the playbook back: otherwise a typo in
-  // one of several playbooks sends whoever started the card hunting for it.
+  // A name the playbook asked for names the playbook back.
   try { impl = getHarness(harnessName); }
   catch (e) {
     return { error: String((e && e.message) || e)
-      + (harnessFromPlaybook ? ' (from playbook ' + playbookFile + ')' : '') };
+      + (harnessFromPlaybook ? ' (from playbook ' + playbookFile + ')' : ''), code: 400 };
   }
-
-  // A finished previous worker (rework restart): its session must be gone
-  // (a live one is resumed/steered, not spawned over), then its worktree is
-  // released first — only when clean, so committed-but-unmerged work is never
-  // discarded.
-  if (existing) {
-    let up = false;
-    let upErr = null;
-    try { up = await harnessFor(existing.ref).alive(existing.ref); } catch (e) { upErr = e; }
-    // The one live session that IS spawned over: done, and its worktree already
-    // released at the handoff. There is nothing left to steer (a reopened turn
-    // has nowhere to write) and nothing to resume, so refusing here would leave
-    // a fresh start as the only move and refuse that too — a dead end. Kill it
-    // and reprovision; every OTHER live session is still off limits.
-    const groundGone = !!(existing.done && existing.worktree && existing.worktree.path
-      && !fs.existsSync(existing.worktree.path));
-    if (up && !groundGone) {
-      const reopenHint = existing.done ? ' (or, since it reported done, reopen it in place with worker send)' : '';
-      return { error: 'previous worker session ' + workerName(existing.ref) + ' is still alive — resume it (card start --resume) or steer it instead of spawning over it' + reopenHint, code: 409 };
-    }
-    // The same verify-then-drop invariant the handoff obeys: this path DROPS
-    // the record at the end, so it may only do so having watched the pane go —
-    // and alive() answering false is NOT that proof. It goes false the moment
-    // the agent process exits, while the window it ran in is still standing at
-    // a shell; the next spawn would then collide with a window nothing on the
-    // board points at any more, and the card could never start again. So the
-    // kill runs on every path, and a kill that cannot be verified refuses the
-    // start: spawning a second worker over a live zombie is worse than a start
-    // that says no and names the session to end by hand.
-    const kill = await killCardWorker(card, existing, { reason: 'the card was restarted' });
-    if (kill && !kill.killed) {
-      const why = kill.reason || String((upErr && upErr.message) || upErr
-        || 'the pane could not be verified gone');
-      return { error: 'previous worker session ' + workerName(existing.ref) + ' could not be ended ('
-        + why + ') — end it by hand (tmux kill-window -t ' + workerName(existing.ref)
-        + ') and start the card again', code: 409 };
-    }
-    // NULL is not that refusal — it is "there was nothing to do": the record
-    // stopped being this card's while we were looking. The handoff's own
-    // teardown runs detached behind a lock and a five-minute budget, and the
-    // boot sweep retires records just after the listen, so a rework start
-    // issued into either window finds its record retired mid-flight. Reading
-    // that as an unkillable pane sends the lieutenant to close a window that
-    // is already closed. Whoever holds the card now decides: nobody, and this
-    // start carries on exactly as one that never had a record; somebody else,
-    // and it is refused the way any start over a live worker is.
-    if (!kill) {
-      const newer = findWorker(card.id);
-      if (newer) {
-        return { error: 'card already has a worker (' + workerName(newer.ref)
-          + ') — resume it (card start --resume) or archive first', code: 409 };
-      }
-      existing = null;
-    }
+  // model and effort are TYPED options: the harness spells its own flags, and
+  // one it does not honor is dropped with a note on the card (best-effort;
+  // verbs still throw). The start never fails over an option.
+  const modelHint = body.model || meta.model;
+  const { opts: typed, ignored } = port.splitOptions(impl, {
+    model: modelHint ? String(modelHint) : undefined,
+    effort: body.effort ? String(body.effort) : undefined,
+  });
+  for (const opt of ignored) {
+    store.cardEvent(card, { text: harnessName + ' does not support ' + opt + '; started without it', actor: 'server' },
+      { kind: 'option-ignored' });
   }
-
-  if (existing) {
-    const prevProject = findProject(existing.project) || project;
-    // A record that already released its worktree is no longer standing on it,
-    // so this start may be looking at a lease the pool has since handed to
-    // somebody else. Refused by name, on the same terms as the pointer branch
-    // below, before the teardown — stopping what runs on that ground would
-    // stop the card that owns it now.
-    if (!recordClaims(existing) && existing.worktree && existing.worktree.path) {
-      const held = worktreeHolder(card.id, existing.worktree.path);
-      if (held) {
-        return { error: 'the worktree ' + card.id + '\'s previous worker recorded (' + existing.worktree.path
-          + ') belongs to card ' + held.card + ', whose worker is live on it — this record\'s claim on it '
-          + 'is spent. Look at ' + held.card + ' first, then archive or restart ' + card.id, code: 409 };
-      }
-    }
-    // A restart is not a handoff: it is the moment that checkout is actually
-    // destroyed, so the teardown belongs here too — otherwise `keep_worktree`,
-    // which skips it at the handoff precisely because the checkout is being
-    // kept, is the one documented rework flow that deletes a worktree with its
-    // container still up. The command run is the PREVIOUS worker's recorded
-    // one, never the playbook being started: what must be stopped is what was
-    // brought up. Best effort, exactly as at the handoff — the release below
-    // makes its own decision, and still 409s if it refuses — on the shorter
-    // budget, because this one is awaited with a caller on the line.
-    await runCardTeardown(card, existing, existing.worktree && existing.worktree.path,
-      RESTART_TEARDOWN_TIMEOUT_MS);
-    const rel = await releaseWorktree(existing.worktree, prevProject.path);
-    if (!rel.released) {
-      return { error: 'previous worker worktree not releasable (' + rel.reason + '): ' + existing.worktree.path, code: 409 };
-    }
-    dropWorkerRecord(card, existing);
-  } else if (card.attributes && card.attributes.worktree) {
-    // No record, but the card still points at a checkout. That is what a
-    // handoff leaves behind when its release did not finish — refused (a
-    // worktree still holding work), or interrupted by a restart of the board —
-    // and the pointer is now the only handle on it, the worker record having
-    // died with the handoff. So the restart releases against the POINTER, on
-    // exactly the terms the record would have got: refused means 409, never a
-    // silent `git worktree add` onto a path that already exists.
-    // The previous run's `teardown` is not recoverable here (it lived on the
-    // record) — it had its turn at the handoff.
-    const stalePath = String(card.attributes.worktree);
-    // Releasing a lease somebody else's live worker stands on would take that
-    // worker's ground out from under it: name the holder and refuse instead.
-    const holder = worktreeHolder(card.id, stalePath);
-    if (holder) {
-      return { error: 'the worktree ' + card.id + ' still points at (' + stalePath + ') belongs to card '
-        + holder.card + ', whose worker is live on it — this card\'s pointer is stale. Clear it '
-        + '(bc-axi card patch ' + card.id + ' --attr worktree=) once you have looked at '
-        + holder.card + ', then start again', code: 409 };
-    }
-    const stale = { path: stalePath, tool: worktreeToolFor(stalePath, WORKSPACE) };
-    if (fs.existsSync(stale.path)) {
-      const rel = await releaseWorktree(stale, project.path);
-      if (!rel.released) {
-        return { error: 'previous worker worktree not releasable (' + rel.reason + '): ' + stale.path, code: 409 };
-      }
-    }
-    delete card.attributes.worktree;
+  const extraArgs = [];
+  if (Object.keys(typed).length) {
+    const raw = impl;
+    impl = Object.assign({}, raw, { spawn: (cwd, prompt, o) => raw.spawn(cwd, prompt, Object.assign({}, o, typed)) });
   }
-
-  let wt;
-  try { wt = await createWorktree(project.path, card.id, WORKSPACE); }
-  catch (e) { return { error: 'worktree provisioning failed: ' + String((e && e.message) || e), code: 502 }; }
-  // A base that could not be refreshed is the card's business, not the server
-  // log's: the worker is about to run on it either way.
-  for (const w of (wt.warnings || [])) {
-    card.events.push(mkEvent({ text: 'worktree base: ' + w, actor: 'server' }, { kind: 'stale-base' }));
-    card.updated = now(); // a start that fails after this still flushes the event
-  }
-  delete wt.warnings; // said on the card; the persisted record is the checkout itself
-
-  const session = ownerSession(card);
-  const window = names.workerWindow(card.id);
-  // Whether the work gets a branch is a DELIVERY contract, so the playbook owns
-  // it: `branch: false` = detached HEAD, nothing to push. With no key, the card
-  // type decides as it always has (an investigation delivers a report).
+  // A branch is the playbook's delivery contract; without the key the card type decides.
   const cuts = typeof meta.branch === 'boolean' ? meta.branch : card.type !== 'investigation';
   const branch = cuts ? 'bc/' + card.id : null;
-  const prompt = workerBrief({
-    template, card, task: body && body.brief, thread: card.thread || [],
-    project, worktree: wt.path, branch: branch || '', workspace: WORKSPACE,
-    stateDir: STATE_DIR, cli: path.join(__dirname, '..', 'cli', 'bc-axi'),
-  });
-  const spawnOpts = { session, window, stateDir: HARNESS_STATE_DIR, callbackUrl: TURNEND_URL };
-  const extraArgs = [];
-  // Model precedence mirrors harness: explicit --model wins, else the
-  // playbook's frontmatter.
-  const modelHint = (body && body.model) || meta.model;
-  if (modelHint) extraArgs.push('--model', String(modelHint));
-  if (body && body.effort) extraArgs.push('--effort', String(body.effort));
-  if (extraArgs.length) spawnOpts.extraArgs = extraArgs;
-  let ref;
-  try {
-    ref = await impl.spawn(wt.path, prompt, spawnOpts);
-  } catch (e) {
-    await releaseWorktree(wt, project.path).catch(() => {}); // best-effort: no spawnless lease left behind
-    return { error: 'worker spawn failed: ' + String((e && e.message) || e), code: 502 };
-  }
-  if (!findCard(card.id)) { // archived while provisioning/spawn were in flight
-    Promise.resolve().then(() => impl.kill(ref)).catch(() => {});
-    await releaseWorktree(wt, project.path).catch(() => {});
-    return { error: 'card left the board during start: ' + card.id, code: 409 };
-  }
-
-  card.attributes.worktree = wt.path;
-  // Cleared when this run cuts none: a card restarted on a no-branch template
-  // would otherwise keep the last run's value, and everything downstream —
-  // lifecycle hooks, the rendered brief — would read a branch that is not there.
-  if (branch) card.attributes.branch = branch;
-  else delete card.attributes.branch;
-  attachBriefArtifact(card, ref);
-  const worker = { card: card.id, ref, worktree: wt, project: project.name, spawnedAt: now(), done: false };
-  stampWorkerAddress(card, worker);
-  if (branch) worker.branch = branch;
-  // Recorded at start because the handoff is where they are read, and the
-  // playbook is resolved HERE and only here.
-  if (meta.keep_worktree) worker.keepWorktree = true;
-  if (meta.teardown) worker.teardown = meta.teardown;
-  board.workers.push(worker);
-  enterWorking(card, 'worker ' + workerName(ref) + ' started in ' + wt.path);
-  return { worker };
-}
-
-// The stale-state is over: signal, done, resume, pause, a turn-end or leaving
-// Working all reset the escalation ladder, so the next stall starts quiet again.
-function clearStale(w) {
-  delete w.staleNotified;
-  delete w.staleNotifiedAt;
-  delete w.staleHits;
-}
-
-// The worker's most recent words: whichever of the turn-end text and the
-// signal text carries the newer stamp, falling back to the one that exists.
-function lastWordOf(w) {
-  const turn = w.lastTurnEndText ? Date.parse(w.lastTurnEnd) : NaN;
-  const sig = w.lastSignalText ? Date.parse(w.lastSignalAt) : NaN;
-  if (!Number.isNaN(turn) && !Number.isNaN(sig)) return sig > turn ? w.lastSignalText : w.lastTurnEndText;
-  return w.lastTurnEndText || w.lastSignalText || '';
-}
-
-// worker.signal — a real milestone from the worker: level-2 event on the card
-// + a QueueItem to the owning lieutenant.
-function workerSignal(card, body) {
-  const text = String((body && body.text) || '').trim();
-  if (!text) return { error: 'text required' };
-  const w = findWorker(card.id);
-  if (w) {
-    delete w.stopNotified; // a fresh signal starts a fresh stop-state
-    clearStale(w);
-    w.lastSignalAt = now(); // a milestone is real activity: resets the stale clock
-    w.lastSignalText = text.slice(0, 300); // what the stall alert quotes as the worker's last word
-  }
-  const ev = mkEvent({ text: text.slice(0, 2000), actor: (body && body.actor) || 'worker' }, { kind: 'signal' });
-  card.events.push(ev);
-  card.updated = now();
-  queuePush(card.owner, { kind: 'worker-signal', card: card.id, text: text.slice(0, 2000) });
-  return { ok: true, event: ev };
-}
-
-// worker done — the worker finished: event + QueueItem to the owner. The card
-// does NOT move — the lieutenant verifies the work, rewrites the body, and
-// hands off to review itself. PR URLs in the outcome auto-populate the card's
-// `prs` attribute (state open — the PR watch takes it from there); an
-// investigation's report file is auto-attached as a card artifact.
-const PR_URL_RE = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/g;
-function workerDone(card, body) {
-  const outcome = String((body && body.outcome) || '').trim();
-  if (!outcome) return { error: 'outcome required' };
-  const w = findWorker(card.id);
-  if (w) {
-    w.done = true; w.outcome = outcome.slice(0, 2000);
-    delete w.flagged; delete w.stopNotified; clearStale(w);
-    delete w.expectExit; delete w.pauseReason; // the gate it stopped at is behind it
-  }
-  const urls = outcome.match(PR_URL_RE) || [];
-  if (urls.length) {
-    if (!Array.isArray(card.attributes.prs)) card.attributes.prs = [];
-    for (const url of urls) {
-      if (!card.attributes.prs.some((p) => p && p.url === url)) card.attributes.prs.push({ url, state: 'open' });
-    }
-  }
-  if (card.type === 'investigation') {
-    const report = path.join(STATE_DIR, 'reports', card.id + '.md');
-    if (fs.existsSync(report)) {
-      if (!Array.isArray(card.attributes.artifacts)) card.attributes.artifacts = [];
-      const uri = 'file://' + report;
-      if (!card.attributes.artifacts.some((a) => a && a.uri === uri)) {
-        card.attributes.artifacts.push({ uri, label: 'report' });
-      }
-    }
-  }
-  const ev = mkEvent({ text: 'worker done: ' + outcome.slice(0, 1900), actor: (body && body.actor) || 'worker' }, { kind: 'worker-done' });
-  card.events.push(ev);
-  card.updated = now();
-  queuePush(card.owner, { kind: 'worker-done', card: card.id, text: outcome.slice(0, 2000) });
-  return { ok: true, event: ev };
-}
-
-// worker.send — lieutenant -> live worker: deliver text into the worker's
-// session through the harness typer (verified submission), the same send half
-// captain-feedback delivery uses for its wake. Workers have no queue, so the
-// pane IS the delivery — the send is awaited and its real outcome reported;
-// a level-2 card event records what was handed over.
-async function workerSend(card, body) {
-  const text = String((body && body.text) || '').trim();
-  if (!text) return { error: 'text required' };
-  const w = findWorker(card.id);
-  if (!w) {
-    return { error: 'no worker bound to card ' + card.id + ' — start one first (card start ' + card.id + ')', code: 404 };
-  }
-  let up = false;
-  try { up = await harnessFor(w.ref).alive(w.ref); } catch (e) { up = false; }
-  if (w.done) {
-    // The ground first: the handoff released the worktree this session sits in,
-    // so neither way back — reopen here, or the resume the dead branch below
-    // points at — has anywhere to write. Checked BEFORE liveness so the answer
-    // comes in one hop instead of sending the caller to a resume that refuses.
-    if (w.worktree && w.worktree.path && !fs.existsSync(w.worktree.path)) {
-      return { error: 'worker for ' + card.id + ' reported done and its worktree was released at the handoff ('
-        + w.worktree.path + ') — a reopened turn would have nowhere to write. Start a fresh worker '
-        + '(card start ' + card.id + ' — it spawns over this finished session), or, for a playbook whose '
-        + 'cards are reworked in place, set `keep_worktree: true` in its frontmatter', code: 409 };
-    }
-    // A done-but-DEAD worker is a genuine restart: point at the resume recipe.
-    if (!up) {
-      return { error: 'worker for ' + card.id + ' reported done and its session is gone — revive it first (card start ' + card.id + ' --resume), then send', code: 409 };
-    }
-    // Done but its session is still alive+idle: reopen the turn in place (the
-    // reset mirrors the resume path) instead of 409-ing, so a send re-enters
-    // Working without the undiscoverable two-step resume.
-    w.done = false;
-    delete w.outcome;
-    delete w.flagged;
-    delete w.stopNotified;
-    clearStale(w);
-    delete w.paused;
-    delete w.killFailed; // alive and working again: the next failed kill is news
-    delete w.expectExit; // the stop is over; --resume is a legal move again
-    delete w.pauseReason;
-    enterWorking(card, 'worker ' + workerName(w.ref) + ' reopened for a new turn');
-  } else if (!up) {
-    return { error: 'worker session ' + workerName(w.ref) + ' is not alive — resume it first (card start ' + card.id + ' --resume), then send', code: 409 };
-  }
-  try {
-    await harnessFor(w.ref).send(w.ref, text);
-  } catch (e) {
-    return { error: 'delivery to ' + workerName(w.ref) + ' failed: ' + String((e && e.message) || e), code: 502 };
-  }
-  const ev = mkEvent({ text: 'sent to worker: ' + text.slice(0, 1900), actor: (body && body.actor) || 'agent' }, { kind: 'worker-send' });
-  card.events.push(ev);
-  card.updated = now();
-  return { ok: true, event: ev, session: workerName(w.ref) };
-}
-
-// worker.pause — a DELIBERATE stop: kill the worker's session but record the
-// stop as intentional, so supervision never reports it as a crash (the whole
-// point — a `tmux kill-session` otherwise reads as WORKER DIED). The paused
-// marker is set BEFORE the kill (the supervision tick re-checks it after its
-// own alive() await, closing the mark/kill race) and the registry entry +
-// worktree/branch stay intact, so `card start --resume` revives the worker
-// exactly like a died one. body.park composes the park (Working → Backlog).
-//
-// body.expectExit — the OTHER kind of deliberate stop: the session is about to
-// end BY ITSELF and the caller is inside it. A worker that stops at an approval
-// gate and returns leaves nothing running, and without a word beforehand that
-// reads as WORKER DIED. Killing here would kill the caller mid-sentence, so the
-// marker is recorded and nothing is killed. body.reason replaces the resume
-// hint, because how you revive one of those is not `card start --resume`.
-//
-// That replacement is not a nicety — `--resume` on an expect-exit worker is
-// ACTIVELY WRONG (it spawns a second run over the one the first is still
-// holding), so the stop is recorded on the registry entry as
-// {expectExit, pauseReason} and `card start --resume` refuses it by name. A
-// reason text alone only informs whoever reads it; the refusal is what stops
-// the lieutenant who reached for the move the board teaches everywhere else.
-async function pauseWorker(card, body) {
-  const w = findWorker(card.id);
-  if (!w) return { error: 'no worker recorded for card ' + card.id + ' — nothing to pause', code: 404 };
-  if (w.done) {
-    return { error: 'worker for ' + card.id + ' already reported done — nothing to pause (the lieutenant verifies and hands off)', code: 409 };
-  }
-  if (body && body.park && card.column !== 'working') {
-    return { error: 'pause --park needs a Working card — ' + card.id + ' is in ' + columnTitle(card.column), code: 409 };
-  }
-  w.paused = now(); // BEFORE the kill: the death must never look like a crash
-  delete w.stopNotified;
-  clearStale(w);
-  if (!(body && body.expectExit)) {
-    try {
-      await harnessFor(w.ref).kill(w.ref);
-    } catch (e) {
-      delete w.paused; // the session may still be alive — stay honest, let supervision judge
-      return { error: 'pause failed killing session ' + workerName(w.ref) + ': ' + String((e && e.message) || e), code: 502 };
-    }
-  }
-  const actor = String((body && body.actor) || 'agent').slice(0, 60);
-  const reason = String((body && body.reason) || '').trim().slice(0, 500)
-    || 'resume: card start ' + card.id + ' --resume';
-  if (body && body.expectExit) {
-    w.expectExit = true;
-    w.pauseReason = reason; // the door back, quoted verbatim by the resume refusal
-  } else {
-    delete w.expectExit; // an ordinary pause is resumable, and says so
-    delete w.pauseReason;
-  }
-  const ev = mkEvent({
-    text: 'worker ' + workerName(w.ref) + ' paused (deliberate) — ' + reason,
-    actor,
-  }, { kind: 'worker-paused' });
-  card.events.push(ev);
-  card.updated = now();
-  const out = { ok: true, event: ev, session: workerName(w.ref) };
-  if (body && body.park) {
-    const p = await parkCard(card, body);
-    if (p.error) { out.parked = false; out.parkError = p.error; }
-    else { out.parked = true; out.parkEvent = p.event; }
-  }
-  return out;
-}
-
-// card.park — the narrow lieutenant door out of Working: Backlog, legal ONLY
-// when the recorded worker is absent or dead (liveness re-checked HERE, server
-// side — the CLI's opinion is not trusted), so the Working ⇔ live-worker
-// invariant is never weakened. A live worker refuses loudly: pausing is
-// worker.pause's job. The dead worker's record stays for card start --resume.
-async function parkCard(card, body) {
-  if (card.column !== 'working') {
-    return { error: 'park moves a Working card back to Backlog — ' + card.id + ' is in ' + columnTitle(card.column), code: 409 };
-  }
-  const w = findWorker(card.id);
-  if (w) {
-    let up = false;
-    try { up = await harnessFor(w.ref).alive(w.ref); } catch (e) { up = false; }
-    if (up) {
-      return w.done
-        ? { error: 'refusing to park ' + card.id + ': its worker reported done and session ' + workerName(w.ref)
-            + ' is still alive — verify the work and hand off (card move ' + card.id + ' review), or archive', code: 409 }
-        : { error: 'refusing to park ' + card.id + ': worker session ' + workerName(w.ref)
-            + ' is ALIVE — pause it first (worker pause ' + card.id + ' [--park]) or let it finish', code: 409 };
-    }
-  }
-  const from = card.column;
-  card.column = 'backlog';
-  card.pendingOrder = null;
-  card.updated = now();
-  if (w) { delete w.stopNotified; clearStale(w); } // leaving Working ends the stop/stale-state
-  const ev = mkEvent({
-    actor: (body && body.actor) || 'agent',
-    text: 'parked (worker ' + (w ? workerName(w.ref) + (w.paused ? ', paused' : ', dead') : 'absent') + '): '
-      + columnTitle(from) + ' → ' + columnTitle('backlog'),
-  }, { kind: 'parked' });
-  card.events.push(ev);
-  return { ok: true, event: ev };
+  return {
+    impl, branch, extraArgs, keepWorktree: !!meta.keep_worktree, teardown: meta.teardown || '',
+    brief: (wtPath) => workerBrief({
+      template, card, task: body.brief, thread: card.thread || [],
+      project, worktree: wtPath, branch: branch || '', workspace: WORKSPACE,
+      stateDir: STATE_DIR, cli: path.join(__dirname, '..', 'cli', 'bc-axi'),
+    }),
+  };
 }
 
 // ---------- supervision loop (invariant 8: supervision is infrastructure) ----------
@@ -3458,169 +2715,98 @@ async function parkCard(card, body) {
 //   worker done      -> nothing to watch (the done QueueItem already landed).
 const SUPERVISE_MS = process.env.BC_SUPERVISE_INTERVAL_MS !== undefined
   ? parseInt(process.env.BC_SUPERVISE_INTERVAL_MS, 10) : 30000;
-// The alive-but-hung gap: a worker stuck inside a single turn (e.g. an
-// infinite tool loop) emits NONE of the three end-of-life signals — alive()
-// stays true (no worker-died), the turn never ends (no worker-stopped), and
-// done is never reached. Long silence on a Working card is the only tell.
-// 30min default: the brief cadence is a milestone every 10–30min, so a
-// healthy worker resets the clock well inside the window.
-const BC_WORKER_STALE_SECS = process.env.BC_WORKER_STALE_SECS !== undefined
-  ? parseInt(process.env.BC_WORKER_STALE_SECS, 10) : 1800;
 const respawnAttempts = new Map(); // lieutenant id -> consecutive failed respawns
-let supervising = false;
+// One skeleton for every periodic job (guard, catch, unref). Kept in a const so
+// the plugin host can hand it to plugins as ctx.watchers.
+const watchers = createWatchers({ log: (msg) => console.error(now() + ' ' + msg) });
 async function superviseTick() {
-  if (supervising) return; // never overlap ticks
-  supervising = true;
-  try {
-    let changed = false;
-    for (const lt of board.lieutenants) {
-      if (!isHarnessRef(lt.ref)) continue;
-      let impl = null;
-      try { impl = harnessFor(lt.ref); } catch (e) { impl = null; }
-      // A lieutenant's session is shared with its worker windows, so its ref
-      // must name its own window (names.LIEUTENANT_WINDOW) — a session-granular
-      // one would kill every worker on revive and read liveness off whichever
-      // window has focus. Refs registered before that (founders, older boards)
-      // are migrated here, in place: the running lieutenant is renamed into its
-      // window, never restarted. Best-effort — a tick on the old ref is fine.
-      if (impl && !lt.ref.window && typeof impl.adoptWindow === 'function') {
-        try {
-          const taken = board.workers
-            .filter((w) => w.ref.session === lt.ref.session && w.ref.window)
-            .map((w) => w.ref.window);
-          const ref = await impl.adoptWindow(lt.ref, names.LIEUTENANT_WINDOW, taken);
-          if (ref) { lt.ref = ref; changed = true; }
-        } catch (e) { /* keep the old ref; the next tick tries again */ }
-      }
-      // /reset is restarting this lieutenant right now: between its kill and
-      // its spawn it is legitimately down, and respawning here would race that
-      // spawn for the same pane.
-      if (cyclingLieutenants.has(lt.id)) continue;
-      let up = false;
-      try { up = impl ? await impl.alive(lt.ref) : false; } catch (e) { up = false; }
-      if (up) {
-        respawnAttempts.delete(lt.id);
-        // Alive but possibly deaf: a wake that landed in a busy pane never
-        // became a turn, yet was recorded as sent. Re-run scheduleWake — it
-        // no-ops while the last nudge is within WAKE_TTL_MS or nothing is
-        // pending, so only a genuinely stuck wake re-fires.
-        if (pendingItems(lt.id).length) scheduleWake(lt.id);
-        continue;
-      }
-      // Asked again on the way out: the kill can land DURING the alive()
-      // round-trip, so a tick that passed the check above still gets down=true
-      // from a lieutenant /reset is legitimately restarting.
-      if (cyclingLieutenants.has(lt.id)) continue;
-      const n = (respawnAttempts.get(lt.id) || 0) + 1;
-      if (n > 3) continue; // already flagged needs-captain; a manual revival resets via alive
-      respawnAttempts.set(lt.id, n);
+  let changed = false;
+  for (const lt of board.lieutenants) {
+    if (!isHarnessRef(lt.ref)) continue;
+    let impl = null;
+    try { impl = harnessFor(lt.ref); } catch (e) { impl = null; }
+    // A lieutenant's session is shared with its worker windows, so its ref
+    // must name its own window (names.LIEUTENANT_WINDOW) — a session-granular
+    // one would kill every worker on revive and read liveness off whichever
+    // window has focus. Refs registered before that (founders, older boards)
+    // are migrated here, in place: the running lieutenant is renamed into its
+    // window, never restarted. Best-effort — a tick on the old ref is fine.
+    if (impl && !lt.ref.window && typeof impl.adoptWindow === 'function') {
       try {
-        // Resume when memory is recoverable; else relaunch a fresh session with
-        // charter + owned cards + pending queue as the prompt (the DNA's
-        // auto-respawn side effect) — a bare agent with no context helps nobody.
-        // The model rides both halves: a resume replays the recorded --model,
-        // and passing it explicitly keeps a lieutenant repinned since its last
-        // launch from coming back on the old one.
-        const opts = ltLaunchOpts(lt);
-        let ref;
-        if (await impl.resumable(lt.ref, opts)) {
-          ref = await impl.resume(lt.ref, opts);
-        } else {
-          ref = await respawnFresh(lt); // kills the dead pane, relaunches on the digest prompt
-        }
-        lt.ref = ref;
-        respawnAttempts.delete(lt.id);
-        board.events.push(mkEvent({
-          text: 'lieutenant ' + lt.name + ' session died — respawned as ' + ref.harness + ':' + ref.session,
-          actor: 'server',
-        }, { kind: 'respawned' }));
-        changed = true;
-        nudged.delete(lt.id); // the reincarnated session owes a drain: queue is truth, its memory is a cache
-        if (pendingItems(lt.id).length) scheduleWake(lt.id);
-        else {
-          const target = lt.ref;
-          Promise.resolve()
-            .then(() => harnessFor(target).send(target, '[bridge-commander] session respawned — run: bc-axi drain'))
-            .catch(() => {});
-        }
-      } catch (e) {
-        console.error(now() + ' respawn failed for ' + lt.id + ' (attempt ' + n + '/3): ' + String((e && e.message) || e));
-        if (n === 3) {
-          board.events.push(mkEvent({
-            text: 'lieutenant ' + lt.name + ' is down and 3 respawn attempts failed — needs the captain (session ' + lt.ref.session + ')',
-            actor: 'server',
-          }, { kind: 'needs-captain' }));
-          respawnAttempts.set(lt.id, 4);
-          changed = true;
-        }
-      }
+        const taken = board.workers
+          .filter((w) => w.ref.session === lt.ref.session && w.ref.window)
+          .map((w) => w.ref.window);
+        const ref = await impl.adoptWindow(lt.ref, names.LIEUTENANT_WINDOW, taken);
+        if (ref) { lt.ref = ref; changed = true; }
+      } catch (e) { /* keep the old ref; the next tick tries again */ }
     }
-    for (const w of board.workers) {
-      if (w.done || w.flagged || w.paused) continue;
-      let up = false;
-      try { up = await harnessFor(w.ref).alive(w.ref); } catch (e) { up = false; }
-      // Staleness watchdog (alive-but-hung): checked BEFORE the alive
-      // early-continue, only for a genuinely live, unpaused worker on a
-      // Working card. It RINGS AGAIN: one worker-stalled per
-      // BC_WORKER_STALE_SECS of continued silence, quiet (level 2) the first
-      // time, level 1 from the second hit on — a worker nobody answered for
-      // two windows is the captain's problem, and the text says what it last
-      // said so he can judge from the feed. Any real activity — signal,
-      // turn-end, resume — resets the ladder.
-      if (up && !w.paused && BC_WORKER_STALE_SECS > 0) {
-        const card = findCard(w.card);
-        if (card && card.column === 'working') {
-          const stamps = [w.spawnedAt, w.lastTurnEnd, w.lastSignalAt]
-            .map((t) => (t ? Date.parse(t) : NaN)).filter((n) => !Number.isNaN(n));
-          const lastActivity = stamps.length ? Math.max(...stamps) : 0;
-          const notifiedAt = w.staleNotifiedAt ? Date.parse(w.staleNotifiedAt) : NaN;
-          const sinceNotify = Number.isNaN(notifiedAt) ? Infinity : Date.now() - notifiedAt;
-          const window = BC_WORKER_STALE_SECS * 1000;
-          if (lastActivity && Date.now() - lastActivity > window && sinceNotify > window) {
-            w.staleNotified = true;
-            w.staleNotifiedAt = now();
-            w.staleHits = (w.staleHits || 0) + 1;
-            const mins = Math.round((Date.now() - lastActivity) / 60000);
-            const lastWord = lastWordOf(w);
-            let text = 'worker ' + workerName(w.ref) + ' alive but silent for '
-              + mins + 'min (no signal/turn-end) — may be hung';
-            if (w.staleHits >= 2) {
-              text += ' — still silent, alert #' + w.staleHits
-                + (lastWord ? '; last said: ' + JSON.stringify(lastWord.slice(0, 300)) : '');
-            }
-            const level = w.staleHits >= 2 ? 1 : 2;
-            card.events.push(mkEvent({ text, actor: 'server', level }, { kind: 'worker-stalled' }));
-            card.updated = now();
-            queuePush(card.owner, { kind: 'worker-stalled', card: card.id, text });
-            changed = true;
-          }
-        }
+    // /reset is restarting this lieutenant right now: between its kill and
+    // its spawn it is legitimately down, and respawning here would race that
+    // spawn for the same pane.
+    if (cyclingLieutenants.has(lt.id)) continue;
+    let up = false;
+    try { up = impl ? await impl.alive(lt.ref) : false; } catch (e) { up = false; }
+    if (up) {
+      respawnAttempts.delete(lt.id);
+      // Alive but possibly deaf: a wake that landed in a busy pane never
+      // became a turn, yet was recorded as sent. Re-run scheduleWake — it
+      // no-ops while the last nudge is within WAKE_TTL_MS or nothing is
+      // pending, so only a genuinely stuck wake re-fires.
+      if (pendingItems(lt.id).length) scheduleWake(lt.id);
+      continue;
+    }
+    // Asked again on the way out: the kill can land DURING the alive()
+    // round-trip, so a tick that passed the check above still gets down=true
+    // from a lieutenant /reset is legitimately restarting.
+    if (cyclingLieutenants.has(lt.id)) continue;
+    const n = (respawnAttempts.get(lt.id) || 0) + 1;
+    if (n > 3) continue; // already flagged needs-captain; a manual revival resets via alive
+    respawnAttempts.set(lt.id, n);
+    try {
+      // Resume when memory is recoverable; else relaunch a fresh session with
+      // charter + owned cards + pending queue as the prompt (the DNA's
+      // auto-respawn side effect) — a bare agent with no context helps nobody.
+      // The model rides both halves: a resume replays the recorded --model,
+      // and passing it explicitly keeps a lieutenant repinned since its last
+      // launch from coming back on the old one.
+      const opts = ltLaunchOpts(lt);
+      let ref;
+      if (await impl.resumable(lt.ref, opts)) {
+        ref = await impl.resume(lt.ref, opts);
+      } else {
+        ref = await respawnFresh(lt); // kills the dead pane, relaunches on the digest prompt
       }
-      // paused re-checked after the await: a pause landing mid-tick (marked,
-      // then killed while alive() was in flight) must not read as a crash.
-      if (up || w.paused) continue;
-      w.flagged = true;
+      lt.ref = ref;
+      respawnAttempts.delete(lt.id);
+      store.boardEvent({
+        text: 'lieutenant ' + lt.name + ' session died — respawned as ' + ref.harness + ':' + ref.session,
+        actor: 'server',
+      }, { kind: 'respawned' });
       changed = true;
-      const card = findCard(w.card);
-      if (card) {
-        card.events.push(mkEvent({
-          text: 'worker session ' + workerName(w.ref) + ' died without reporting done',
+      delivery.resetNudge(lt.id); // the reincarnated session owes a drain: queue is truth, its memory is a cache
+      if (pendingItems(lt.id).length) scheduleWake(lt.id);
+      else {
+        const target = lt.ref;
+        Promise.resolve()
+          .then(() => harnessFor(target).send(target, '[bridge-commander] session respawned — run: bc-axi drain'))
+          .catch(() => {});
+      }
+    } catch (e) {
+      console.error(now() + ' respawn failed for ' + lt.id + ' (attempt ' + n + '/3): ' + String((e && e.message) || e));
+      if (n === 3) {
+        store.boardEvent({
+          text: 'lieutenant ' + lt.name + ' is down and 3 respawn attempts failed — needs the captain (session ' + lt.ref.session + ')',
           actor: 'server',
-        }, { kind: 'worker-died' }));
-        card.updated = now();
-        queuePush(card.owner, {
-          kind: 'worker-died', card: card.id,
-          text: 'worker session ' + workerName(w.ref) + ' died without reporting done',
-        });
-        fireHooks('worker-died', card, w); // fire-and-forget
+        }, { kind: 'needs-captain' });
+        respawnAttempts.set(lt.id, 4);
+        changed = true;
       }
     }
-    if (changed) { saveBoard(); broadcast(); }
-  } finally {
-    supervising = false;
   }
+  if (await workers.tick()) changed = true; // died / stalled workers
+  if (changed) store.commit();
 }
-if (Number.isInteger(SUPERVISE_MS) && SUPERVISE_MS > 0) setInterval(superviseTick, SUPERVISE_MS).unref();
+watchers.register({ id: 'supervise', intervalMs: SUPERVISE_MS, tick: superviseTick });
 
 // ---------- PR watch (F6: merged PR ⇒ archive + release, no agent turn) ----------
 // Every ~2min: for every card whose `prs` attribute holds an open URL, ask gh.
@@ -3631,456 +2817,152 @@ if (Number.isInteger(SUPERVISE_MS) && SUPERVISE_MS > 0) setInterval(superviseTic
 // the state and tell the owner; the card stays. gh failures leave state untouched.
 const PRWATCH_MS = process.env.BC_PRWATCH_INTERVAL_MS !== undefined
   ? parseInt(process.env.BC_PRWATCH_INTERVAL_MS, 10) : 120000;
-const GH_CMD = process.env.BC_GH_CMD || 'gh'; // injectable for tests
-function ghPrState(url) {
-  return new Promise((resolve) => {
-    execFile(GH_CMD, ['pr', 'view', url, '--json', 'state,mergedAt'], { timeout: 30000 }, (err, stdout) => {
-      if (err) return resolve(null);
-      try { resolve(JSON.parse(stdout)); } catch (e) { resolve(null); }
-    });
-  });
+// The loop lives in server/prwatch.js; the board reaches it only through these.
+const prWatch = createPrWatch({
+  cards: () => board.cards,
+  ghCmd: process.env.BC_GH_CMD || 'gh', // injectable for tests
+  cardEvent: (card, ev, opts) => store.cardEvent(card, ev, opts),
+  queuePush,
+  endWorker: (card, trigger) => workers.end(card, trigger),
+  archiveCard,
+  commit: store.commit,
+});
+// The PR watch belongs to the shipped `github` plugin (the internal tier hands
+// it prWatch.tick): disabling that plugin is how a board turns the watch off.
+// A board with no github plugin at all still watches — see syncPrWatch below.
+
+// ---------- plugins (server/plugins.js; docs/rfc/plugins.md) ----------
+const pluginLog = (m) => console.error(now() + ' ' + m);
+// A plugin reaches the board only through this, and reads it as a copy.
+const pluginApi = {
+  board: () => structuredClone(storedBoard(board)),
+  findCard: (id) => { const c = findCard(String(id || '')); return c ? structuredClone(c) : null; },
+  queuePush: (owner, item) => {
+    if (!findLieutenant(owner)) throw new Error('queuePush: unknown lieutenant ' + owner);
+    return queuePush(owner, item);
+  },
+  cardEvent: (card, text, kind) => {
+    const ev = landCardEvent(card, mkEvent({ text: String(text || '').slice(0, 4000), actor: 'server' }, kind ? { kind: String(kind) } : {}));
+    store.commit();
+    return ev;
+  },
+  get runs() { return runs; },
+  commit: store.commit,
+};
+pluginHost = createPluginHost({
+  catalog: () => manifests.resolveCatalog({ workspaceDir: PLUGINS_DIR, stateDir: STATE_DIR, log: pluginLog }),
+  log: pluginLog, now, api: pluginApi, watchers,
+  internal: { prWatch, prWatchIntervalMs: PRWATCH_MS },
+});
+// Observe-only: nothing awaits a handler, and a throwing one is the host's to log.
+function emitPlugins(name, payload) {
+  if (!pluginHost) return;
+  try { pluginHost.emit(name, payload).catch(() => {}); } catch (e) { pluginLog('plugin event ' + name + ' failed: ' + String((e && e.message) || e)); }
 }
-let prWatching = false;
-async function prWatchTick() {
-  if (prWatching) return;
-  prWatching = true;
-  try {
-    for (const card of [...board.cards]) {
-      const prs = card.attributes && card.attributes.prs;
-      if (!Array.isArray(prs) || !prs.some((p) => p && p.state === 'open' && p.url)) continue;
-      const merged = []; // every PR of this card that landed in THIS tick
-      let changed = false;
-      for (const pr of prs) {
-        if (!pr || pr.state !== 'open' || !pr.url) continue;
-        const st = await ghPrState(pr.url);
-        if (!st || !st.state) continue;
-        if (st.state === 'MERGED') { pr.state = 'merged'; merged.push(pr); changed = true; }
-        else if (st.state === 'CLOSED') {
-          pr.state = 'closed';
-          changed = true;
-          card.events.push(mkEvent({ text: 'PR closed without merge: ' + pr.url, actor: 'server', level: 2 }, {}));
-          queuePush(card.owner, { kind: 'pr-closed', card: card.id, text: pr.url });
-        }
-      }
-      if (!changed) continue;
-      // one signal per PR that landed — a stack can flip several between polls
-      for (const pr of merged) {
-        card.events.push(mkEvent({ text: 'PR merged: ' + pr.url, actor: 'server' }, { kind: 'pr-merged' }));
-        queuePush(card.owner, { kind: 'pr-merged', card: card.id, text: pr.url });
-      }
-      // a stack card only finishes when nothing is left open: a partial merge
-      // keeps the card on the board, the worktree alive and the hooks unfired.
-      const anyOpenLeft = prs.some((p) => p && p.state === 'open');
-      if (merged.length && !anyOpenLeft) {
-        const w = findWorker(card.id);
-        let note = merged.map((p) => p.url).join(' ');
-        // Same order as the archive endpoint: the worker dies first (awaited
-        // and verified — usually a no-op, the handoff having killed it), then
-        // the card-archived hooks run — and finish or time out — BEFORE the
-        // worktree release, since a hook may need paths inside $BC_WORKTREE.
-        const kill = await killCardWorker(card, w, { reason: 'the PR merged' });
-        await fireHooks('card-archived', card, w, { boardLevel: true });
-        // the archive record is the only place a merged card's refusal is
-        // readable afterwards, so the reason rides the note as well as the
-        // timeline event the release lands
-        const rel = await releaseCardWorktree(card, w);
-        if (rel && !rel.released) note += ' (worktree NOT released: ' + rel.reason + ')';
-        if (kill && kill.killed) dropWorkerRecord(card, w);
-        // An archived card has neither Working nor worker, and the card was on
-        // the board for every await above — the hooks and the release run on
-        // budgets measured in minutes, and a rework restart inside that window
-        // binds a NEW worker to it. That worker is working a card that has
-        // already merged, so ending it is the point, not collateral damage.
-        // Read the registry AGAIN at the moment of the commit and end whatever
-        // is bound now, on the same verified terms as everywhere else.
-        const bound = findWorker(card.id);
-        if (bound && bound !== w) {
-          const late = await killCardWorker(card, bound, { reason: 'the PR merged while it was working' });
-          if (late && late.killed) dropWorkerRecord(card, bound);
-        }
-        // The address goes on the card BEFORE the snapshot freezes, exactly as
-        // the archive endpoint does it: the drop is what usually stamps it, and
-        // it is skipped whenever the kill could not be verified — the one case
-        // where somebody most needs to go find that transcript. Whichever run
-        // was really bound at the end is the one the snapshot names.
-        const last = findWorker(card.id);
-        if (last) stampWorkerAddress(card, last);
-        archiveCard(card, { reason: 'merged', note, actor: 'server' }); // landed — the level-1 bell
-      }
-      saveBoard(); broadcast();
-    }
-  } finally {
-    prWatching = false;
+
+// A tracked run that fails is owed to the card's owner, the way a failed hook is.
+const trackedRuns = new Set();
+runs = createRuns({ stateDir: STATE_DIR, now, log: pluginLog, onChange: broadcast, runOne: hookRunOne });
+runs.onEnd((run) => {
+  const tracked = trackedRuns.delete(run.id);
+  emitPlugins('activity-ended', { activity: run });
+  if (!tracked || !run.card || (run.status !== 'failed' && run.status !== 'timeout')) return;
+  const card = findCard(run.card) || { id: run.card, title: run.card, owner: run.owner };
+  let tail = '';
+  try { tail = runs.readLog(run.id).text.trim().slice(-1500); } catch (e) {}
+  const text = (run.title || run.command) + ' ' + run.status + (run.error ? ' (' + run.error + ')' : '')
+    + ' — activity ' + run.id + (tail ? ':\n' + tail : '');
+  landCardEvent(card, mkEvent({ text, actor: 'server', level: 1 }, { kind: 'activity-failed' }));
+  const owner = card.owner || run.owner;
+  if (owner && findLieutenant(owner)) queuePush(owner, { kind: 'activity-failed', card: run.card, activity: run.id, text: text.slice(0, 2000) });
+  store.commit();
+});
+
+// Checks: what the enabled plugins declare, re-registered on every reload.
+const checks = createChecks({ log: pluginLog });
+let checkDisposers = [];
+function registerChecks() {
+  for (const d of checkDisposers) d();
+  checkDisposers = [];
+  const cat = pluginHost.catalog();
+  if (!cat) return;
+  for (const c of manifests.contributions(cat).checks) {
+    const p = cat.plugins.find((x) => x.id === c.plugin);
+    try { checkDisposers.push(checks.register(checks.fromManifest(c, { plugin: c.plugin, dir: p && p.dir }))); }
+    catch (e) { pluginLog('check ' + c.plugin + '/' + c.id + ' not registered: ' + String((e && e.message) || e)); }
   }
 }
-if (Number.isInteger(PRWATCH_MS) && PRWATCH_MS > 0) setInterval(prWatchTick, PRWATCH_MS).unref();
 
-// ---------- the clock (schedules; server/schedules.js holds the timing) ----------
-//
-// A schedule fires A HOOK, through `hook run` and nothing else — the clock gets
-// no private door. Everything a firing needs to decide (which card, whether to
-// wake anybody, what to say) is the hook's business, because a hook is bash
-// with `bc-axi` on its PATH.
-//
-// The cursor is `lastWindow`: the DUE TIME of the last window this schedule
-// handled. Windows are a function of that cursor and the clock, so a restart
-// neither loses a due window nor fires one twice — the tick after the boot sees
-// exactly the windows that came due while nobody was looking, and the catch-up
-// policy says what to do with them.
+// The PR watch's fallback: a board whose github plugin is missing (or failed
+// to register the watch) keeps the watch it always had. Only an overlay that
+// says `github: {enabled: false}` turns it off — that is the captain's word.
+let prWatchFallback = null;
+function syncPrWatch() {
+  const cat = pluginHost.catalog();
+  const o = cat && cat.overlay.plugins && cat.overlay.plugins.github;
+  const off = !!(o && typeof o === 'object' && o.enabled === false);
+  const pluginOwns = watchers.list().some((w) => w.id !== 'prwatch' && w.id.endsWith('/prwatch'));
+  if (prWatchFallback && (off || pluginOwns)) { prWatchFallback(); prWatchFallback = null; }
+  if (!prWatchFallback && !off && !pluginOwns) {
+    prWatchFallback = watchers.register({ id: 'prwatch', intervalMs: PRWATCH_MS, tick: prWatch.tick });
+    pluginLog('no plugin registered the PR watch — the server runs it itself');
+  }
+}
+
+// After every catalog change: the checks, the watch, and the version clients poll.
+async function reloadPlugins() {
+  await pluginHost.reload();
+  pluginsVersion++;
+  registerChecks();
+  syncPrWatch();
+  broadcast();
+}
+
+
+// Boot: the boot plugins start, the boot checks run (a failure is one log
+// line, never a failed boot), and the PR watch is settled either way.
+pluginHost.bootActivate()
+  .then(async () => {
+    registerChecks();
+    syncPrWatch();
+    broadcast();
+    for (const r of await checks.run('boot')) {
+      if (!r.ok) pluginLog('check ' + r.plugin + '/' + r.id + ' (' + r.severity + ') failed: "' + r.title + '" — ' + r.message + (r.fix ? ' (fix: ' + r.fix + ')' : ''));
+    }
+  })
+  .catch((e) => {
+    pluginLog('plugin boot failed: ' + String((e && e.message) || e));
+    syncPrWatch();
+  });
+
+// ---------- the clock (schedules; server/clock.js runs them) ----------
+// A schedule fires a NAMED hook through `hook run`, and a failed firing lands
+// on its owner. The tick, the claims and the overlap policy are clock.js's;
+// what it touches on the board comes in here.
 const SCHEDULE_MS = process.env.BC_SCHEDULE_INTERVAL_MS !== undefined
   ? parseInt(process.env.BC_SCHEDULE_INTERVAL_MS, 10) : 15000;
-// The line between "missed while the server was down" and "came due while we
-// were watching" — the whole meaning of catch-up `none`.
-const SCHEDULER_BOOT = Date.now();
-
-function findSchedule(name) { return board.schedules.find((s) => s.name === name); }
-// The trace's `trigger` for a firing. It names the SCHEDULE, not just "a
-// schedule": two schedules on one hook each read their own last fire out of
-// hookruns.jsonl, and nobody keeps a second copy of what already happened.
-function scheduleTrigger(s) { return 'schedule:' + s.name; }
-
-// scheduleProblem(s) -> '' or why this schedule cannot fire right now. Checked
-// on EVERY tick, not just at `add`: a hook deleted out from under a live
-// schedule has to make that schedule say so, rather than failing silently every
-// window forever.
-function scheduleProblem(s) {
-  try { parseWhen(s.when); } catch (e) { return e.message; }
-  // A cursor that is not a date is a DEAD window: every due-window question is
-  // asked from it, and all of them answer nothing, forever. board.json is
-  // git-tracked, so a bad merge or a hand edit is how this arrives — and a
-  // clock that quietly stops is the exact failure this card replaces. Said out
-  // loud here for the same reason an unparseable `when` is, and healed the same
-  // way any cursor is: pause and resume re-arms it at now.
-  if (s.lastWindow && Number.isNaN(Date.parse(s.lastWindow))) {
-    return 'cursor "' + s.lastWindow + '" is not a date — this schedule cannot work out what is due'
-      + ' (bc-axi schedule pause ' + s.name + ' && bc-axi schedule resume ' + s.name + ' re-arms it at now)';
-  }
-  if (!namedHookFile(WORKSPACE, s.hook)) {
-    return 'hook "' + s.hook + '" is gone from ' + hooksDir(WORKSPACE) + ' — this schedule fires nothing';
-  }
-  if (!findLieutenant(s.owner)) {
-    return 'owner "' + s.owner + '" is not a registered lieutenant — a failure here would land nowhere';
-  }
-  return '';
-}
-
-// A problem is announced ONCE, when it appears, and once when it clears. The
-// board's bell is level 1 because a schedule that stopped firing is exactly the
-// silent failure this card exists to end; a level-2 line marks the recovery.
-// An unregistered owner cannot be woken, so the board stream is all there is.
-// The kind travels onto the QUEUE ITEM as well as the timeline entry, and the
-// two must be the same one: the drain dispatches on the item's kind alone, so a
-// recovery labelled `schedule-failed` reaches its owner headlined "a firing
-// failed" and advised to fix the hook and pause the schedule — advice that is
-// exactly backwards for the schedule that just told them it is working again.
-function announceScheduleProblem(s, problem) {
-  const text = problem
-    ? 'schedule ' + s.name + ' cannot fire: ' + problem
-    : 'schedule ' + s.name + ' is healthy again';
-  const kind = problem ? 'schedule-failed' : 'schedule';
-  board.events.push(mkEvent({ text, actor: 'server', level: problem ? 1 : 2 }, { kind }));
-  if (findLieutenant(s.owner)) {
-    queuePush(s.owner, { kind, schedule: s.name, text, source: 'schedule ' + s.name });
-  }
-}
-
-// A schedule is not a card, so it gets its own scope in the key store rather
-// than a parallel store of its own. The `@` is what keeps the two apart for
-// good: a card id has to start with a word character, so no card can ever be
-// spelled like this.
-function scheduleKeyScope(s) { return '@schedule:' + s.name; }
-
-// The SIGNATURE of a failure: how it went wrong, plus the tail of what it said.
-// Two windows that failed the same way are the same failure and are worth one
-// wake between them; a hook that starts exiting 4 instead of 3, or says
-// something new, is a different failure and is worth hearing about.
-function failureKey(run) {
-  const how = run.timedOut ? 'timeout' : run.error ? 'spawn' : 'exit:' + run.code;
-  const tail = String(run.output || '').slice(-500);
-  return how + ':' + crypto.createHash('sha1').update(tail).digest('hex').slice(0, 12);
-}
-
-// A firing that fails lands on its OWNER, carrying the hook's output — never
-// only in a log. The trace already holds the run detail; this is the wake.
-//
-// Announced ONCE, the way announceScheduleProblem announces a problem once, and
-// through the key store MNC-24 already built for this shape. A 5m schedule
-// whose hook is permanently broken fails 288 times a day, and a drain holding
-// 288 identical items is quieter than one holding a single item, because its
-// owner stops reading it. A repeat still lands on the timeline at level 2 — the
-// record stays whole; the bell and the queue item are the only things the key
-// spends.
-function landScheduleFailure(s, run) {
-  const how = run.timedOut ? 'timed out' : run.error ? String(run.error)
-    : run.code === null ? 'killed' : 'exit ' + run.code;
-  const text = ('schedule ' + s.name + ' — hook ' + s.hook + ' FAILED (' + how + ')'
-    + (run.output ? ':\n' + run.output : '')).slice(0, 2000);
-  // ask -> deliver -> claim, the order the pair documents: claiming first would
-  // make a delivery that throws a wake forever answered "duplicate".
-  const scope = scheduleKeyScope(s);
-  const key = failureKey(run);
-  const fresh = !seenEventKey(scope, key);
-  board.events.push(mkEvent({ text, actor: 'server', level: fresh ? 1 : 2 },
-    { kind: 'schedule-failed' }));
-  if (fresh && findLieutenant(s.owner)) {
-    queuePush(s.owner, { kind: 'schedule-failed', schedule: s.name, text,
-      source: 'schedule ' + s.name });
-  }
-  saveBoard(); broadcast();
-  if (fresh) claimEventKey(scope, key);
-}
-
-// The other half of announcing once: silence has to mean one thing. The first
-// green firing after a failing one says so on the timeline and forgets the key,
-// so the next failure is heard as new rather than swallowed as a repeat of one
-// that is already fixed.
-function landScheduleRecovery(s) {
-  if (!forgetEventKeys(scheduleKeyScope(s))) return;
-  board.events.push(mkEvent({ text: 'schedule ' + s.name + ' — hook ' + s.hook + ' is green again',
-    actor: 'server', level: 2 }, { kind: 'schedule' }));
-  saveBoard(); broadcast();
-}
-
-// recordSkip(s, why) — a firing that did NOT run is still a firing. `skip` that
-// swallows its windows makes a schedule which never runs look exactly like one
-// that is working, so every skipped window gets a line in the same trace the
-// runs land in.
-function recordSkip(s, why) {
-  traceSkip(WORKSPACE, { hook: s.hook, trigger: scheduleTrigger(s), reason: 'skipped: ' + why });
-}
-
-// The run this schedule's hook is holding, named the way the EBUSY refusal
-// names it — an operator reading a skip afterwards has to be able to find the
-// firing that displaced the window, and `started` + `trigger` is what identifies
-// it on the trace. A pass between windows holds no run: say so rather than
-// invent one.
-function inFlightFiring(s) {
-  const run = runningHook(WORKSPACE, s.hook);
-  if (!run) return 'the firing in flight is still running';
-  return 'the firing in flight (trigger ' + run.trigger + ', started ' + run.started
-    + (run.card ? ', card ' + run.card : '') + ') is still running';
-}
-
-// fireSchedule(s) -> 'ran' | 'skipped' | 'queued' — one window, awaited to the
-// end. The EBUSY here is the OTHER overlap: not this schedule's own previous
-// firing (the tick handles that, below) but somebody else's run of the same
-// hook — the board's ▶, a lieutenant at the CLI, a second schedule. Same
-// policy, because from the window's point of view it is the same situation.
-async function fireSchedule(s) {
-  const trigger = scheduleTrigger(s);
-  for (let attempt = 0; ; attempt++) {
-    try {
-      const run = await runNamedHook(WORKSPACE, s.hook, {}, {
-        trigger, timeoutMs: HOOK_TIMEOUT_MS || 0,
-      });
-      // A run cancelled to make room for another already answered its own
-      // caller; only a genuine failure wakes the owner, and only a genuine
-      // success closes a failure that is still open.
-      if (!run.ok && !run.canceled) landScheduleFailure(s, run);
-      else if (run.ok) landScheduleRecovery(s);
-      return 'ran';
-    } catch (e) {
-      if (e && e.code === 'ENOHOOK') return 'skipped'; // scheduleProblem says it on the next tick
-      if (!e || e.code !== 'EBUSY') throw e;
-      if (s.overlap === 'queue') return 'queued';
-      if (s.overlap === 'restart' && attempt === 0) {
-        await cancelNamedHook(WORKSPACE, s.hook);
-        continue; // and if someone took the name in that instant, skip below
-      }
-      recordSkip(s, e.message);
-      return 'skipped';
+const clock = createClock({
+  workspace: WORKSPACE,
+  schedules: () => board.schedules,
+  findLieutenant,
+  // The kind travels onto the queue item as well as the timeline entry: the
+  // drain dispatches on the item's kind alone.
+  notify: (s, { text, kind, level, wake }) => {
+    store.boardEvent({ text, actor: 'server', level }, { kind });
+    if (wake && findLieutenant(s.owner)) {
+      queuePush(s.owner, { kind, schedule: s.name, text, source: 'schedule ' + s.name });
     }
-  }
-}
+  },
+  keys: { seen: seenEventKey, claim: claimEventKey, forget: forgetEventKeys },
+  save: store.commit,
+  runNamedHook,
+  now,
+  hookTimeoutMs: HOOK_TIMEOUT_MS,
+});
+const { publicSchedules, findSchedule, scheduleTrigger, describeWhenSafe } = clock;
+if (Number.isInteger(SCHEDULE_MS) && SCHEDULE_MS > 0) setInterval(clock.tick, SCHEDULE_MS).unref();
 
-// runSchedule(s, windows) — one schedule's due windows, oldest first, ONE AT A
-// TIME. A catch-up backlog is not an overlap: `all` over a weekend means fire
-// each of those windows, in order, and the next one starts when the last one is
-// done. Runs outside the tick, which decides and never waits.
-//
-// Two cursors, deliberately, and the difference between them is the whole
-// durability story:
-//
-//   the CLAIM   in memory, keyed by the schedule OBJECT, alive for exactly as
-//               long as a pass is. The windows a pass took stop being due the
-//               moment it takes them, so the ticks that go by while a
-//               six-minute hook runs see the overlap policy and not the same
-//               backlog again. Keyed by the object and not by the name because
-//               a name can be removed and given to a new schedule while a pass
-//               is still running, and that new schedule is not the one firing.
-//   lastWindow  on disk, and it lags the claim on purpose. board.json still
-//               names the pre-pass window for the whole run, so a machine
-//               powered off mid-hook comes back and offers that window again.
-//               At-least-once is the promise a clock can keep; at-most-once
-//               would lose the firing outright, with nothing anywhere to say a
-//               window had ever come due.
-//
-// A pass writes the claim it REACHED — which the overlap policy's skips have
-// been moving all along — never the cursor it started with, or `skip` would
-// turn into back-to-back firing and the trace would hold skips for windows that
-// then ran. `queue` is the one outcome that lands somewhere earlier: the window
-// it could not take is re-offered on the next tick.
-const claimed = new Map();
-async function runSchedule(s, windows) {
-  let requeue = null;
-  try {
-    for (const w of windows) {
-      const outcome = await fireSchedule(s);
-      if (outcome === 'queued') { requeue = w - 1; break; } // re-offered next tick
-    }
-  } catch (e) {
-    console.error(now() + ' schedule ' + s.name + ' failed to fire: ' + String((e && e.message) || e));
-  } finally {
-    // Nothing above this line is awaited by anybody, so a board write that fails
-    // here is an unhandled rejection — which is to say the whole server, killed
-    // by a full disk while a hook was running. It is contained like every other
-    // background loop's failure.
-    try {
-      const reached = requeue !== null ? requeue : claimed.get(s);
-      // FORWARD only, and only onto the schedule this pass actually owns. Both
-      // halves are load-bearing. A `resume` that landed while the hook ran has
-      // already re-armed the cursor at now — a pause is not a queue — and
-      // stamping an older claim over it would make the whole paused interval
-      // due. And a schedule removed and re-added under the same name is a
-      // different schedule: it must not start life owing a dead pass's backlog.
-      // The `queue` pull-back is not a rewind, so it survives this: `w - 1` is
-      // never earlier than the cursor the pass started from.
-      const owned = findSchedule(s.name) === s;
-      if (owned && reached !== undefined && reached > (Date.parse(s.lastWindow) || 0)) {
-        s.lastWindow = new Date(reached).toISOString();
-        saveBoard(); broadcast();
-      }
-    } catch (e) {
-      console.error(now() + ' schedule ' + s.name + ': the board would not save after a firing: '
-        + String((e && e.message) || e));
-    }
-  }
-}
-
-// The overlap POLICY: a window came due while this schedule's PREVIOUS firing
-// is still running. It is a policy over `hook run`'s refusal, not a second
-// opinion about what is running — the five-minute poll that takes six minutes
-// is the case, and all three answers are defensible depending on the hook.
-//
-//   skip     don't run — and record every window it dropped
-//   queue    leave the cursor where it is; the window is re-offered when the
-//            firing in flight finishes. It survives a restart because the
-//            cursor is board state, not a list in memory
-//   restart  kill what is running (the whole process group, traced as canceled)
-//            and let the next tick start the window that displaced it
-function overlapPolicy(s, due) {
-  if (s.overlap === 'queue') return;
-  if (s.overlap === 'restart') {
-    cancelNamedHook(WORKSPACE, s.hook).catch(() => {});
-    return;
-  }
-  // Two different firings in one line, and keeping them apart is the whole
-  // point of writing it: the window being DROPPED, and the firing it lost to.
-  // The run in flight is read off `hook run`'s own registry (started, trigger)
-  // rather than guessed from the windows here, which are the dropped ones.
-  const lost = inFlightFiring(s);
-  for (const w of due) recordSkip(s, 'window ' + new Date(w).toISOString() + ' — ' + lost);
-  // Against the CLAIM, because a skip belongs to the pass in flight: it reaches
-  // board.json when that pass finishes, and a crash before then leaves the
-  // window due again — which is the honest answer, since nothing ran.
-  claimed.set(s, due[due.length - 1]);
-}
-
-let scheduleTicking = false;
-async function scheduleTick() {
-  if (scheduleTicking) return;
-  scheduleTicking = true;
-  try {
-    let changed = false;
-    const nowMs = Date.now();
-    for (const s of [...board.schedules]) {
-      const problem = scheduleProblem(s);
-      if (problem !== s.problem) {
-        // A paused schedule still reports a problem it has — you pause a clock,
-        // you do not stop wanting to know its hook was deleted — but announcing
-        // it would be a wake nobody asked for.
-        if (!s.paused) announceScheduleProblem(s, problem);
-        s.problem = problem;
-        changed = true;
-      }
-      if (problem || s.paused) continue;
-      const when = parseWhen(s.when);
-      const anchor = Date.parse(s.created) || 0;
-      // A schedule that has never fired starts its cursor HERE: `add` is not a
-      // firing, and a fresh 5m schedule that fired the instant it was created
-      // would make every `add` a surprise.
-      if (!s.lastWindow) { s.lastWindow = new Date(nowMs).toISOString(); changed = true; continue; }
-      // The claim, when a pass holds one, is ahead of the stored cursor — see
-      // runSchedule. Reading past both is what stops a pass being offered the
-      // windows it already took.
-      const from = Math.max(Date.parse(s.lastWindow), claimed.get(s) || 0);
-      const due = dueWindows(when, from, nowMs, anchor);
-      if (!due.windows.length) continue;
-      // Its own previous firing is still running: that is what `overlap` is for.
-      if (claimed.has(s)) { overlapPolicy(s, due.windows); continue; }
-      const { fire, dropped } = pickWindows(due, s.catchup, SCHEDULER_BOOT);
-      if (dropped) {
-        // No silent caps: a policy that drops windows says how many, so `all`
-        // hitting its ceiling is never mistaken for full coverage.
-        console.error(now() + ' schedule ' + s.name + ': ' + dropped + ' due window(s) not fired (catch-up '
-          + s.catchup + ')');
-      }
-      // The claim is taken HERE, before anything is awaited, so no second pass
-      // can ever be handed these windows. It reaches board.json when the pass
-      // ends, and it reaches it even for a firing that threw — at-least-once
-      // belongs to delivery, and a schedule that retries a broken hook every
-      // tick forever is a wake storm, not a recovery. The trace and the owner's
-      // drain hold what happened.
-      claimed.set(s, due.windows[due.windows.length - 1]);
-      // Deliberately not awaited: the tick's job is to decide, not to wait out
-      // a hook. Every window still fires in order, one at a time, per schedule.
-      // The claim is dropped out here rather than inside, so a pass that somehow
-      // dies on the way out cannot wedge the schedule shut forever.
-      runSchedule(s, fire)
-        .finally(() => claimed.delete(s))
-        .catch((e) => console.error(now() + ' schedule ' + s.name + ': '
-          + String((e && e.message) || e)));
-    }
-    if (changed) { saveBoard(); broadcast(); }
-  } catch (e) {
-    console.error(now() + ' schedule tick failed: ' + String((e && e.message) || e));
-  } finally {
-    scheduleTicking = false;
-  }
-}
-if (Number.isInteger(SCHEDULE_MS) && SCHEDULE_MS > 0) setInterval(scheduleTick, SCHEDULE_MS).unref();
-
-// What `schedule list` and `schedule show` read: the stored schedule plus the
-// two things that make it trustworthy — when it fires next, and how it last
-// went. The last fire comes off hookruns.jsonl (one backward walk for the whole
-// list); there is no second copy of a run anywhere on this board.
-function publicSchedules() {
-  const last = lastRunsFor(WORKSPACE, board.schedules.map((s) => ({
-    key: s.name, hook: s.hook, trigger: scheduleTrigger(s),
-  })));
-  return board.schedules.map((s) => {
-    let next = null;
-    try {
-      const when = parseWhen(s.when);
-      // A schedule that has never fired will arm at now, so now is the honest
-      // answer for an empty cursor. An unparseable one is a different thing
-      // entirely: there is no next fire to compute, and printing a plausible
-      // "in 4m" for a clock that will never fire again is the lie `problem` is
-      // there to replace.
-      const from = s.lastWindow ? Date.parse(s.lastWindow) : Date.now();
-      if (!Number.isNaN(from)) {
-        const t = nextAfter(when, from, Date.parse(s.created) || 0);
-        next = t ? new Date(t).toISOString() : null;
-      }
-    } catch (e) { /* an unparseable `when` has no next fire — `problem` says why */ }
-    return Object.assign({}, s, { next, last: last.get(s.name) || null, describe: describeWhenSafe(s.when) });
-  });
-}
-function describeWhenSafe(text) {
-  try { return describeWhen(parseWhen(text)); } catch (e) { return String(text || ''); }
-}
-
-// validateSchedule(body) -> {error} | {schedule}
+// validateSchedule(body) -> {error, code} | {schedule}
 // The refusals are the point of `add`: a bad expression names the offending
 // text, a hook that is not there is refused before it can become a dead window
 // every five minutes, and an unregistered owner is refused because a firing's
@@ -4088,27 +2970,27 @@ function describeWhenSafe(text) {
 function validateSchedule(body) {
   const name = String(body.name || '').trim();
   if (!SCHEDULE_NAME_RE.test(name)) {
-    return { error: 'bad schedule name "' + name + '" (letters, digits, _ . - ; starts with a letter, digit or _)' };
+    return { error: 'bad schedule name "' + name + '" (letters, digits, _ . - ; starts with a letter, digit or _)', code: 400 };
   }
-  if (findSchedule(name)) return { error: 'schedule "' + name + '" already exists', status: 409 };
+  if (findSchedule(name)) return { error: 'schedule "' + name + '" already exists', code: 409 };
   const hook = String(body.hook || '').trim();
-  if (!HOOK_NAME_RE.test(hook)) return { error: 'a schedule fires a NAMED hook — give one with --hook' };
+  if (!HOOK_NAME_RE.test(hook)) return { error: 'a schedule fires a NAMED hook — give one with --hook', code: 400 };
   if (!namedHookFile(WORKSPACE, hook)) {
     return { error: 'no hook "' + hook + '" — a named hook is an executable file in ' + hooksDir(WORKSPACE)
-      + ' (bc-axi hook list). A schedule naming a hook that does not exist is a window that fires nothing' };
+      + ' (bc-axi hook list). A schedule naming a hook that does not exist is a window that fires nothing', code: 400 };
   }
   let when;
-  try { when = parseWhen(body.when); } catch (e) { return { error: e.message }; }
+  try { when = parseWhen(body.when); } catch (e) { return { error: e.message, code: 400 }; }
   const owner = String(body.owner || '').trim();
   if (!findLieutenant(owner)) {
-    return { error: 'unknown lieutenant "' + owner + '" — a schedule needs an owner for its failures to land on' };
+    return { error: 'unknown lieutenant "' + owner + '" — a schedule needs an owner for its failures to land on', code: 400 };
   }
   const overlap = body.overlap === undefined || body.overlap === null || body.overlap === ''
     ? 'skip' : String(body.overlap);
-  if (!OVERLAP.includes(overlap)) return { error: 'overlap must be one of: ' + OVERLAP.join(', ') };
+  if (!OVERLAP.includes(overlap)) return { error: 'overlap must be one of: ' + OVERLAP.join(', '), code: 400 };
   const catchup = body.catchup === undefined || body.catchup === null || body.catchup === ''
     ? 'latest' : String(body.catchup);
-  if (!CATCHUP.includes(catchup)) return { error: 'catch-up must be one of: ' + CATCHUP.join(', ') };
+  if (!CATCHUP.includes(catchup)) return { error: 'catch-up must be one of: ' + CATCHUP.join(', '), code: 400 };
   return { schedule: { name, hook, when: when.text, owner, overlap, catchup,
     paused: false, created: now(), lastWindow: '', problem: '' } };
 }
@@ -4160,129 +3042,33 @@ function serveStatic(res, rel) {
   res.end(data);
 }
 
-// The one uri the artifact routes accept that is not listed on a card: a
-// playbook. The config screen edits them in the same editor a card artifact
-// opens in, which means the same GET, the same version check and the same 409 —
-// a second file API would be a second place to get all of that wrong. So the
-// widening is exactly one shape and nothing else: `<playbooks dir>/<name>.md`,
-// one level deep, no symlink. The directory is DERIVED here, never taken from
-// the client.
-//
-// Returns 'workspace' | 'packaged' | '' — the same two populations
-// resolvePlaybook picks between, and the difference is what may be written.
-// The packaged set is a git checkout of this repo: readable, so the captain can
-// open one and copy it, and never written in place.
-function playbookSource(uri) {
-  if (typeof uri !== 'string' || !uri.startsWith('file://')) return '';
-  const file = uri.slice('file://'.length);
-  // path.resolve is idempotent on a clean absolute path — a `..` segment or a
-  // relative path changes it, so `<dir>/../../board.json` never gets this far.
-  if (path.resolve(file) !== file) return '';
-  if (path.extname(file) !== '.md') return '';
-  const dir = path.dirname(file);
-  const source = dir === playbooksDir(STATE_DIR) ? 'workspace'
-    : dir === PACKAGED_PLAYBOOKS_DIR ? 'packaged' : '';
-  if (!source) return '';
-  // A symlink IN the dir is not a file in the dir: what it points at is what
-  // would be read or written. Refused here rather than followed. (ENOENT is
-  // fine — that is the copy-to-workspace create, and PUT guards the dir itself.)
-  try { if (fs.lstatSync(file).isSymbolicLink()) return ''; }
-  catch (e) { if (e.code !== 'ENOENT') return ''; }
-  return source;
-}
+// ---------- the file gate (server/filegate.js) ----------
+// Which files the artifact routes may read and write: a card's listed
+// artifacts, the workspace's playbooks, charters and hooks — nothing else.
+const files = createFileGate({
+  workspace: WORKSPACE,
+  cards: () => board.cards,
+  lieutenants: () => board.lieutenants,
+  attachment: readAttachmentMeta,
+  maxBytes: ARTIFACT_MAX_BYTES,
+});
 
-// The second — and last — uri the artifact routes accept that is no card's:
-// a lieutenant's charter, `<workspace>/lieutenants/<id>/README.md`. The config
-// screen edits it in the same editor a playbook opens in, so it rides the same
-// GET, the same version check and the same 409.
-//
-// The widening is exactly one shape. charterPath() BUILDS the only acceptable
-// path from the workspace root and a REGISTERED id, and the uri has to equal
-// it — which is what refuses an unregistered id, another file in that folder, a
-// subdirectory of it, and a directory prefix from the client all at once.
-// Returns the path when it is one, '' otherwise.
-function charterFile(uri) {
-  if (typeof uri !== 'string' || !uri.startsWith('file://')) return '';
-  const file = uri.slice('file://'.length);
-  // path.resolve is idempotent on a clean absolute path — a `..` segment or a
-  // relative path changes it, so `<dir>/../../board.json` never gets this far.
-  if (path.resolve(file) !== file) return '';
-  if (!board.lieutenants.some((l) => charterPath(WORKSPACE, l.id) === file)) return '';
-  // A symlink named README.md is not the charter: what it points at is what
-  // would be read or written. Refused here rather than followed. (ENOENT is
-  // fine — a lieutenant that has never written its memory file still opens it.)
-  try { if (fs.lstatSync(file).isSymbolicLink()) return ''; }
-  catch (e) { if (e.code !== 'ENOENT') return ''; }
-  return file;
-}
-
-// The third — and last — uri the artifact routes accept that is no card's: a
-// HOOK file. The hooks tab's ✎ opens one in the same editor a playbook opens
-// in, which is where "he asks a lieutenant to help build one" happens: a file
-// on a screen he can point at.
-//
-// The widening is exactly one shape, and it is the namespace hooks.js already
-// defines: an executable file under <workspace>/.bridge-commander/hooks/, ONE
-// level deep (a named hook) or TWO (a lifecycle hook, in its event's
-// directory). The containing directory is BUILT here from STATE_DIR and
-// compared for equality — never taken from the client — the way charterFile()
-// does it, and the two names in it have to look like ids, so a traversal never
-// survives the comparison.
-//
-// Returns the path when the uri is one, '' otherwise. A file that is not there
-// YET is still one (that is the create), which is why the leaf check tolerates
-// ENOENT and nothing else: a symlink, a directory and a socket all fail
-// isFile() and are refused rather than followed.
-// Three answers, because two of them are different things:
-//   null      — not a hook path at all. Falls through to the other allowlists,
-//               and the caller gets the ordinary "unknown artifact" refusal.
-//   {file}    — a hook path the board reads and writes.
-//   {error}   — a hook path that is LEGAL and whose tree is not there. Answering
-//               "unknown artifact" to a legal path is a lie: the name is fine,
-//               the id is fine, the only thing missing is a directory. So it
-//               says which one, and what would have fired it.
-function hookTarget(uri) {
-  if (typeof uri !== 'string' || !uri.startsWith('file://')) return null;
-  const file = uri.slice('file://'.length);
-  // path.resolve is idempotent on a clean absolute path — a `..` segment or a
-  // relative path changes it, so `<dir>/../../board.json` never gets this far.
-  if (path.resolve(file) !== file) return null;
-  if (!HOOK_NAME_RE.test(path.basename(file))) return null;
-  const dir = path.dirname(file);
-  const root = hooksDir(WORKSPACE);
-  // '' = a named hook, one level deep. Otherwise the EVENT directory it sits in.
-  let event = '';
-  if (dir !== root) {
-    if (path.dirname(dir) !== root || !HOOK_NAME_RE.test(path.basename(dir))) return null;
-    event = path.basename(dir);
-  }
-  let real;
-  try { real = fs.realpathSync(dir); }
-  catch (e) {
-    if (e.code !== 'ENOENT') return null;
-    // The directory is not there. `hooks/` is a CONSTANT the board owns, so the
-    // write below makes it — the same one level `charterFile` makes for a
-    // lieutenant that never wrote its memory file, and the path the card names
-    // when it says a new hook is a file a lieutenant writes.
-    if (!event) return { file };
-    // An event directory is NOT a constant: creating one invents a lifecycle
-    // event, and a typo'd event is a hook that silently never fires, forever,
-    // with nothing to notice it. So this stays a refusal — one that names the
-    // event and the ones that exist, instead of pretending the path is unknown.
-    return { code: 400, error: 'no hook event directory "' + event + '" — the board fires '
-      + LIFECYCLE_EVENTS.join(', ') + '. Create ' + dir + ' yourself if that is really the event: '
-      + 'one invented here would be a hook that never runs' };
-  }
-  // The directory has to be reached without following a link: a symlinked
-  // hooks/ (or event dir) points somewhere else, and somewhere else is the
-  // whole thing this refuses. Not a hook path, so it refuses as one.
-  if (real !== dir) return null;
-  try { if (!fs.lstatSync(file).isFile()) return null; }
-  catch (e) { if (e.code !== 'ENOENT') return null; }
-  return { file };
-}
+// The plugin routes (server/pluginapi.js): catalog, overlay, commands,
+// activities, checks, a plugin's own routes and its browser module.
+const pluginRoutes = createPluginApi({
+  host: pluginHost, runs, checks, stateDir: STATE_DIR, workspace: WORKSPACE,
+  board: () => board, findCard, publicCard: (c) => publicCard(c, 'user'),
+  listHarnesses: () => port.listHarnesses(),
+  pluginsVersion: () => pluginsVersion,
+  reload: reloadPlugins,
+  profilesKey: () => profilesKey(manifests.resolveCatalog({ workspaceDir: PLUGINS_DIR, stateDir: STATE_DIR })),
+  profilesAtBoot: BOOT_PROFILES,
+  onRunStarted: (run, tracked) => { if (tracked) trackedRuns.add(run.id); },
+  sendJson, readBody, sseFrame, SSE_HEADERS, mime: MIME, log: pluginLog,
+});
 
 // ---------- server ----------
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const p = url.pathname;
@@ -4295,23 +3081,15 @@ const server = http.createServer(async (req, res) => {
     // ----- reads -----
     if (route === 'GET /api/board') return sendJson(res, 200, publicBoard(url.searchParams.get('user') || 'user'));
     if (route === 'GET /api/config') return sendJson(res, 200, userConfig());
-    // ----- the TTS engine, on the board's own origin -----
-    // Any method, any path under the prefix, streamed both ways. No engine
-    // configured means no route at all: this falls through to the ordinary 404
-    // and the board is as silent as it is with no tts block.
-    if (p === TTS_PREFIX || p.startsWith(TTS_PREFIX + '/')) {
-      const t = ttsConfig();
-      // p, not a decoded path: what the browser encoded is what the engine gets.
-      if (t) return proxyTts(req, res, t.url, p.slice(TTS_PREFIX.length) + url.search);
-    }
-    // ----- the STT engine, same deal (the websocket half is on 'upgrade') -----
-    if (p === STT_PREFIX || p.startsWith(STT_PREFIX + '/')) {
-      const t = sttConfig();
-      if (t) return proxyStt(req, res, t.url, p.slice(STT_PREFIX.length) + url.search);
-    }
+    // ----- plugins: catalog, overlay, commands, activities, checks, /api/x, /plugins -----
+    if (await pluginRoutes.handle(req, res, url)) return;
+    // ----- the TTS and STT engines, on the board's own origin -----
+    // Any method, any path under the prefix, streamed both ways (the STT
+    // websocket half is on 'upgrade').
+    if (ttsProxy.handle(req, res, p, url.search)) return;
+    if (sttProxy.handle(req, res, p, url.search)) return;
     if (route === 'GET /api/status') {
-      let pending = 0;
-      for (const lt of queueIds()) pending += pendingItems(lt).length;
+      const pending = delivery.pending().length;
       return sendJson(res, 200, {
         // `host` is what this process actually BOUND, not what config said —
         // a caller that wants a different bind (init/open --host) can only tell
@@ -4319,7 +3097,7 @@ const server = http.createServer(async (req, res) => {
         // that sent a stranger a URL their browser could not reach.
         workspace: WORKSPACE, port: PORT, host: BIND_HOST, cards: board.cards.length,
         lieutenants: board.lieutenants.length, seq: board.seq,
-        queue_seq: qseq, queue_pending: pending,
+        queue_seq: delivery.head(), queue_pending: pending,
         projects: board.projects.length, workers: board.workers.length,
         pid: process.pid,
         code: CODE, // {root, commit, short, dirty} as of BOOT — the CLI compares it to HEAD now
@@ -4342,7 +3120,7 @@ const server = http.createServer(async (req, res) => {
       const next = Object.assign({}, cur, body, { step, updated: now() });
       delete next.actor;
       board.onboarding = next;
-      saveBoard(); broadcast();
+      store.commit();
       return sendJson(res, 200, { ok: true, onboarding: board.onboarding });
     }
     if (route === 'GET /api/archive') {
@@ -4354,7 +3132,8 @@ const server = http.createServer(async (req, res) => {
       const n = parseInt(url.searchParams.get('limit') || '50', 10) || 50;
       const off = parseInt(url.searchParams.get('offset') || '0', 10) || 0;
       const all = readArchive().reverse();
-      return sendJson(res, 200, { archive: all.slice(off, off + n), total: all.length });
+      return sendJson(res, 200, { archive: all.slice(off, off + n).map((r) => ({ ...r,
+        card: r.card && r.card.sessions ? { ...r.card, sessions: publicSessions(r.card) } : r.card })), total: all.length });
     }
     if (route === 'GET /api/notifications') {
       const items = notificationItems(url.searchParams.get('user'));
@@ -4365,151 +3144,36 @@ const server = http.createServer(async (req, res) => {
     // so there is no directory for a relative path to sit in — which is why
     // artifact pages had to inline their assets as base64. `/artifacts/<dir>/<rel>`
     // gives the page a folder, and its siblings load the way every relative path
-    // on the web does. Scoped to the artifact's own directory: <dir> must be the
-    // directory of a listed artifact, and the resolved file must stay inside it —
-    // not as a security claim, but because "this URL means this folder" is what
-    // makes a relative path mean anything.
+    // on the web does. Scoped by the file gate to the directory of a listed
+    // artifact.
     const adir = /^\/artifacts\/([^/]+)\/(.+)$/.exec(p);
     if (adir && req.method === 'GET') {
       let dir, rel;
       try { dir = decodeURIComponent(adir[1]); rel = decodeURIComponent(adir[2]); }
       catch (e) { return sendJson(res, 400, { error: 'bad artifact path' }); }
-      const listed = dir && path.resolve(dir) === dir &&
-        board.cards.some((c) => Array.isArray(c.attributes && c.attributes.artifacts) &&
-          c.attributes.artifacts.some((a) => a && typeof a.uri === 'string' && a.uri.startsWith('file://') &&
-            path.dirname(a.uri.slice('file://'.length)) === dir));
-      if (!listed) return sendJson(res, 404, { error: 'unknown artifact directory' });
-      const file = path.resolve(dir, rel);
-      if (!file.startsWith(dir + path.sep)) return sendJson(res, 403, { error: 'outside the artifact directory' });
-      let st;
-      try { st = fs.statSync(file); }
-      catch (e) { return sendJson(res, 404, { error: 'unreadable: ' + e.message }); }
-      if (!st.isFile()) return sendJson(res, 404, { error: 'not a file' });
-      if (st.size > ARTIFACT_MAX_BYTES) return sendJson(res, 413, { error: 'artifact too large (max ' + ARTIFACT_MAX_BYTES + ' bytes)' });
-      // No sandbox CSP: the board has no auth and binds to the tailnet, so anyone
-      // who reaches it can already ask a lieutenant to run anything. Hardening
-      // this page against that board defends nothing.
-      return sendBytes(req, res, fs.readFileSync(file), {
-        'Content-Type': ARTIFACT_MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
-        'Cache-Control': 'no-store',
-        'X-Content-Type-Options': 'nosniff',
-      });
+      const r = files.readDir(dir, rel);
+      if (r.error) return sendJson(res, r.code, { error: r.error });
+      return sendBytes(req, res, r.bytes, r.headers);
     }
-    // Artifact serve, for the UI's popup viewer. Servable is a uri listed
-    // verbatim in some live card's attributes.artifacts, or one of the
-    // workspace-owned files the same screen edits (playbookSource, charterFile,
-    // hookTarget) — never an arbitrary file read. Same allowlist the write below
-    // uses, plus the packaged playbooks, which are read-only.
-    // Default (no raw): TEXT content of the file. raw=1: the raw
-    // bytes with a real Content-Type, backing the inline <img> and downloads.
+    // Artifact serve, for the UI's popup viewer: whatever the file gate allows
+    // (a card's listed artifacts, or the workspace files the config screen
+    // edits) — never an arbitrary file read. Default: the TEXT content and its
+    // version. raw=1: the bytes with a real Content-Type, backing the inline
+    // <img> and downloads.
     if (route === 'GET /api/artifact') {
-      const uri = url.searchParams.get('uri') || '';
       const raw = url.searchParams.get('raw') === '1' || url.searchParams.get('raw') === 'true';
-      const charter = charterFile(uri);
-      const ht = hookTarget(uri);
-      if (ht && ht.error) return sendJson(res, ht.code, { error: ht.error });
-      const hook = (ht && ht.file) || '';
-      const listed = board.cards.some((c) => Array.isArray(c.attributes && c.attributes.artifacts) &&
-        c.attributes.artifacts.some((a) => a && a.uri === uri)) || !!playbookSource(uri) || !!charter || !!hook;
-      if (!listed) return sendJson(res, 404, { error: 'unknown artifact' });
-      // A promoted chat attachment (attachment://id) resolves to its stored file
-      // via the sidecar; file:// / bare paths read directly.
-      let file = uri.startsWith('file://') ? uri.slice('file://'.length) : uri;
-      let name = path.basename(file);
-      let attMime = '';
-      const am = /^attachment:\/\/(.+)$/.exec(uri);
-      if (am) {
-        const meta = readAttachmentMeta(am[1]);
-        if (!meta) return sendJson(res, 404, { error: 'unknown attachment' });
-        file = meta.path; name = meta.name; attMime = meta.mime || '';
-      }
-      if (raw) {
-        // Byte mode. Only a real local file is servable: an attachment path is
-        // already vetted by readAttachmentMeta; a plain artifact must be a
-        // file:// absolute path with no traversal escaping it (path.resolve is
-        // idempotent on a clean absolute path — a `..` segment or a relative
-        // path changes it, so it is rejected).
-        if (!am) {
-          if (!uri.startsWith('file://')) return sendJson(res, 400, { error: 'not a file artifact' });
-          if (path.resolve(file) !== file) return sendJson(res, 400, { error: 'unsafe artifact path' });
-        }
-        let st;
-        try { st = fs.statSync(file); }
-        catch (e) { return sendJson(res, 404, { error: 'unreadable: ' + e.message }); }
-        if (!st.isFile()) return sendJson(res, 404, { error: 'not a file' });
-        if (st.size > ARTIFACT_MAX_BYTES) return sendJson(res, 413, { error: 'artifact too large (max ' + ARTIFACT_MAX_BYTES + ' bytes)' });
-        const ext = path.extname(name).toLowerCase();
-        // A curated .html/.htm artifact (teach-me page, report) is a self-contained
-        // document meant to be *rendered*: serve it as text/html inline so a page
-        // opened here shows, not its source. Scoped to plain file artifacts, not
-        // attachments (an uploaded .html keeps its neutralized download behavior)
-        // and never a HOOK: a hook is a script whose basename the writer chooses,
-        // so `hooks/report.html` is a legal hook path and rendering it would make
-        // the gate that writes hooks a way to run script on the board's origin.
-        const isHtml = !am && !hook && (ext === '.html' || ext === '.htm');
-        const ctype = isHtml ? 'text/html; charset=utf-8'
-          : am ? (attMime || 'application/octet-stream')
-          : (ARTIFACT_MIME[ext] || 'application/octet-stream');
-        // Images, video, audio, pdf, and rendered html show inline in the browser;
-        // other binaries download. nosniff pins the Content-Type; the sandbox CSP
-        // neutralizes an uploaded SVG/HTML if it is navigated to as a document
-        // (inline <img>/<video> subresources unaffected). A curated .html artifact
-        // is exempt — it is the captain's own deliverable, and sandboxing it against
-        // a board anyone on the tailnet can drive defends nothing.
-        const inline = isHtml || /^(image|video|audio)\//.test(ctype) || ctype === 'application/pdf';
-        let data;
-        try { data = fs.readFileSync(file); }
-        catch (e) { return sendJson(res, 404, { error: 'unreadable: ' + e.message }); }
-        return sendBytes(req, res, data, {
-          'Content-Type': ctype,
-          'Cache-Control': 'private, max-age=31536000, immutable',
-          'X-Content-Type-Options': 'nosniff',
-          ...(isHtml ? {} : { 'Content-Security-Policy': 'sandbox' }),
-          'Content-Disposition': (inline ? 'inline' : 'attachment') + '; filename="' + name.replace(/["\\\r\n]/g, '_') + '"',
-        });
-      }
-      let data;
-      try { data = fs.readFileSync(file); }
-      catch (e) {
-        // A BOARD-OWNED file that is not written yet reads as the empty document
-        // at version '' — whatever kind it is. The board owns the path (it built
-        // it, not the client), so the file's absence is a state, not a 404: a
-        // lieutenant that has never written its memory, a hook nobody has typed
-        // yet. And '' is exactly what the PUT below reads as "I expect no file",
-        // so the first 💾 creates it. A card artifact is NOT board-owned — that
-        // path came from the card, and a missing one is genuinely unreadable.
-        if ((charter || hook) && e.code === 'ENOENT') return sendJson(res, 200, { name, content: '', version: '' });
-        return sendJson(res, 404, { error: 'unreadable: ' + e.message });
-      }
-      if (data.length > 2e6) return sendJson(res, 413, { error: 'file too large to preview' });
-      if (data.includes(0)) return sendJson(res, 415, { error: 'binary file' });
-      // The version travels with the content so an editor can hand it back on
-      // save: sha256 of the exact bytes on disk. Content-derived on purpose —
-      // mtime+size misses two writes in the same second at the same length.
-      return sendJson(res, 200, { name, content: data.toString('utf8'), version: sha256(data) });
+      const r = files.read(url.searchParams.get('uri') || '', { raw });
+      if (r.error) return sendJson(res, r.code, { error: r.error });
+      if (raw) return sendBytes(req, res, r.bytes, r.headers);
+      return sendJson(res, 200, r);
     }
 
-    // Artifact WRITE — what the file editor's save actually does. Deliberately
-    // narrow: this is an artifact editor, not remote arbitrary-file write on
-    // this machine. The board has no auth of its own (the network boundary is
-    // the auth boundary), so every guard below is load-bearing:
-    //   - the uri must ALREADY be listed on a live card, or be a WORKSPACE
-    //     playbook (playbookSource), or a registered lieutenant's charter
-    //     (charterFile), or a hook file (hookTarget) — the GET's allowlist minus
-    //     the packaged playbooks, which are read-only. Anything else is 403, and
-    //     there is no flag to turn it off;
-    //   - file:// only, absolute, no `..` (path.resolve is idempotent on a
-    //     clean absolute path), and no symlink anywhere along it (realpath must
-    //     come back unchanged), so a listed artifact can never be a door to
-    //     somewhere else;
-    //   - attachment:// is immutable: an upload is the record of what was sent.
-    // Lost-update guard: the client sends the version it read. If disk has
-    // moved since, nothing is written and the answer is 409 carrying what is
-    // there now — the captain's text stays on his screen either way. It applies
-    // to EVERY writer, agent included (`bc-axi artifact write`): the door is
-    // locked on both sides or it is not locked.
-    // A write that lands also announces itself on the board SSE (event
-    // `artifact`), so an editor already open on the file follows along.
+    // Artifact WRITE — what the file editor's save actually does. The file
+    // gate decides what is writable and guards the write (no symlink, no `..`,
+    // atomic swap); a version the writer read that no longer matches the disk
+    // is a 409 carrying what is there now, and nothing is written. A write that
+    // lands announces itself on the board SSE (event `artifact`), so an editor
+    // already open on the file follows along.
     if (route === 'PUT /api/artifact') {
       let raw;
       try { raw = await readBodyUpto(req, ARTIFACT_MAX_BYTES + 65536); }
@@ -4520,88 +3184,19 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(raw || '{}');
       const uri = String(body.uri || '');
       if (typeof body.content !== 'string') return sendJson(res, 400, { error: 'content required' });
-      const pbSource = playbookSource(uri);
-      const charter = charterFile(uri);
-      const ht = hookTarget(uri);
-      if (ht && ht.error) return sendJson(res, ht.code, { error: ht.error });
-      const hook = (ht && ht.file) || '';
-      const listed = board.cards.some((c) => Array.isArray(c.attributes && c.attributes.artifacts) &&
-        c.attributes.artifacts.some((a) => a && a.uri === uri)) || pbSource === 'workspace' || !!charter || !!hook;
-      if (!listed) {
-        // A packaged playbook is readable and never writable: it is a git
-        // checkout of this repo, so the edit is a copy into the workspace.
-        if (pbSource === 'packaged') {
-          return sendJson(res, 403, { error: 'a packaged playbook is never written — copy it to the workspace first' });
-        }
-        return sendJson(res, 403, { error: 'not an artifact of any card — refusing to write' });
+      const w = files.write(uri, body.content, body.version);
+      if (w.conflict) {
+        return sendJson(res, 409, {
+          error: 'the file changed on disk since you opened it — nothing was written',
+          version: w.conflict.version, content: w.conflict.content,
+        });
       }
-      if (!uri.startsWith('file://')) return sendJson(res, 403, { error: 'only file:// artifacts are writable' });
-      const file = uri.slice('file://'.length);
-      if (path.resolve(file) !== file) return sendJson(res, 403, { error: 'unsafe artifact path' });
-      // A listed artifact that is not on disk yet is CREATED — that is how a
-      // derived file gets written beside its source (a drawing's .svg), and it
-      // is the SAME lost-update rule with "nothing there" as the version read:
-      // an empty version means "I expect no file", so a file that turned up
-      // meanwhile is still a 409 below. The directory has to be real, for the
-      // same reason the file does.
-      let st = null, real;
-      try { st = fs.statSync(file); real = fs.realpathSync(file); }
-      catch (e) {
-        if (e.code !== 'ENOENT' || String(body.version || '') !== '') {
-          return sendJson(res, 404, { error: 'unreadable: ' + e.message });
-        }
-        const dir = path.dirname(file);
-        // A charter's folder is the board's to make: a lieutenant registered
-        // without one has no other way to get `lieutenants/<id>/`. So is a
-        // workspace's `hooks/` — a fixed name the board owns, and the card's
-        // "a new hook is a file you or a lieutenant writes" goes through this
-        // very route, so a workspace that has no hooks yet must not be the one
-        // place a lieutenant cannot write the first one. An EVENT directory is
-        // never made here: hookTarget refused before we got this far, because a
-        // directory invented from a typo is a hook that never runs.
-        // mkdir is a no-op when it is already there — including when it is a
-        // symlink, which the check right below still refuses.
-        if (charter || hook) { try { fs.mkdirSync(dir, { recursive: true }); } catch (e2) { /* the check below answers */ } }
-        try { if (fs.realpathSync(dir) !== dir) throw new Error('symlink'); }
-        catch (e2) { return sendJson(res, 403, { error: 'artifact path resolves elsewhere (symlink) — refusing to write' }); }
-      }
-      if (st) {
-        if (!st.isFile()) return sendJson(res, 403, { error: 'not a regular file' });
-        if (real !== file) return sendJson(res, 403, { error: 'artifact path resolves elsewhere (symlink) — refusing to write' });
-        let cur;
-        try { cur = fs.readFileSync(file); }
-        catch (e) { return sendJson(res, 404, { error: 'unreadable: ' + e.message }); }
-        if (cur.includes(0)) return sendJson(res, 415, { error: 'binary file' });
-        const version = sha256(cur);
-        if (String(body.version || '') !== version) {
-          return sendJson(res, 409, {
-            error: 'the file changed on disk since you opened it — nothing was written',
-            version, content: cur.toString('utf8'),
-          });
-        }
-      }
-      const next = Buffer.from(body.content, 'utf8');
-      if (next.length > ARTIFACT_MAX_BYTES) return sendJson(res, 413, { error: 'content too large (max ' + ARTIFACT_MAX_BYTES + ' bytes)' });
-      // Atomic swap: write a sibling temp file, then rename over the original.
-      // Truncating the artifact and writing into it would leave it half-written
-      // if the process died mid-write; a rename either happened or it didn't.
-      const tmp = path.join(path.dirname(file), '.' + path.basename(file) + '.bc-' + process.pid + '-' + Date.now() + '.tmp');
-      try {
-        // An existing file keeps its mode. A hook created here is born
-        // EXECUTABLE — a hook the runner would skip silently is not a hook, and
-        // there is no chmod on a phone.
-        fs.writeFileSync(tmp, next, st ? { mode: st.mode & 0o777 } : (hook ? { mode: 0o755 } : {}));
-        fs.renameSync(tmp, file);
-      } catch (e) {
-        try { fs.unlinkSync(tmp); } catch (e2) {}
-        return sendJson(res, 500, { error: 'write failed: ' + e.message });
-      }
-      const newVersion = sha256(next);
+      if (w.error) return sendJson(res, w.code, { error: w.error });
       // Whoever has this file open hears about it right away — that is what
       // makes four hands four hands instead of two taking turns around a
       // reload button. The writer's own client recognizes the echo.
-      broadcastArtifact(uri, newVersion, String(body.client || ''));
-      return sendJson(res, 200, { ok: true, version: newVersion, bytes: next.length });
+      broadcastArtifact(uri, w.version, String(body.client || ''));
+      return sendJson(res, 200, { ok: true, version: w.version, bytes: w.bytes });
     }
 
     // ----- chat attachments (uploads) -----
@@ -4646,19 +3241,21 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ----- lieutenants -----
+    // Every listing carries `next`, the card id this lieutenant would mint.
     // `live=1` adds what the config screen's lieutenants tab shows and the board
-    // payload cannot: the next card id this lieutenant would mint, how many live
-    // cards it owns, where its charter file is, and — the one fact a board tile
-    // never tells you — whether its session is actually up. The probe shells out
-    // to the harness once per lieutenant, so it is gated the way /api/projects
-    // gates its git reads: the tab asks, nobody else pays.
+    // payload cannot: how many live cards it owns, where its charter file is,
+    // and — the one fact a board tile never tells you — whether its session is
+    // actually up. The probe shells out to the harness once per lieutenant, so
+    // it is gated the way /api/projects gates its git reads: the tab asks,
+    // nobody else pays.
     if (route === 'GET /api/lieutenants') {
       if (!/^(1|true)$/.test(url.searchParams.get('live') || '')) {
-        return sendJson(res, 200, { lieutenants: board.lieutenants.map(withStatusAge) });
+        return sendJson(res, 200, { lieutenants: board.lieutenants.map((l) =>
+          Object.assign({}, withStatusAge(l), { next: nextCardId(l) })) });
       }
       const lieutenants = await Promise.all(board.lieutenants.map(async (l) => Object.assign({}, withStatusAge(l), {
         cards: board.cards.filter((c) => c.owner === l.id).length,
-        next: l.prefix + '-' + ((l.cardSeq || 0) + 1),
+        next: nextCardId(l),
         memory: charterPath(WORKSPACE, l.id),
         session: await sessionState(l),
       })));
@@ -4672,84 +3269,39 @@ const server = http.createServer(async (req, res) => {
       // spawn:true births a real session (harness.spawn in the workspace root)
       // and registers the lieutenant with the returned ref; without it this is
       // registration only (the founding lieutenant brings its own ref).
-      const r = body.spawn ? await spawnLieutenant(body) : createLieutenant(body);
-      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      saveBoard(); broadcast();
+      const r = await store.mutate(() => (body.spawn ? spawnLieutenant(body) : createLieutenant(body)));
       // `spawned` is how a re-run of `init --onboard` tells "I revived her" from
       // "she was already up" — the second is not worth a line of anyone's output.
-      return sendJson(res, 200, { ok: true, lieutenant: r.lieutenant, spawned: r.spawned });
+      return respond(res, r, () => ({ ok: true, lieutenant: r.lieutenant, spawned: r.spawned }));
+    }
+    // The models a harness can list cheaply, for the settings modal's suggestions
+    // (codex: its own models cache). `models: null` = this harness cannot say, so
+    // the UI suggests nothing and warns about nothing.
+    const hmRoute = /^\/api\/harnesses\/([^/]+)\/models$/.exec(p);
+    if (hmRoute && req.method === 'GET') {
+      let profile = null;
+      try { profile = port.profileOf(decodeURIComponent(hmRoute[1])); } catch (e) { /* unknown = cannot say */ }
+      let models = null;
+      try { models = profile && typeof profile.models === 'function' ? profile.models() || null : null; }
+      catch (e) { models = null; }
+      return sendJson(res, 200, { models });
     }
     const ltRoute = /^\/api\/lieutenants\/([^/]+)$/.exec(p);
     if (ltRoute && req.method === 'DELETE') { // lieutenant.retire — explicit only
       const body = JSON.parse(await readBody(req) || '{}');
-      const r = await retireLieutenant(decodeURIComponent(ltRoute[1]), body);
-      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, event: r.event, memory: r.memory });
+      const r = await store.mutate(() => retireLieutenant(decodeURIComponent(ltRoute[1]), body));
+      return respond(res, r, () => ({ ok: true, event: r.event, memory: r.memory }));
     }
     if (ltRoute && req.method === 'PATCH') { // name/color/avatar/voice/prefix/model/harness/ref (init idempotency)
       const lt = findLieutenant(decodeURIComponent(ltRoute[1]));
       if (!lt) return sendJson(res, 404, { error: 'unknown lieutenant: ' + decodeURIComponent(ltRoute[1]) });
       const body = JSON.parse(await readBody(req) || '{}');
-      // Prefix first, and refused before anything else applies: it is the only
-      // field a peer can veto (two lieutenants may not share one), so a rejected
-      // pick must not leave half a patch behind. Past cards keep the id they
-      // were minted with — a prefix change is about what comes next.
-      if (body.prefix !== undefined) {
-        const p = validPrefix(body.prefix);
-        if (!p) return sendJson(res, 400, { error: BAD_PREFIX });
-        const clash = prefixOwner(p, lt.id);
-        if (clash) return sendJson(res, 409, { error: prefixTakenMsg(p, clash) });
-        lt.prefix = p;
-      }
-      if (body.ref !== undefined) {
-        if (body.ref !== null && !isHarnessRef(body.ref)) {
-          return sendJson(res, 400, { error: 'bad ref (want {harness, session, cwd, resumeId?} or null)' });
-        }
-        // A re-run of `bc-axi init` re-sends the founder's session-granular ref
-        // (the caller's tmux session is all it can see). Keep the window this
-        // lieutenant was already pinned to — losing it would put the ref back
-        // to killing its whole session, worker windows included, on revive.
-        lt.ref = body.ref && !body.ref.window && lt.ref && lt.ref.window
-          && lt.ref.session === body.ref.session
-          ? { ...body.ref, window: lt.ref.window }
-          : body.ref;
-      }
-      if (body.name !== undefined && String(body.name).trim()) lt.name = String(body.name).trim().slice(0, 60);
-      if (body.color !== undefined && validColor(body.color)) lt.color = body.color;
-      if (body.avatar !== undefined) {
-        if (body.avatar === null) delete lt.avatar;
-        else if (validAvatar(body.avatar)) lt.avatar = body.avatar;
-        else return sendJson(res, 400, { error: 'avatar must be an integer 0-63 or null' });
-      }
-      // "" / null clears the pick — the lieutenant is back to the board's voice.
-      if (body.voice !== undefined) {
-        const v = validVoice(body.voice);
-        if (v) lt.voice = v; else delete lt.voice;
-      }
-      // The model is stored, not applied: it rides `--model` on the next spawn
-      // or resume this lieutenant gets. Set BEFORE the harness switch below, so
-      // a captain who moves harness and model in one call lands on both.
-      // null / "" clears it back to the harness's own default.
-      if (body.model !== undefined) {
-        if (body.model === null || body.model === '') delete lt.model;
-        else {
-          const m = validModel(body.model);
-          if (!m) return sendJson(res, 400, { error: BAD_MODEL });
-          lt.model = m;
-        }
-      }
-      // Last, because it is the only field that costs the lieutenant its
-      // session: everything above is already on the record the respawn prompt
-      // is built from.
-      if (body.harness !== undefined && body.harness !== null && String(body.harness) !== '') {
-        const sw = await switchLieutenantHarness(lt, String(body.harness), body.actor);
-        if (sw.error) { saveBoard(); broadcast(); return sendJson(res, sw.code || 400, { error: sw.error }); }
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, lieutenant: lt, switched: sw.switched, event: sw.event });
-      }
-      saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, lieutenant: lt });
+      const r = store.mutate(() => patchLieutenant(lt, body));
+      if (r.error || !r.harness) return respond(res, r, () => ({ ok: true, lieutenant: lt }));
+      // Last, and its own change: the switch costs the lieutenant its session,
+      // and the fields above are already on the record the respawn prompt reads.
+      const sw = await store.mutate(() => switchLieutenantHarness(lt, r.harness, body.actor));
+      return respond(res, sw, () => ({ ok: true, lieutenant: lt, switched: sw.switched, event: sw.event }));
     }
 
     // ----- turn boundaries (the BC_TURNEND_URL target; posted by the Stop-hook relay) -----
@@ -4762,69 +3314,23 @@ const server = http.createServer(async (req, res) => {
     // BEFORE lieutenant attribution so a worker's first POST can never be
     // mis-adopted); (4) tmux attribution — the hook runs inside the agent's
     // pane, so its tmux_session names the owning lieutenant's ref.session
-    // exactly (adopts/refreshes resumeId; works for any number of founders);
+    // exactly — never for a worker's `:w-<card>` key, whose pane shares that
+    // session (adopts/refreshes resumeId; works for any number of founders);
     // (5) legacy adoption — only for old hooks whose payload carries no
     // tmux_session field: exactly one ref-bearing lieutenant missing its
     // resumeId, and never a session_id whose cwd is not that lieutenant's
     // ref.cwd (a stray claude in the workspace must not become a lieutenant).
     // Anything else is some other agent in the workspace: acknowledged, ignored.
+    // The steps are conversation.identify's (resolveHookAgent).
     if (route === 'POST /api/turn-end') {
       const body = JSON.parse(await readBody(req) || '{}');
       const sid = body.session_id ? String(body.session_id) : '';
-      const sname = body.session ? String(body.session) : '';
-      const tmux = typeof body.tmux_session === 'string' ? body.tmux_session : null;
-      let lt = sid ? board.lieutenants.find((l) => isHarnessRef(l.ref) && l.ref.resumeId === sid) : null;
-      // A lieutenant's hook posts its state key, which for a window-granular
-      // ref is `session:lt` — matching on ref.session alone never saw it, and
-      // a codex lieutenant (born without a resumeId) had no other way in.
-      if (!lt && sname) lt = board.lieutenants.find((l) => isHarnessRef(l.ref) && refKey(l.ref) === sname);
-      if (!lt) {
-        let w = sid ? board.workers.find((x) => x.ref.resumeId === sid) : null;
-        // A window-granular worker's hook posts the `session:window` key —
-        // never the bare session name it shares with its lieutenant.
-        if (!w && sname) w = board.workers.find((x) => workerName(x.ref) === sname);
-        if (w) {
-          if (sid && w.ref.resumeId !== sid) w.ref.resumeId = sid; // hook payload is ground truth
-          w.lastTurnEnd = now();
-          w.turns = (w.turns || 0) + 1;
-          if (typeof body.text === 'string' && body.text.trim()) w.lastTurnEndText = body.text.trim().slice(0, 300);
-          clearStale(w); // a turn-end is activity: the stall ladder starts over
-          // turn-end is the status refresh point (context bar / /status data)
-          const statusChanged = await refreshAgentStatus(w);
-          // A worker turn-end IS the stop signal: a Working card whose worker
-          // stopped without done would otherwise be invisible to its owner.
-          // EVERY such turn-end posts — a worker re-sent after a stop that ends
-          // its turn again with no signal has stopped AGAIN, and an owner who
-          // heard about the first stop only is the 3h silence of CMD-26.
-          // stopNotified marks "this stop was notified" for the drain hint;
-          // signal/done/leaving Working clear it.
-          const card = findCard(w.card);
-          let stopped = false;
-          if (card && card.column === 'working' && !w.done) {
-            w.stopNotified = true;
-            stopped = true;
-            const text = 'worker ' + workerName(w.ref) + ' stopped without reporting done';
-            card.events.push(mkEvent({ text, actor: 'server' }, { kind: 'worker-stopped' }));
-            card.updated = now();
-            queuePush(card.owner, { kind: 'worker-stopped', card: card.id, text });
-          }
-          saveBoard();
-          if (stopped || statusChanged) broadcast();
-          return sendJson(res, 200, { ok: true, lieutenant: null, worker: w.card });
-        }
-      }
-      // Worker hooks are excluded from tmux attribution: a worker's pane sits
-      // in the lieutenant session it cohabits, so its tmux_session IS that
-      // lieutenant's — without this guard a stale worker POST (its record
-      // already gone) would corrupt the lieutenant's resumeId. The WINDOW part
-      // of the key tells them apart: `:lt` is the lieutenant's own window,
-      // `:w-<card>` is a worker's (names.js — workerWindow / LIEUTENANT_WINDOW).
-      const keyWindow = sname.includes(':') ? sname.slice(sname.indexOf(':') + 1) : '';
-      const workerKey = !!keyWindow && keyWindow !== names.LIEUTENANT_WINDOW;
-      if (!lt && tmux && !workerKey) lt = board.lieutenants.find((l) => isHarnessRef(l.ref) && l.ref.session === tmux);
-      if (!lt && tmux === null && sid) {
-        const cands = board.lieutenants.filter((l) => isHarnessRef(l.ref) && !l.ref.resumeId);
-        if (cands.length === 1 && body.cwd && path.resolve(String(body.cwd)) === cands[0].ref.cwd) lt = cands[0];
+      const { lt, worker: w } = resolveHookAgent(body);
+      if (w) {
+        const r = await workers.turnEnd(w, { sid, text: body.text });
+        store.save();
+        if (r.stopped || r.statusChanged || sid) broadcast();
+        return sendJson(res, 200, { ok: true, lieutenant: null, worker: w.card });
       }
       if (!lt) return sendJson(res, 200, { ok: true, lieutenant: null });
       if (sid && lt.ref.resumeId !== sid) lt.ref.resumeId = sid; // hook payload is ground truth
@@ -4832,7 +3338,7 @@ const server = http.createServer(async (req, res) => {
       lt.turns = (lt.turns || 0) + 1;
       // turn-end is the status refresh point (context bar / /status data)
       const statusChanged = await refreshAgentStatus(lt);
-      saveBoard();
+      store.save();
       if (statusChanged) broadcast();
       // Drain-at-turn-start backstop: the lieutenant just ended a turn with
       // items still unacked. Re-nudge unless a wake is already outstanding
@@ -4843,63 +3349,111 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, lieutenant: lt.id, pending });
     }
 
+    // ----- permission approvals -----
+    // A PermissionRequest hook asks here and waits: the response stays open
+    // until the captain decides (/decide below), the cap answers null, or the
+    // hook hangs up. Attribution is turn-end's, read-only — an ask never
+    // adopts a resumeId. Unattributed asks still show: the captain can judge.
+    if (route === 'POST /api/permission') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const { lt, worker } = resolveHookAgent(body);
+      permissions.hold(res, permissionFields(body, lt, worker));
+      return;
+    }
+    const decideRoute = /^\/api\/permission\/([^/]+)\/decide$/.exec(p);
+    if (decideRoute && req.method === 'POST') {
+      const id = decodeURIComponent(decideRoute[1]);
+      if (!permissions.has((it) => it.id === id)) return sendJson(res, 404, { error: 'unknown permission: ' + id });
+      const body = JSON.parse(await readBody(req) || '{}');
+      if (body.decision !== 'allow' && body.decision !== 'deny') {
+        return sendJson(res, 400, { error: 'decision must be allow or deny' });
+      }
+      const message = typeof body.message === 'string' ? body.message.trim().slice(0, 1000) : '';
+      const item = permissions.decide(id, body.decision, message);
+      // The hook may have hung up while this body was being read.
+      if (!item) return sendJson(res, 404, { error: 'unknown permission: ' + id });
+      const card = item.card ? findCard(item.card) : null;
+      if (card) {
+        const text = 'captain ' + (body.decision === 'allow' ? 'approved ' : 'denied ') + item.tool_name + ': '
+          + item.summary + (message ? ' — ' + message : '');
+        store.cardEvent(card, { text, actor: 'captain' }, { kind: 'permission', level: 2 });
+      }
+      store.commit();
+      return sendJson(res, 200, { ok: true });
+    }
+
     // ----- cards -----
+    if (route === 'POST /api/sessions/sync') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const r = store.mutate(() => sessions.sync(body));
+      return respond(res, r, () => ({ ok: true, card: publicCard(r.card, 'user'),
+        session: publicSessions(r.card).find((s) => s.key === r.session.key) }));
+    }
     if (route === 'POST /api/cards') {
       const body = JSON.parse(await readBody(req) || '{}');
-      const r = createCard(body);
-      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, card: publicCard(r.card, 'user') });
+      const r = store.mutate(() => createCard(body));
+      if (!r.error) emitPlugins('card-created', { card: r.card });
+      return respond(res, r, () => ({ ok: true, card: publicCard(r.card, 'user') }));
     }
     // restore targets a card that is NOT on the board, so it routes before the
     // find-card paths (which would 404 the normal restore case).
     const restoreRoute = /^\/api\/cards\/([^/]+)\/restore$/.exec(p);
     if (restoreRoute && req.method === 'POST') {
-      const r = restoreCard(decodeURIComponent(restoreRoute[1]), JSON.parse(await readBody(req) || '{}'));
-      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, card: publicCard(r.card, 'user'), event: r.event });
+      const body = JSON.parse(await readBody(req) || '{}');
+      const r = store.mutate(() => restoreCard(decodeURIComponent(restoreRoute[1]), body));
+      return respond(res, r, () => ({ ok: true, card: publicCard(r.card, 'user'), event: r.event }));
     }
-    const cardRoute = /^\/api\/cards\/([^/]+)(\/(move|events|archive|status|start|park|artifacts|worker\/signal|worker\/done|worker\/send|worker\/pause))?$/.exec(p);
+    const cardRoute = /^\/api\/cards\/([^/]+)(\/(move|events|archive|status|start|park|artifacts|sessions|worker\/signal|worker\/done|worker\/send|worker\/pause))?$/.exec(p);
     if (cardRoute) {
       const card = findCard(decodeURIComponent(cardRoute[1]));
       if (!card) return sendJson(res, 404, { error: 'unknown card: ' + decodeURIComponent(cardRoute[1]) });
       const sub = cardRoute[3];
+      if (sub === 'sessions' && req.method === 'GET') {
+        const w = findWorker(card.id);
+        let live = null;
+        if (w) { try { live = !!(await harnessFor(w.ref).alive(w.ref)); } catch {} }
+        return sendJson(res, 200, { sessions: publicSessions(card), currentSession: card.currentSession,
+          worker: w ? { ...w, live } : null });
+      }
       if (sub === 'start' && req.method === 'POST') { // card.start — the ONE atomic op into Working
-        const r = await startCard(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, card: publicCard(card, 'user'), worker: r.worker, resumed: !!r.resumed });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const from = card.column;
+        const r = await store.mutate(() => workers.start(card, body));
+        if (!r.error) {
+          if (from !== card.column) emitPlugins('card-moved', { card, from, to: card.column });
+          emitPlugins('worker-started', { card, worker: r.worker || null, resumed: !!r.resumed });
+        }
+        return respond(res, r, () => ({ ok: true, card: publicCard(card, 'user'), worker: r.worker, resumed: !!r.resumed }));
       }
       if (sub === 'worker/signal' && req.method === 'POST') {
-        const r = workerSignal(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, event: r.event });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => workers.signal(card, body));
+        return respond(res, r, () => ({ ok: true, event: r.event }));
       }
       if (sub === 'worker/send' && req.method === 'POST') {
-        const r = await workerSend(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, event: r.event, session: r.session });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = await store.mutate(() => workers.send(card, body));
+        return respond(res, r, () => ({ ok: true, event: r.event, session: r.session }));
       }
       if (sub === 'worker/pause' && req.method === 'POST') {
-        const r = await pauseWorker(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, event: r.event, session: r.session,
-          parked: r.parked, parkError: r.parkError, card: publicCard(card, 'user') });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const from = card.column;
+        const r = await store.mutate(() => workers.pause(card, body));
+        if (!r.error && from !== card.column) emitPlugins('card-moved', { card, from, to: card.column });
+        return respond(res, r, () => ({ ok: true, event: r.event, session: r.session,
+          parked: r.parked, parkError: r.parkError, card: publicCard(card, 'user') }));
       }
       if (sub === 'park' && req.method === 'POST') {
-        const r = await parkCard(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, event: r.event, card: publicCard(card, 'user') });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const from = card.column;
+        const r = await store.mutate(() => workers.park(card, body));
+        if (!r.error && from !== card.column) emitPlugins('card-moved', { card, from, to: card.column });
+        return respond(res, r, () => ({ ok: true, event: r.event, card: publicCard(card, 'user') }));
       }
       if (sub === 'worker/done' && req.method === 'POST') {
-        const r = workerDone(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, 400, { error: r.error });
-        saveBoard(); broadcast();
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => workers.done(card, body));
+        if (r.error) return respond(res, r);
         // The worktree STAYS: done hands the card to its lieutenant, whose first
         // job is to read the diff in it. It goes at the handoff (the move out of
         // Working), not here.
@@ -4908,65 +3462,33 @@ const server = http.createServer(async (req, res) => {
       }
       if (!sub && req.method === 'GET') {
         const pc = publicCard(card, url.searchParams.get('user') || 'user');
-        pc.status = await statusWithLiveness(card, pc.status);
+        pc.status = await workers.withLiveness(card, pc.status);
         return sendJson(res, 200, pc);
       }
       if (!sub && req.method === 'PATCH') {
-        const r = patchCard(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, card: publicCard(card, 'user') });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => patchCard(card, body));
+        return respond(res, r, () => ({ ok: true, card: publicCard(card, 'user') }));
       }
       if (sub === 'status' && req.method === 'POST') { // status.set(card, worker{id, state}, ttl?)
-        const r = setStatus(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, status: cardStatus(card, 'user') });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => setStatus(card, body));
+        return respond(res, r, () => ({ ok: true, status: cardStatus(card, 'user') }));
       }
       if (sub === 'move' && req.method === 'POST') {
         const wasWorking = card.column === 'working';
-        const w = findWorker(card.id);
-        const r = moveCard(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        // The handoff IS the end of the work: the lieutenant has read the diff
-        // and the card left Working, so the worktree goes back. A worker that
-        // has not reported done keeps its checkout — a card moved out from under
-        // a live or crashed worker is the one case where that directory is still
-        // the only copy of anything.
-        //
-        // NOT awaited. The release queues behind the per-clone lock, which a
-        // concurrent `card start` holds across `git fetch` + `git worktree add`
-        // — seconds, minutes on a big repo — and the move used to sit there with
-        // it while the card stayed visibly in Working. The move answers as soon
-        // as the card has left; the release lands on the timeline when it lands,
-        // and its own saveBoard/broadcast carries it (including a refusal) to
-        // every screen. Same shape archive already uses.
-        if (wasWorking && card.column !== 'working' && (!w || w.done)) {
-          // The worker dies first and the ground goes after it: the kill is a
-          // tmux window closing (fast), while the release queues behind the
-          // per-clone lock and a playbook's teardown — minutes, on a bad day.
-          // Chained so the timeline reads in that order; neither ever throws.
-          killCardWorker(card, w, { honorKeep: true, reason: 'the handoff — the card left Working' })
-            .then(async (kill) => {
-              // Read BEFORE the release: a landed one deletes the pointer.
-              const ground = !!((w && w.worktree && w.worktree.path)
-                || (card.attributes && card.attributes.worktree));
-              const rel = await releaseCardWorktree(card, w, { honorKeep: true });
-              // A release that REFUSED leaves work standing on that checkout,
-              // and its teardown unspent. Keep the record — archive is the next
-              // release point and reads it there. So does a release that could
-              // not RUN (no clone to release against, or it threw): `not
-              // released` means exactly that, and only a positive signal is
-              // proof the ground went. The one drop without that proof is the
-              // worker that had no ground to begin with — there is nothing left
-              // for its record to be the handle for.
-              if (kill && kill.killed && ((rel && rel.released) || !ground)) dropWorkerRecord(card, w);
-            })
-            .catch((e) => console.error(now() + ' handoff teardown for ' + card.id
-              + ' failed: ' + String((e && e.message) || e)));
+        const body = JSON.parse(await readBody(req) || '{}');
+        const from = card.column;
+        const r = store.mutate(() => moveCard(card, body));
+        if (!r.error && from !== card.column) emitPlugins('card-moved', { card, from, to: card.column });
+        // The handoff IS the end of the worker (workers.end: kill, then release,
+        // with its exceptions). NOT awaited: the release queues behind the clone
+        // lock and a teardown, and lands on the timeline when it lands.
+        if (!r.error && wasWorking && card.column !== 'working') {
+          workers.end(card, 'handoff').catch((e) => console.error(now() + ' handoff teardown for ' + card.id
+            + ' failed: ' + String((e && e.message) || e)));
         }
-        saveBoard(); broadcast();
-        return sendJson(res, 200, r);
+        return respond(res, r);
       }
       if (sub === 'events' && req.method === 'POST') {
         const body = JSON.parse(await readBody(req) || '{}');
@@ -4981,7 +3503,7 @@ const server = http.createServer(async (req, res) => {
         // Write-ahead, then the live board — the order queuePush itself keeps.
         // The append is the step that can throw, and a throw before the push
         // must leave NOTHING behind in the board object for somebody else's
-        // saveBoard to write out later: the caller was told nothing happened,
+        // save to write out later: the caller was told nothing happened,
         // so a phantom entry surfacing on the next unrelated save is the one
         // duplicate --key was never meant to buy. mkEvent has already spent a
         // board.seq by then, which costs nothing — seq is monotonic, not dense.
@@ -5001,58 +3523,34 @@ const server = http.createServer(async (req, res) => {
             { kind: 'card-event', card: card.id, eventKind: ev.kind || null, text: ev.text },
             source ? { source } : {}));
         }
-        card.events.push(ev);
-        card.updated = now();
-        saveBoard();
+        store.pushCardEvent(card, ev);
+        store.commit();
         // Only now: the entry is on the card and the queue item is written, so
         // this key really has been said.
         if (key) claimEventKey(card.id, key);
-        broadcast();
         return sendJson(res, 200, { ok: true, event: ev });
       }
       if (sub === 'archive' && req.method === 'POST') {
-        const w = findWorker(card.id); // captured BEFORE the detached chain below drops the registry entry
-        // The address goes onto the card BEFORE archiveCard freezes the
-        // snapshot: the drop below is detached and lands long after, when the
-        // card is off the board and there is nothing left to stamp. The frozen
-        // record is the only place the transcript stays findable.
-        stampWorkerAddress(card, w);
-        const r = archiveCard(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, 400, { error: r.error });
-        saveBoard(); broadcast();
-        // Hooks first, then the release — the ordering guarantee: a hook may
-        // still need paths inside $BC_WORKTREE. The card is gone, so nothing
-        // is ever kept here; a worktree already released at the handoff is a
-        // no-op, and an unclean one stays exactly where it is.
-        // The kill first — it is fast and it is what an archived card must not
-        // keep — then the hooks (which may still need paths inside
-        // $BC_WORKTREE), then the release. `keep_worktree` buys nothing here:
-        // the card is gone, there is nothing left to rework.
-        killCardWorker(card, w, { reason: 'the card was archived' })
-          .then(async (kill) => {
-            await fireHooks('card-archived', card, w, { boardLevel: true });
-            await releaseCardWorktree(card, w);
-            // Last release point there will ever be: the record has nothing
-            // left to be the handle FOR, refused release or not.
-            if (kill && kill.killed) dropWorkerRecord(card, w);
-          })
-          .catch((e) => console.error(now() + ' archive teardown for ' + card.id
-            + ' failed: ' + String((e && e.message) || e)));
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => archiveCard(card, body));
+        if (r.error) return respond(res, r);
+        // Kill, card-archived hooks, release (keep_worktree buys nothing: the
+        // card is gone) — detached, like the handoff.
+        workers.end(card, 'archive').catch((e) => console.error(now() + ' archive teardown for ' + card.id
+          + ' failed: ' + String((e && e.message) || e)));
         return sendJson(res, 200, r);
       }
       // promote-to-artifact — the deliberate tool. POST adds, DELETE removes an
       // entry on card.attributes.artifacts. A chat upload alone never lands here.
       if (sub === 'artifacts' && req.method === 'POST') {
-        const r = cardArtifactAdd(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, artifact: r.artifact, card: publicCard(card, 'user') });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => cardArtifactAdd(card, body));
+        return respond(res, r, () => ({ ok: true, artifact: r.artifact, card: publicCard(card, 'user') }));
       }
       if (sub === 'artifacts' && req.method === 'DELETE') {
-        const r = cardArtifactRemove(card, JSON.parse(await readBody(req) || '{}'));
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, { ok: true, removed: r.removed, card: publicCard(card, 'user') });
+        const body = JSON.parse(await readBody(req) || '{}');
+        const r = store.mutate(() => cardArtifactRemove(card, body));
+        return respond(res, r, () => ({ ok: true, removed: r.removed, card: publicCard(card, 'user') }));
       }
       return sendJson(res, 405, { error: 'method not allowed' });
     }
@@ -5076,10 +3574,9 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { projects });
     }
     if (route === 'POST /api/projects') {
-      const r = await addProject(JSON.parse(await readBody(req) || '{}'));
-      if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, project: r.project });
+      const body = JSON.parse(await readBody(req) || '{}');
+      const r = await store.mutate(() => addProject(body));
+      return respond(res, r, () => ({ ok: true, project: r.project }));
     }
 
     // ----- playbooks (the card's `playbook` picks one by id) -----
@@ -5163,16 +3660,18 @@ const server = http.createServer(async (req, res) => {
     }
     if (route === 'POST /api/schedules') {
       const body = JSON.parse(await readBody(req) || '{}');
-      const v = validateSchedule(body);
-      if (v.error) return sendJson(res, v.status || 400, { error: v.error });
-      board.schedules.push(v.schedule);
-      board.events.push(mkEvent({
-        text: 'schedule ' + v.schedule.name + ' added — hook ' + v.schedule.hook + ', '
-          + describeWhenSafe(v.schedule.when) + ', owner ' + v.schedule.owner,
-        actor: String(body.actor || 'agent'), level: 2,
-      }, { kind: 'schedule' }));
-      saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, schedule: publicSchedules().find((s) => s.name === v.schedule.name) });
+      const v = store.mutate(() => {
+        const out = validateSchedule(body);
+        if (out.error) return out;
+        board.schedules.push(out.schedule);
+        store.boardEvent({
+          text: 'schedule ' + out.schedule.name + ' added — hook ' + out.schedule.hook + ', '
+            + describeWhenSafe(out.schedule.when) + ', owner ' + out.schedule.owner,
+          actor: String(body.actor || 'agent'), level: 2,
+        }, { kind: 'schedule' });
+        return out;
+      });
+      return respond(res, v, () => ({ ok: true, schedule: publicSchedules().find((s) => s.name === v.schedule.name) }));
     }
     const schedRoute = /^\/api\/schedules\/([^/]+)$/.exec(p);
     if (schedRoute) {
@@ -5194,14 +3693,13 @@ const server = http.createServer(async (req, res) => {
         // is paused, not queued, and must not wake up owing sixty windows.
         if (s.paused && !body.paused) s.lastWindow = now();
         s.paused = body.paused;
-        saveBoard(); broadcast();
+        store.commit();
         return sendJson(res, 200, { ok: true, schedule: publicSchedules().find((x) => x.name === name) });
       }
       if (req.method === 'DELETE') {
         board.schedules = board.schedules.filter((x) => x.name !== name);
-        board.events.push(mkEvent({ text: 'schedule ' + name + ' removed', actor: 'agent', level: 2 },
-          { kind: 'schedule' }));
-        saveBoard(); broadcast();
+        store.boardEvent({ text: 'schedule ' + name + ' removed', actor: 'agent', level: 2 }, { kind: 'schedule' });
+        store.commit();
         return sendJson(res, 200, { ok: true });
       }
     }
@@ -5210,9 +3708,8 @@ const server = http.createServer(async (req, res) => {
     if (route === 'POST /api/events') {
       const body = JSON.parse(await readBody(req) || '{}');
       if (!String(body.text || '').trim()) return sendJson(res, 400, { error: 'text required' });
-      const ev = mkEvent(body, { level: 1 });
-      board.events.push(ev);
-      saveBoard(); broadcast();
+      const ev = store.boardEvent(body, { level: 1 });
+      store.commit();
       return sendJson(res, 200, { ok: true, event: ev });
     }
 
@@ -5235,7 +3732,7 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { ok: true, kinds: Object.keys(board.kinds).length, unchanged: true });
       }
       board.kinds = next;
-      saveBoard(); broadcast();
+      store.commit();
       return sendJson(res, 200, { ok: true, kinds: Object.keys(board.kinds).length });
     }
 
@@ -5244,7 +3741,7 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || '{}');
       if (body.title !== undefined) board.title = String(body.title).slice(0, 120);
       if (body.subtitle !== undefined) board.subtitle = String(body.subtitle).slice(0, 300);
-      saveBoard(); broadcast();
+      store.commit();
       return sendJson(res, 200, { ok: true });
     }
 
@@ -5278,9 +3775,9 @@ const server = http.createServer(async (req, res) => {
     // have nothing to page.
     if (route === 'GET /api/chat') {
       const target = String(url.searchParams.get('target') || '');
-      const m = /^lieutenant:(.+)$/.exec(target);
-      if (!m) return sendJson(res, 400, { error: 'target must be lieutenant:<id> (card threads ride the board payload)' });
-      const lt = findLieutenant(m[1]);
+      const t = parseTarget(target);
+      if (!t || t.kind !== 'lieutenant') return sendJson(res, 400, { error: 'target must be lieutenant:<id> (card threads ride the board payload)' });
+      const lt = findLieutenant(t.id);
       if (!lt) return sendJson(res, 404, { error: 'unknown target: ' + target });
       // Only an explicit 0 means the whole conversation; anything unreadable
       // falls back to the default page rather than shipping the entire log.
@@ -5290,112 +3787,34 @@ const server = http.createServer(async (req, res) => {
       const before = String(url.searchParams.get('before') || '');
       return sendJson(res, 200, { target, before: before || null, messages: chatPage(lt.id, before, limit) });
     }
+    // chat.say — both sides go through conversation.say(), which decides the
+    // thread append, the QueueItem (and so the wake) and the line move.
     if (route === 'POST /api/message') { // lieutenant -> captain (chat.say, lieutenant side)
       const body = JSON.parse(await readBody(req) || '{}');
-      const target = String(body.target || '');
-      if (!threadFor(target)) return sendJson(res, 404, { error: 'unknown target: ' + target });
-      const text = String(body.text_md || body.text || '');
-      const attachments = resolveAttachments(body.attachments);
-      if (!text.trim() && !attachments.length) return sendJson(res, 400, { error: 'text or attachments required' });
-      // Default author, most-identified first: explicit body.author; then the
-      // CALLER resolved from its tmux session (like drain/ack — so a lieutenant
-      // posting to another's chat or card is stamped as itself, not the target);
-      // then the target's lieutenant (unidentified callers — the interlocutor
-      // is the owning lieutenant, card threads included).
-      const lt = targetLieutenant(target);
-      const sess = body.session ? String(body.session) : '';
-      const caller = sess ? board.lieutenants.find((l) => l.ref && l.ref.session === sess) : null;
-      const msg = { author: String(body.author || (caller && caller.name) || (lt && lt.name) || 'agent').slice(0, 60), text, ts: now() };
-      if (attachments.length) msg.attachments = attachments;
-      appendMessage(target, msg);
-      const m = /^card:(.+)$/.exec(target);
-      if (m) {
-        const card = findCard(m[1]);
-        if (card) {
-          card.updated = now(); if (!card.threadStart) card.threadStart = msg.ts;
-          // A card-thread say from anyone but the owning lieutenant — its own
-          // worker (whose session resolves to no lieutenant), a peer, raw
-          // tooling — must WAKE the owner: the thread alone notifies nobody.
-          // Default-notify: only a session-identified owner is exempt (author
-          // names can't be trusted — an unidentified worker is stamped with
-          // the owner's name). Captain messages ride /api/feedback, never here.
-          const fromOwner = !!(caller && caller.id === card.owner);
-          if (!fromOwner && msg.author !== 'user') {
-            queuePush(card.owner, { kind: 'worker-said', card: card.id, target, author: msg.author,
-              text: text.slice(0, 2000), attachments });
-          }
-        }
-      } else {
-        // A free-form lieutenant message in its main chat is a level-1 notification.
-        const ev = mkEvent({ text: text.slice(0, 200), actor: msg.author, level: body.level, kind: body.kind }, { level: 1 });
-        board.events.push(ev);
-        // A PEER's message into another lieutenant's main chat must also be
-        // DELIVERED to that lieutenant: the chat append alone notifies nobody
-        // (same rule as the non-owner card-thread say above). Without this,
-        // lieutenant→lieutenant orders sit in the chat unread forever.
-        const fromPeer = !!(caller && lt && caller.id !== lt.id);
-        if (fromPeer) {
-          queuePush(lt.id, { kind: 'peer-message', target, author: msg.author,
-            text: text.slice(0, 4000), attachments });
-        }
-        // …and it is the last voice the captain heard, so the line follows it:
-        // an answer over the line keeps the line, and a lieutenant that speaks
-        // up on its own becomes who he reaches when he answers with the screen
-        // off. Card threads never move it — they are a board surface, read with
-        // eyes on a picker, not the channel with no picker. A peer's post is
-        // the PEER speaking, not the chat's owner — the line must not follow
-        // the silent recipient.
-        if (lt && !fromPeer) lineFollow(lt.id);
-      }
-      saveBoard(); broadcast(); // owed clears on ACK, not here — the reply alone leaves it derived from the queue
-      return sendJson(res, 200, { ok: true });
+      // The caller is resolved from its tmux session + window (like drain/ack),
+      // so a lieutenant speaking elsewhere is stamped as itself and a worker as
+      // `worker <card>` — never as the lieutenant whose session it shares.
+      // owed clears on ACK, not here — the reply alone leaves it derived from the queue
+      const r = store.mutate(() => conversation.say(callerOf(body), String(body.target || ''),
+        String(body.text_md || body.text || ''), resolveAttachments(body.attachments),
+        { author: body.author, level: body.level, kind: body.kind }));
+      return respond(res, r, () => ({ ok: true }));
     }
     if (route === 'POST /api/feedback') { // captain -> lieutenant (chat.say, captain side)
       const body = JSON.parse(await readBody(req) || '{}');
-      let target = String(body.target || '');
-      // `target: "line"` = whoever is on the line. The voice shortcut posts
-      // this and names nobody; the server resolves it to a real main chat, so
-      // everything below is an ordinary captain message — it just knows it
-      // came over the line.
-      const overLine = target === 'line';
-      if (overLine) {
-        const holder = lineHolder().lieutenant;
-        if (!holder) return sendJson(res, 404, { error: 'nobody is on the line — this board has no lieutenant' });
-        target = 'lieutenant:' + holder.id;
-      }
-      if (!threadFor(target)) return sendJson(res, 404, { error: 'unknown target: ' + target });
       const text = String(body.text || '');
       const attachments = resolveAttachments(body.attachments);
-      if (!text.trim() && !attachments.length) return sendJson(res, 400, { error: 'text or attachments required' });
       // A bare "/command" (no attachments riding along) is a slash command,
       // not a say: it routes to the target harness's runCommand and both the
       // command and its reply land in the thread — no QueueItem, no wake.
       if (text.trim().startsWith('/') && !attachments.length) {
-        const r = await runChatCommand(target, text.trim());
-        if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-        saveBoard(); broadcast();
-        return sendJson(res, 200, r);
+        const t = conversation.captainTarget(body.target); // `line` = whoever holds it
+        if (t.error) return respond(res, t);
+        return respond(res, await store.mutate(() => runChatCommand(t.target, text.trim())));
       }
-      const lt = targetLieutenant(target);
-      if (!lt) return sendJson(res, 404, { error: 'no lieutenant behind target: ' + target });
-      // Write-ahead delivery: the QueueItem lands FIRST; the send-keys wake half
-      // of delivery arrives in a later phase. A dead session loses nothing. The
-      // attachments (with absolute paths) ride the queue item so drain surfaces
-      // the file paths to the agent.
-      // `via: 'line'` rides the ENVELOPE, never the captain's words: a lieutenant
-      // that reads channel information back to him got it glued into the text.
-      const item = queuePush(lt.id, Object.assign({ kind: 'message', target, text, attachments },
-        overLine ? { via: 'line' } : null));
-      const msg = { author: 'user', text, ts: now() };
-      if (attachments.length) msg.attachments = attachments;
-      appendMessage(target, msg);
-      const m = /^card:(.+)$/.exec(target);
-      if (m) {
-        const card = findCard(m[1]);
-        if (card) { card.updated = now(); if (!card.threadStart) card.threadStart = msg.ts; }
-      }
-      saveBoard(); broadcast(); // a captain message flips derived owed via broadcast
-      return sendJson(res, 200, { ok: true, seq: item.seq, target, via: overLine ? 'line' : undefined });
+      // a captain message flips derived owed via the broadcast
+      const r = store.mutate(() => conversation.say(CAPTAIN, String(body.target || ''), text, attachments));
+      return respond(res, r, () => ({ ok: true, seq: r.item.seq, target: r.target, via: r.via }));
     }
 
     // ----- the line -----
@@ -5406,23 +3825,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (route === 'POST /api/line') { // line.pass — a DELIVERY, not a quiet flag flip
       const body = JSON.parse(await readBody(req) || '{}');
-      const id = String(body.lieutenant || '').trim();
-      const lt = findLieutenant(id);
-      if (!lt) return sendJson(res, 404, { error: 'unknown lieutenant: ' + (id || '(none)') });
-      const note = String(body.note || '').trim().slice(0, 2000);
       // Who is handing it over: explicit actor, else the CALLER resolved from
-      // its tmux session (like say/drain/ack), else the captain.
-      const sess = body.session ? String(body.session) : '';
-      const caller = sess ? board.lieutenants.find((l) => l.ref && l.ref.session === sess) : null;
-      const from = String(body.actor || (caller && caller.name) || 'user').trim().slice(0, 60);
-      board.line = lt.id;
-      // The receiver finds out because it was TOLD — same durable queue as
-      // everything else, so it wakes and greets him in its own voice.
-      const item = queuePush(lt.id, { kind: 'line-passed', from, text: note });
-      board.events.push(mkEvent({ text: 'the line passed to ' + lt.name + (note ? ': ' + note : ''),
-        actor: from, kind: 'line' }, {}));
-      saveBoard(); broadcast();
-      return sendJson(res, 200, { ok: true, lieutenant: lt.id, name: lt.name, seq: item.seq });
+      // its tmux session + window (like say/drain/ack), else the captain.
+      const r = store.mutate(() => conversation.pass(callerOf(body), body.lieutenant, body.note, { actor: body.actor }));
+      return respond(res, r, () => ({ ok: true, lieutenant: r.lt.id, name: r.lt.name, seq: r.item.seq }));
     }
 
     // ----- read state (persisted server-side, per user) -----
@@ -5445,7 +3851,7 @@ const server = http.createServer(async (req, res) => {
       else if (Array.isArray(body.seqs)) {
         for (const s of body.seqs) if (Number.isInteger(s) && s > r.notifSeq && !r.notifSeqs.includes(s)) r.notifSeqs.push(s);
       }
-      saveBoard(); broadcast();
+      store.commit();
       return sendJson(res, 200, { ok: true });
     }
     if (route === 'POST /api/read') { // thread read marker: {user?, target, ts?}
@@ -5459,7 +3865,7 @@ const server = http.createServer(async (req, res) => {
       // unified stream fires one POST per viewed thread per device — full
       // board pushes here burst every SSE client. Other devices of the same
       // user converge on the next real broadcast.
-      saveBoard();
+      store.save();
       return sendJson(res, 200, { ok: true });
     }
 
@@ -5500,40 +3906,36 @@ const server = http.createServer(async (req, res) => {
       } else {
         return sendJson(res, 400, { error: 'expected create|rename|recolor|delete' });
       }
-      saveBoard(); broadcast();
+      store.commit();
       return sendJson(res, 200, { ok: true, labels: board.labels });
     }
 
     // ----- feed.drain: pending QueueItems past the committed ack cursor -----
+    // Each item goes out with its `head` and `hint` (feedtext.js), rendered
+    // against the card as it stands now; the stored item is never touched.
     if (route === 'GET /api/feed') {
+      const served = (items) => items.map((it) => Object.assign({}, it, feedtext.describe(it, findCard)));
       let lt = url.searchParams.get('lieutenant') || '';
       const sess = url.searchParams.get('session') || '';
       // Session-scoped drain: a lieutenant identifies itself by its tmux session
-      // so it drains ONLY its own queue — the fix for cross-lieutenant drain. A
-      // registered lieutenant always resolves here; an unresolved session (a
-      // non-lieutenant caller, or a stale ref) falls back to unscoped behavior
-      // rather than erroring, so tooling and peeks keep working.
+      // so it drains ONLY its own queue — the fix for cross-lieutenant drain.
       if (lt && !findLieutenant(lt)) return sendJson(res, 404, { error: 'unknown lieutenant: ' + lt });
       if (!lt && sess) {
-        const owner = board.lieutenants.find((l) => l.ref && l.ref.session === sess);
-        // A session-identified caller drains ONLY its own queue. If the session
-        // resolves to no lieutenant (a worker, a stale ref, a non-lieutenant
-        // tmux), return nothing — draining every queue here is exactly what let
-        // a non-owner ack-wipe another lieutenant's items.
-        if (!owner) return sendJson(res, 200, { items: [], head: qseq });
+        const who = callerOf({ session: sess, window: url.searchParams.get('window') });
+        const owner = who.kind === 'lieutenant' ? who.lt : null;
+        // A session that resolves to no lieutenant (a worker, a stale ref, a
+        // non-lieutenant tmux) gets nothing — draining every queue here is
+        // exactly what let a non-owner ack-wipe another lieutenant's items.
+        if (!owner) return sendJson(res, 200, { items: [], head: delivery.head() });
         lt = owner.id;
       }
-      // A drain clears the nudged flag: the next append (or a turn-end with
-      // still-unacked items) wakes again. Only a truly unidentified caller
-      // (no lieutenant, no session — raw tooling) drains all queues.
-      if (lt) nudged.delete(lt); else nudged.clear();
-      const items = drainItems(lt);
-      // Draining is SEEING: advance the lieutenant's durable drained cursor to
-      // the highest seq just served, and let the UI flip queued→seen. Only an
-      // identified drain advances — an unscoped all-queues drain is raw tooling
-      // peeking, not a lieutenant starting its turn.
-      if (lt && items.length && advanceDrained(lt, items[items.length - 1].seq)) broadcast();
-      return sendJson(res, 200, { items, head: qseq });
+      // No identity at all (raw tooling): a read-only peek at every queue. It is
+      // not a lieutenant starting its turn, so no wake flag or cursor moves.
+      if (!lt) return sendJson(res, 200, { items: served(delivery.pending()), head: delivery.head() });
+      // Draining is SEEING: the drained cursor moves, the UI flips queued→seen.
+      const r = delivery.drain(lt);
+      if (r.seen) broadcast();
+      return sendJson(res, 200, { items: served(r.items), head: delivery.head() });
     }
 
     // ----- feed.ack: commit the cursor AFTER the items were handled -----
@@ -5541,15 +3943,25 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req) || '{}');
       const seq = parseInt(body.seq, 10);
       if (!Number.isInteger(seq) || seq < 0) return sendJson(res, 400, { error: 'seq required (integer)' });
-      // Identity-scoped ack: a lieutenant commits only within its own queue.
+      // Identity-scoped ack: a lieutenant commits only within its own queue,
+      // and an ack nobody can attribute is refused — it could discard any
+      // lieutenant's pending items. Only a one-lieutenant board is unambiguous.
       let ackOwner = body.lieutenant || '';
+      if (ackOwner && !findLieutenant(ackOwner)) return sendJson(res, 404, { error: 'unknown lieutenant: ' + ackOwner });
       if (!ackOwner && body.session) {
-        const owner = board.lieutenants.find((l) => l.ref && l.ref.session === body.session);
-        if (owner) ackOwner = owner.id;
+        const who = callerOf(body);
+        // A worker shares its lieutenant's session but owns no queue: unscoped,
+        // its ack could commit (and so discard) the lieutenant's pending items.
+        if (who.kind === 'worker') return sendJson(res, 409, { error: 'a worker has no delivery queue — acks belong to its lieutenant' });
+        if (who.kind !== 'lieutenant') return sendJson(res, 403, { error: 'session ' + body.session + ' is not a lieutenant — ack refused' });
+        ackOwner = who.lt.id;
       }
-      const r = commitAck(seq, ackOwner || null);
+      if (!ackOwner && board.lieutenants.length === 1) ackOwner = board.lieutenants[0].id;
+      if (!ackOwner) {
+        return sendJson(res, 400, { error: 'ack needs an identity: run it in your lieutenant session, or pass --lieutenant <id>' });
+      }
+      const r = delivery.ack(ackOwner, seq);
       if (r.error) return sendJson(res, r.code || 400, { error: r.error });
-      nudged.delete(r.lieutenant); // handled: a fresh append nudges anew
       broadcast(); // the ack advances the seen cursor too (drain normally beat it here)
       return sendJson(res, 200, r);
     }
@@ -5593,14 +4005,25 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true });
     }
 
+    // ----- interrupt (⏹ — stop the agent's running turn, like Esc in its terminal) -----
+    // The card target is its live WORKER, never a sibling pane window.
+    // 404 nothing to stop, 409 idle or no live session, 501 the harness cannot, 502 it refused.
+    const interruptRoute = /^\/api\/(cards|lieutenants)\/([^/]+)\/interrupt$/.exec(p);
+    if (interruptRoute && req.method === 'POST') {
+      const body = JSON.parse(await readBody(req) || '{}');
+      const r = await interruptAgent(interruptRoute[1], decodeURIComponent(interruptRoute[2]),
+        String(body.actor || 'user').slice(0, 60));
+      return sendJson(res, r.code, r.body);
+    }
+
     // ----- sysload stream (⚙️ → monitoring; see the sysload section above) -----
     // The HTTP connection's lifetime IS the subscription, exactly like the
     // pane streams: connect to watch, disconnect to release. Each sample lands
     // as one `sample` event; samples flow every ~2s, so no extra ping rides here.
     if (route === 'GET /api/sysload/stream') {
-      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+      res.writeHead(200, SSE_HEADERS);
       const unsubscribe = sysload.subscribe((sample) => {
-        res.write('event: sample\ndata: ' + JSON.stringify(sample) + '\n\n');
+        res.write(sseFrame('sample', sample));
       });
       req.on('close', unsubscribe);
       return;
@@ -5608,8 +4031,8 @@ const server = http.createServer(async (req, res) => {
 
     // ----- SSE -----
     if (route === 'GET /api/events') {
-      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-      res.write('event: board\ndata: ' + JSON.stringify(publicBoard('user')) + '\n\n');
+      res.writeHead(200, SSE_HEADERS);
+      res.write(SSE_RETRY + sseFrame('board', publicBoard('user')));
       sseClients.add(res);
       req.on('close', () => sseClients.delete(res));
       return;
@@ -5617,7 +4040,10 @@ const server = http.createServer(async (req, res) => {
 
     sendJson(res, 404, { error: 'not found' });
   } catch (e) {
-    sendJson(res, 400, { error: String(e.message || e) });
+    // A malformed body (JSON) or URL escape is the caller's fault; anything else,
+    // e.g. the board save failing on disk, is ours and must not read as a bad request.
+    const code = e instanceof SyntaxError || e instanceof URIError ? 400 : 500;
+    sendJson(res, code, { error: String(e.message || e) });
   }
 });
 
@@ -5626,11 +4052,7 @@ const server = http.createServer(async (req, res) => {
 // with no upgrade handler does anyway.
 function onUpgrade(req, socket, head) {
   const u = new URL(req.url, 'http://localhost');
-  const p = u.pathname;
-  if (p === STT_PREFIX || p.startsWith(STT_PREFIX + '/')) {
-    const t = sttConfig();
-    if (t) return proxySttUpgrade(req, socket, head, t.url, p.slice(STT_PREFIX.length) + u.search);
-  }
+  if (sttProxy.upgrade(req, socket, head, u.pathname, u.search)) return;
   socket.destroy();
 }
 server.on('upgrade', onUpgrade);
@@ -5641,7 +4063,7 @@ server.listen(PORT, BIND_HOST, () => {
     ' workspace=' + WORKSPACE + ' pid=' + process.pid);
   // A worker outlives neither its card's Working state nor a board restart that
   // forgot to notice. Off the critical path of the boot, and it never throws.
-  sweepStaleWorkers().catch((e) => console.error(now() + ' worker sweep failed: ' + String((e && e.message) || e)));
+  workers.sweep().catch((e) => console.error(now() + ' worker sweep failed: ' + String((e && e.message) || e)));
 });
 // Non-loopback bind: also listen on loopback so local CLI/UI keep working.
 if (!LOOPBACKS.includes(BIND_HOST) && BIND_HOST !== '0.0.0.0') {

@@ -12,6 +12,17 @@ const { execFile } = require('node:child_process');
 
 const RELAY = path.join(__dirname, '..', 'codex-notify.js');
 
+// The relay only trusts a thread that has a rollout (codex's side threads have
+// none), so the conversations these tests speak for get one.
+const SESSIONS = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-codex-sessions-'));
+process.env.BC_CODEX_SESSIONS_DIR = SESSIONS;
+function rollout(threadId) {
+  const day = path.join(SESSIONS, '2026', '09', '28');
+  fs.mkdirSync(day, { recursive: true });
+  fs.writeFileSync(path.join(day, 'rollout-2026-09-28T08-00-00-' + threadId + '.jsonl'), '');
+}
+for (const id of ['019f49a7-81f4-7ad3-822d-3acf8cf81ed6', 'fresh-thread-id']) rollout(id);
+
 function runRelay(args, env = {}) {
   return new Promise((resolve, reject) => {
     execFile('node', [RELAY, ...args], { encoding: 'utf8', env: { ...process.env, ...env } },
@@ -48,6 +59,7 @@ test('codex-notify normalizes agent-turn-complete into the claude-relay event sh
     assert.strictEqual(ev.cwd, '/abs/worktree');
     assert.ok(typeof ev.ts === 'string' && !Number.isNaN(Date.parse(ev.ts)), 'ts is a timestamp');
     assert.ok('tmux_session' in ev, 'tmux_session present (may be empty outside tmux)');
+    assert.strictEqual(ev.text, 'PONG', 'the last assistant message rides along for the stall alert');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -114,6 +126,7 @@ test('codex-notify POSTs the event to the url argv (and still writes files)', as
     assert.strictEqual(got[0].body.session, 'bc-x4');
     assert.strictEqual(got[0].body.session_id, '019f49a7-81f4-7ad3-822d-3acf8cf81ed6');
     assert.strictEqual(got[0].body.event, 'turn-end');
+    assert.strictEqual(got[0].body.text, 'PONG', 'the server reads body.text for the stall alert');
     assert.ok(fs.existsSync(path.join(dir, 'bc-x4.turnend.jsonl')), 'marker file written too');
   } finally {
     server.close();
@@ -130,4 +143,31 @@ test('codex-notify survives an unreachable callback url (files written, exit 0)'
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('codex-notify trims and caps the text, and omits it when codex said nothing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-codex-notify-'));
+  try {
+    await runRelay([dir, 'bc-x6', payload({ 'last-assistant-message': '  ' + 'y'.repeat(400) + '\n' })]);
+    await runRelay([dir, 'bc-x6', payload({ 'last-assistant-message': '   ' })]);
+    await runRelay([dir, 'bc-x6', payload({ 'last-assistant-message': null })]);
+    const evs = fs.readFileSync(path.join(dir, 'bc-x6.turnend.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    assert.strictEqual(evs[0].text, 'y'.repeat(300));
+    assert.ok(!('text' in evs[1]) && !('text' in evs[2]), 'no text key when there is nothing to quote');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('codex-notify ignores a side thread with no rollout (the task-title thread)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-codex-notify-'));
+  try {
+    await runRelay([dir, 'bc-x9', payload()]);
+    await runRelay([dir, 'bc-x9', payload({ 'thread-id': 'title-thread-id',
+      'input-messages': ['Generate a concise, single-line task title'], 'last-assistant-message': '{"title":"x"}' })]);
+    assert.strictEqual(fs.readFileSync(path.join(dir, 'bc-x9.session-id'), 'utf8'),
+      '019f49a7-81f4-7ad3-822d-3acf8cf81ed6\n', 'the conversation keeps its resume id');
+    const lines = fs.readFileSync(path.join(dir, 'bc-x9.turnend.jsonl'), 'utf8').trim().split('\n');
+    assert.strictEqual(lines.length, 1, 'no turn-end for the side thread');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

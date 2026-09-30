@@ -7,7 +7,8 @@
 // is on screen while selection mode is off, and so the decisions below (what
 // labels a card ends up with, what refuses to archive, what the report says)
 // are plain functions a unit test can import.
-import { cards, columns, cardStatus, cardVisible, card, workerFor, render } from './state.js';
+import { S, cards, columns, cardVisible, card, render } from './state.js';
+import { cardFacts } from './cardview.js';
 import { api } from './api.js';
 import { push as toast } from './toast.js';
 import { selectionOn, selectedIds, selCount, exitSelection, reconcile } from './selection.js';
@@ -25,18 +26,12 @@ export function labelsAfter(labels, add, remove) {
   return out;
 }
 
-// A card with a live worker is not archivable: archiving kills that session and
-// drops its worktree binding. The question is asked of the WORKER REGISTRY
-// (board.workers, via workerFor) — the same record the server consults before it
-// kills anything, and an entry with done !== true is live work. card.status is
-// only an advisory lease that nothing but POST /api/cards/:id/status writes, so
-// its `absent` is evidence of nothing; it is asked second, never alone.
-// null = go ahead.
+// A card with a live worker is not archivable. The rule is cardFacts.canArchive
+// (cardview.js) — the same one the move menu's archive asks — so the bar and
+// the menu can never disagree. null = go ahead.
 export function archiveRefusal(c) {
-  const w = workerFor(c.id);
-  if (w && w.done !== true) return 'live worker' + (w.branch ? ' on ' + w.branch : '');
-  const lease = cardStatus(c).worker;
-  return lease && lease.state && lease.state !== 'absent' ? 'worker ' + lease.state : null;
+  const v = cardFacts(c, S.doc).canArchive;
+  return v.ok ? null : v.reason;
 }
 // what "archive the selection" will actually do, before it happens
 export function archivePlan(list) {

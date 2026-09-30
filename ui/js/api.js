@@ -1,9 +1,12 @@
 // server API — every captain-side write goes through here with actor "user"
-async function j(method, url, body) {
+// `timeoutMs` aborts a request that hangs, so a caller that chains requests is
+// never wedged behind one.
+async function j(method, url, body, timeoutMs) {
   const r = await fetch(url, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : {},
     body: body ? JSON.stringify(body) : undefined,
+    signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined,
   });
   if (!r.ok) {
     // The status and the parsed body ride on the error: a 409 from the artifact
@@ -36,6 +39,7 @@ export const api = {
   clientId: CLIENT_ID,
   createLieutenant: (lt) => j('POST', '/api/lieutenants', Object.assign({ actor: 'user' }, lt)),
   updateLieutenant: (id, patch) => j('PATCH', '/api/lieutenants/' + encodeURIComponent(id), patch),
+  harnessModels: (name) => j('GET', '/api/harnesses/' + encodeURIComponent(name) + '/models', undefined, 5000),
   retireLieutenant: (id) => j('DELETE', '/api/lieutenants/' + encodeURIComponent(id), { actor: 'user' }),
   createCard: (card) => j('POST', '/api/cards', Object.assign({ actor: 'user' }, card)),
   // A captain move may come back as {ordered: 'start-order'|'rework-order'}
@@ -50,6 +54,7 @@ export const api = {
     j('POST', '/api/cards/' + encodeURIComponent(id) + '/move',
       Object.assign({ column, actor: 'user' }, text ? { text } : {}))),
   patchCard: (id, patch) => j('PATCH', '/api/cards/' + encodeURIComponent(id), patch),
+  sessionStatus: (id) => j('GET', '/api/cards/' + encodeURIComponent(id) + '/sessions', undefined, 5000),
   archiveCard: (id, reason) => j('POST', '/api/cards/' + encodeURIComponent(id) + '/archive', { actor: 'user', reason }),
   feedback: (target, text, attachments) => j('POST', '/api/feedback',
     Object.assign({ target, text }, attachments && attachments.length ? { attachments } : {})),
@@ -70,6 +75,10 @@ export const api = {
   addArtifact: (id, uri, label) => j('POST', '/api/cards/' + encodeURIComponent(id) + '/artifacts',
     Object.assign({ uri, actor: 'user' }, label ? { label } : {})),
   removeArtifact: (id, uri) => j('DELETE', '/api/cards/' + encodeURIComponent(id) + '/artifacts', { uri, actor: 'user' }),
+  // answer an agent's held permission prompt; the item leaves the board payload
+  // on the next broadcast. `message` only rides a deny.
+  decidePermission: (id, decision, message) => j('POST', '/api/permission/' + encodeURIComponent(id) + '/decide',
+    Object.assign({ decision }, message ? { message } : {})),
   markNotifRead: (seqs) => j('POST', '/api/notifications/read', { user: 'user', seqs }),
   markAllNotifRead: () => j('POST', '/api/notifications/read', { user: 'user', all: true }),
   markThreadRead: (target) => j('POST', '/api/read', { user: 'user', target }),
@@ -114,6 +123,12 @@ export const api = {
   addSchedule: (s) => j('POST', '/api/schedules', Object.assign({ actor: 'user' }, s)),
   pauseSchedule: (name, paused) => j('PATCH', '/api/schedules/' + encodeURIComponent(name), { paused }),
   removeSchedule: (name) => j('DELETE', '/api/schedules/' + encodeURIComponent(name)),
+  // a keystroke into a live pane. `url` is the pane's own input door (pane.js
+  // builds it with the window query), bounded so a stalled key cannot wedge
+  // the ones queued behind it.
+  // stop the agent's running turn (⏹ / Esc); kind is 'cards' or 'lieutenants'
+  interrupt: (kind, id) => j('POST', '/api/' + kind + '/' + encodeURIComponent(id) + '/interrupt', { actor: 'user' }),
+  paneInput: (url, payload, timeoutMs) => j('POST', url, payload, timeoutMs),
   // slash commands the current chat target's harness answers (composer autocomplete)
   commands: (target) => j('GET', '/api/commands?target=' + encodeURIComponent(target)),
 };

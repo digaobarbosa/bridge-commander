@@ -1,0 +1,8 @@
+{
+  "id": "claude",
+  "name": "Claude Code",
+  "description": "The claude profile of the tmux adapter family (harness/claude-tmux.js).",
+  "contributes": {
+    "profiles": [{ "name": "claude", "builtin": true }]
+  }
+}

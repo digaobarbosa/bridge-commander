@@ -1,0 +1,12 @@
+{
+  "id": "alpha",
+  "name": "Alpha",
+  "activation": "boot",
+  "server": "server.js",
+  "config": { "greeting": { "type": "string", "default": "hi" } },
+  "contributes": {
+    "commands": [{ "id": "alpha.go", "title": "Go", "run": "server", "prepare": "server" }],
+    "menus": { "card.menu/v1": [{ "command": "alpha.go", "when": { "card.column": { "$in": ["working", "review"] } } }] },
+    "badges": [{ "id": "flag", "text": "A", "when": { "card.labels": "alpha" } }]
+  }
+}

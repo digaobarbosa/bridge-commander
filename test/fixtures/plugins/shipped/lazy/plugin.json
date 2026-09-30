@@ -1,0 +1,7 @@
+{
+  "id": "lazy",
+  "server": "server.js",
+  "contributes": {
+    "commands": [{ "id": "lazy.hi", "title": "Hi", "run": "server" }]
+  }
+}

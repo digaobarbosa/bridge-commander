@@ -84,16 +84,11 @@ test('readProcTable + descendants: fabricated tree walks transitively', () => {
 
 // ---------- sampler ----------
 
-// exec stub: tmux answers with the given pane lines; docker answers (or rejects).
-function execStub({ panes = {}, docker = null } = {}) {
+// exec stub: docker answers (or rejects). The sampler runs nothing else.
+function execStub({ docker = null } = {}) {
   const calls = [];
   const fn = (cmd, args) => {
     calls.push([cmd, ...args]);
-    if (cmd === 'tmux') {
-      const session = args[args.indexOf('-t') + 1];
-      if (panes[session]) return Promise.resolve(panes[session]);
-      return Promise.reject(new Error('no server running'));
-    }
     if (cmd === 'docker') {
       if (docker === null) return Promise.reject(new Error('docker: not found'));
       return Promise.resolve(docker);
@@ -125,12 +120,14 @@ test('sampler: machine + per-entity CPU/RSS from two samples, heaviest first', a
       102: { ppid: 101, ticks: 100, rssKb: 3000 },
       200: { ppid: 1, ticks: 100, rssKb: 500 },
     } });
-    const exec = execStub({
-      panes: { 'bc-x-lt-ada': 'main\t200\nw-c1\t100\n' },
-      docker: 'abc\ndef\n',
-    });
+    const exec = execStub({ docker: 'abc\ndef\n' });
+    const asked = [];
     const sampler = createSampler({
       procRoot: dir, diskPath: '/', statfs: STATFS, execFileImpl: exec, intervalMs: 40,
+      panePids: async (t) => {
+        asked.push(t.session);
+        return t.session === 'bc-x-lt-ada' ? [{ window: 'main', pid: 200 }, { window: 'w-c1', pid: 100 }] : [];
+      },
       targets: () => [
         { kind: 'worker', id: 'c1', label: 'Card One', session: 'bc-x-lt-ada', window: 'w-c1' },
         { kind: 'lieutenant', id: 'ada', label: 'Ada', session: 'bc-x-lt-ada', window: null },
@@ -174,21 +171,26 @@ test('sampler: machine + per-entity CPU/RSS from two samples, heaviest first', a
     assert.equal(lt.rssBytes, 500 * 1024);
     assert.ok(worker.cpuPct > lt.cpuPct, 'heaviest first');
     assert.equal(s2.entities[0].kind, 'worker'); // sorted heaviest-first
+    assert.deepEqual(asked, ['bc-x-lt-ada', 'bc-x-lt-ada'], 'one lookup per session per sample');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('sampler: docker absent → containers null; tmux gone → no entities, no crash', async () => {
+test('sampler: docker absent → containers null; no panes → no entities, no crash', async () => {
   const dir = tmpProc();
   try {
-    writeProc(dir, { pids: {} });
-    const sampler = createSampler({
-      procRoot: dir, statfs: STATFS, intervalMs: 40,
-      execFileImpl: execStub({ panes: {}, docker: null }),
-      targets: () => [{ kind: 'lieutenant', id: 'ada', label: 'Ada', session: 'bc-gone', window: null }],
-    });
-    const [s] = await collectSamples(sampler, 1);
-    assert.equal(s.containers, null);
-    assert.deepEqual(s.entities, []);
+    writeProc(dir, { pids: { 100: { ppid: 1, ticks: 1 } } });
+    const targets = () => [{ kind: 'lieutenant', id: 'ada', label: 'Ada', session: 'bc-gone', window: null }];
+    // a session with no panes, a lookup that throws, a harness without the
+    // verb (no panePids at all): each is "no rows", never a crash
+    for (const panePids of [async () => [], () => { throw new Error('tmux: no server'); }, undefined]) {
+      const sampler = createSampler({
+        procRoot: dir, statfs: STATFS, intervalMs: 40,
+        execFileImpl: execStub({ docker: null }), targets, panePids,
+      });
+      const [s] = await collectSamples(sampler, 1);
+      assert.equal(s.containers, null);
+      assert.deepEqual(s.entities, []);
+    }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

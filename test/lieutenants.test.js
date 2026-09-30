@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { startServer, runCli } = require('./helper');
-const { charterPath, writeCharter } = require('../server/charter.js');
+const { charterPath, writeCharter } = require('../server/layout.js');
 
 test('lieutenant create: slug id, palette color; a charter sent by a client is ignored; duplicates conflict', async () => {
   const s = await startServer();
@@ -56,6 +56,13 @@ test('emoji-safe naming: id is the ASCII slug, display name keeps the emoji, ses
     assert.match(r.body.lieutenant.ref.session, /^bc-[A-Za-z0-9-]+-lt-marcela$/, 'emoji never reach tmux');
     // eslint-disable-next-line no-control-regex
     assert.match(r.body.lieutenant.ref.session, /^[\x21-\x7e]+$/, 'session name is pure ASCII');
+
+    // a refused avatar is refused BEFORE the spawn: no session is left behind
+    // with no lieutenant to own it
+    r = await s.api('POST', '/api/lieutenants', { name: 'Bad avatar', spawn: true, harness: 'fake', avatar: 64 });
+    assert.strictEqual(r.status, 400);
+    assert.match(r.body.error, /avatar must be an integer 0-63/);
+    assert.ok(!fs.readdirSync(fdir).some((f) => f.includes('bad-avatar')), 'no fake session was spawned');
 
     // pure-emoji names still yield usable, unique ids (fallback 'lt', deduped)
     r = await s.api('POST', '/api/lieutenants', { name: '👩‍🦰' });
@@ -242,15 +249,20 @@ test('cli: lieutenant create --avatar and lieutenant patch', async () => {
     let lt = (await s.api('GET', '/api/lieutenants')).body.lieutenants.find((l) => l.id === 'avi');
     assert.strictEqual(lt.avatar, 5);
 
+    // the range is the server's: the CLI forwards the number and prints the refusal
     r = await runCli(['lieutenant', 'create', '--name', 'Bad', '--id', 'bad', '--avatar', '64', ...args]);
     assert.notStrictEqual(r.code, 0);
-    assert.match(r.stderr, /--avatar must be an integer 0-63/);
+    assert.match(r.stderr, /avatar must be an integer 0-63/);
+    r = await runCli(['lieutenant', 'create', '--name', 'Bad', '--id', 'bad', '--avatar', 'blue', ...args]);
+    assert.notStrictEqual(r.code, 0);
+    assert.match(r.stderr, /avatar must be an integer 0-63/);
+    assert.ok(!(await s.api('GET', '/api/lieutenants')).body.lieutenants.some((l) => l.id === 'bad'));
 
     r = await runCli(['lieutenant', 'patch', 'avi', '--avatar', '9', '--color', '#abcdef', ...args]);
     assert.strictEqual(r.code, 0, r.stderr);
     // The line reports what it runs on too — 'none'/'default' for a lieutenant
     // registered without a session and pinned to no model.
-    assert.match(r.stdout, /lieutenant avi updated \(avatar=9 color=#abcdef prefix=AVI harness=none model=default\)/);
+    assert.match(r.stdout, /lieutenant avi updated \(avatar=9 color=#abcdef prefix=AVI harness=none model=default effort=default\)/);
 
     r = await runCli(['lieutenant', 'patch', 'avi', '--avatar', 'none', ...args]);
     assert.strictEqual(r.code, 0, r.stderr);
@@ -476,6 +488,33 @@ test('prefix patch: applies, refuses one another lieutenant holds, leaves minted
   }
 });
 
+// Prefix, name and color are valid; the avatar / model / harness is not. None of
+// the valid fields may stay in memory for the next unrelated save to persist.
+test('lieutenant patch is all-or-nothing: a bad avatar, model or harness applies nothing, on disk too', async () => {
+  const s = await startServer();
+  try {
+    await s.api('POST', '/api/lieutenants', { name: 'Monica', id: 'monica', color: '#111111' });
+    const good = { prefix: 'NEW', name: 'Renamed', color: '#123456' };
+    for (const bad of [{ avatar: 99 }, { model: 'two words' }, { harness: 'no-such-harness' }]) {
+      const r = await s.api('PATCH', '/api/lieutenants/monica', Object.assign({}, good, bad));
+      assert.strictEqual(r.status, 400, JSON.stringify(bad));
+    }
+    // an unrelated mutation saves the board
+    assert.strictEqual((await s.api('POST', '/api/lieutenants', { name: 'Waldir', id: 'waldir' })).status, 200);
+
+    const lt = (await s.api('GET', '/api/lieutenants')).body.lieutenants.find((l) => l.id === 'monica');
+    const stored = JSON.parse(fs.readFileSync(path.join(s.dir, '.bridge-commander', 'board.json'), 'utf8'))
+      .lieutenants.find((l) => l.id === 'monica');
+    for (const got of [lt, stored]) {
+      assert.strictEqual(got.prefix, 'MON');
+      assert.strictEqual(got.name, 'Monica');
+      assert.strictEqual(got.color, '#111111');
+    }
+  } finally {
+    await s.stop();
+  }
+});
+
 test('prefix + counter are backfilled for lieutenants that predate them, without touching their cards', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-test-'));
   const s = await startServer({
@@ -551,10 +590,12 @@ test('live=1 adds the next card id, the live-card count, the charter path and th
     },
   });
   try {
-    // the plain read is untouched — no probe, no extra fields
+    // the plain read runs no probe; it carries only `next`, which costs nothing
+    // and saves every client the arithmetic (bc-axi lieutenant list prints it)
     const plain = (await s.api('GET', '/api/lieutenants')).body.lieutenants;
     assert.deepStrictEqual(plain.map((l) => l.id), ['ada', 'grace', 'hedy']);
-    for (const l of plain) assert.ok(!('session' in l) && !('next' in l), l.id + ' carries no probe');
+    for (const l of plain) assert.ok(!('session' in l) && !('cards' in l), l.id + ' carries no probe');
+    assert.deepStrictEqual(plain.map((l) => l.next), ['ADA-7', 'GRC-1', 'HED-42']);
 
     const r = await s.api('GET', '/api/lieutenants?live=1');
     assert.strictEqual(r.status, 200);

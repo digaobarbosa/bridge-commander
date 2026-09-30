@@ -230,6 +230,8 @@ test('add refuses a bad expression, a hook that is not there, an unknown owner a
     const dup = await runCli(['schedule', 'add', 'a', '--hook', 'tick', '--when', '5m', '--owner', LT, ...ws]);
     assert.strictEqual(dup.code, 1);
     assert.match(dup.stderr, /already exists/);
+    const dupHttp = await s.api('POST', '/api/schedules', { name: 'a', hook: 'tick', when: '5m', owner: LT });
+    assert.strictEqual(dupHttp.status, 409, 'a duplicate is a conflict, not a bad request');
     assert.strictEqual((await s.api('GET', '/api/schedules')).body.schedules.length, 1);
   } finally { await s.stop(); }
 });

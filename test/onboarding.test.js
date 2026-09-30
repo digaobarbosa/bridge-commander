@@ -168,16 +168,30 @@ test('init --onboard continues an existing workspace instead of refusing it', as
   }
 });
 
-test('--host on an already-running board rebinds it, prints the reachable URL, and persists', async () => {
+// Linux routes all of 127/8 to lo; macOS has only 127.0.0.1 unless someone adds
+// an alias, and there the listen fails with EADDRNOTAVAIL.
+function canBind(host) {
+  return new Promise((resolve) => {
+    const srv = require('node:net').createServer();
+    srv.once('error', () => resolve(false));
+    srv.listen(0, host, () => srv.close(() => resolve(true)));
+  });
+}
+
+test('--host on an already-running board rebinds it, prints the reachable URL, and persists', async (t) => {
   // Round 2 of the install test: the person gets a board first and discovers
   // only afterwards that their browser cannot reach it. Asking for a bind at
   // that point used to do nothing at all — "server already running", still
   // loopback, still printing localhost, and nothing written down.
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-onboard-'));
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-home-'));
   // A second loopback address: bindable, not 127.0.0.1, and reachable from here
   // — so this stays a real rebind without opening anything to the network.
   const HOST = '127.0.0.2';
+  if (!(await canBind(HOST))) {
+    t.skip(HOST + ' cannot be bound here (no loopback alias, e.g. macOS) — this test needs a second loopback address');
+    return;
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-onboard-'));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-home-'));
   let port; let base; let r;
   try {
     ({ port, args: base, r } = await bootOnboard(dir, home));

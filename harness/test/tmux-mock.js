@@ -2,7 +2,7 @@
 // tmux-mock — patches the shared harness/tmux.js exports so a tmux-TUI
 // adapter's spawn() runs end-to-end with NO real tmux process, while
 // recording every call the adapter (via tmux-session.js) makes. This is what
-// lets claude-tmux.test.js / codex-tmux.test.js pin "the brief never rides
+// lets conformance.test.js pin "the brief never rides
 // on the command line" as a plain, fast, deterministic unit test: mock
 // submit() records exactly what text got typed into the composer, separate
 // from the launch line typed by sendLiteral() at launch.

@@ -1,0 +1,9 @@
+{
+  "id": "badwhen",
+  "activation": "boot",
+  "server": "server.js",
+  "contributes": {
+    "commands": [{ "id": "badwhen.x", "title": "X", "run": "server" }],
+    "menus": { "card.menu/v1": [{ "command": "badwhen.x", "when": { "card.column": { "$bogus": 1 } } }] }
+  }
+}

@@ -1,5 +1,8 @@
 // central UI state + derived selectors. The board doc from SSE is the truth;
-// everything here is view state or cheap derivation over it.
+// everything here is view state or cheap derivation over it. Pure: no DOM at
+// import, so the 3D room and node tests share these rules.
+import { validAvatar } from './avatars.js';
+
 export const USER = 'user';
 
 export const S = {
@@ -11,9 +14,9 @@ export const S = {
   chatMode: null,          // {mode:'lieutenant', id} | {mode:'card', id} | null
   openCardId: null,        // detail panel
   view: 'chat',            // mobile tab: 'chat' | 'board'
-  boardMode: 'board',      // the board region's view: 'board' (kanban) | 'table' | 'archive'
+  boardMode: 'board',      // the board region's view id (views.js registry): 'board' (kanban), 'table', …
   // The ONE filter state, shared by every board-region mode. `text` lives in
-  // the topbar input; the rest is configured in the filter popup (filterpop.js).
+  // the filter row's input; the rest is configured in the filter popup (filterpop.js).
   // Every dimension is MULTI: sel holds {kind:'label'|'owner', value} chips,
   // types/columns hold toggled values. Semantics: OR within a dimension, AND
   // across dimensions.
@@ -23,14 +26,58 @@ export const S = {
   notifExpanded: new Set(), // seq of level-1 item whose preceding gap is expanded
 };
 
-let renderFn = () => {};
-export function onRender(fn) { renderFn = fn; }
-export function render() { renderFn(); }
+// A listener set, not a single slot: main's orchestrator is one listener, the
+// 3D room another, and a plugin view host may add its own. Returns dispose().
+const renderFns = new Set();
+export function onRender(fn) {
+  renderFns.add(fn);
+  return () => renderFns.delete(fn);
+}
+export function render() {
+  for (const fn of [...renderFns]) fn();
+}
+
+// ---------- board ingest ----------
+// Every board document — SSE push, reconnect refetch, the chat's echo refetch,
+// the 3D room — enters through applyBoard, so no path can skip a tracker.
+const boardSubs = [];
+/** Register fn(doc), run on every board document taken in, before the render. */
+export function onBoard(fn) { boardSubs.push(fn); }
+/** The one entry point for a board document: store it, notify subscribers, render. */
+export function applyBoard(doc) {
+  if (!doc) return;
+  S.doc = doc;
+  for (const fn of boardSubs) fn(doc);
+  render();
+}
+
+// ---------- pure rules (no S.doc) ----------
+/** Map id → item for a list of board records (cards, lieutenants, columns). */
+export function byId(list) { return new Map((list || []).map((x) => [x.id, x])); }
+/**
+ * Whether `actor` names this lieutenant. The server stamps chat-say events and
+ * messages with the author NAME, not the id, so both match.
+ */
+export function isActor(lt, actor) { return !!(lt && actor) && (lt.id === actor || lt.name === actor); }
+/** Messages in `msgs` the captain has not read: not his own, newer than `readTs`. */
+export function unreadCount(msgs, readTs) {
+  return (msgs || []).filter((m) => m.author !== USER && (!readTs || m.ts > readTs)).length;
+}
+/** The captain's read marker for a thread target, from a board doc's `reads` map. */
+export function readMarker(readsMap, target) {
+  const u = readsMap && readsMap[USER];
+  return (u && u.threads && u.threads[target]) || '';
+}
 
 // ---------- selectors ----------
 export function cards() { return (S.doc && S.doc.cards) || []; }
 export function card(id) { return cards().find((c) => c.id === id); }
 export function columns() { return (S.doc && S.doc.columns) || []; }
+/** A column's display title, or the id itself when the column is unknown. */
+export function columnTitle(id) {
+  const col = columns().find((k) => k.id === id);
+  return col ? col.title || col.id : id;
+}
 export function lieutenants() { return (S.doc && S.doc.lieutenants) || []; }
 export function lieutenant(id) { return lieutenants().find((l) => l.id === id); }
 // Lieutenants by most recent conversation — the chat's last message first, and
@@ -54,8 +101,7 @@ function lieutenantChatTs(l) {
 // events with the author NAME (not the id — server.js's msg.author), so match
 // both; 'user'/'server'/'worker' actors resolve to nothing.
 export function lieutenantByActor(actor) {
-  if (!actor) return undefined;
-  return lieutenants().find((l) => l.id === actor || l.name === actor);
+  return lieutenants().find((l) => isActor(l, actor));
 }
 export function lieutenantColor(id) {
   const l = lieutenant(id);
@@ -67,8 +113,7 @@ export function lieutenantName(id) {
 }
 export function lieutenantAvatar(id) {
   const l = lieutenant(id);
-  const a = l && l.avatar;
-  return Number.isInteger(a) && a >= 0 && a <= 63 ? a : null;
+  return validAvatar(l && l.avatar);
 }
 // the worker registry record bound to a card (board.workers rides the payload);
 // its agentStatus feeds the Working-tile context bar
@@ -84,11 +129,23 @@ export function reads() {
     threads: r.threads || {},
   };
 }
-export function threadReadTs(target) { return reads().threads[target] || ''; }
-export function threadUnread(target, msgs) {
-  const ts = threadReadTs(target);
-  return (msgs || []).filter((m) => m.author !== USER && (!ts || m.ts > ts)).length;
+/**
+ * Apply a read marker to the local doc until the next broadcast carries it.
+ * The server persists reads without broadcasting (only this user's view moves).
+ */
+export function applyLocalRead(target, ts) {
+  if (!S.doc) return;
+  const all = S.doc.reads || (S.doc.reads = {});
+  const u = all[USER] || (all[USER] = { notifSeq: 0, notifSeqs: [], threads: {} });
+  const threads = u.threads || (u.threads = {});
+  if (!threads[target] || threads[target] < ts) threads[target] = ts;
+  // the board dot reads the server-derived card status, not the marker
+  const m = /^card:(.+)$/.exec(target);
+  const c = m && card(m[1]);
+  if (c && c.status) c.status.unread = false;
 }
+export function threadReadTs(target) { return readMarker(S.doc && S.doc.reads, target); }
+export function threadUnread(target, msgs) { return unreadCount(msgs, threadReadTs(target)); }
 export function cardUnread(c) { return threadUnread('card:' + c.id, c.thread); }
 export function lieutenantUnread(l) { return threadUnread('lieutenant:' + l.id, l.chat); }
 // newest unread-relevant ts on a card: lieutenant thread messages + level-1
@@ -106,6 +163,10 @@ export function cardActivityTs(c) {
 // writes — a status-lease refresh/decay, an attribute sync — never read as "now".
 // Fall back to the mutable `updated` for any older cached doc without it.
 export function cardRecency(c) { return (c && (c.activity || c.updated)) || ''; }
+/** Sort comparator: most recent real activity first (cardRecency). */
+export function byRecency(a, b) {
+  return (new Date(cardRecency(b) || 0).getTime() || 0) - (new Date(cardRecency(a) || 0).getTime() || 0);
+}
 
 // ---------- status (card.status is the single source; no other status feed) ----------
 export function cardStatus(c) {
@@ -134,16 +195,21 @@ export function targetOwedState(target) {
     return l.chatQueued ? 'queued' : 'seen';
   }
   const c = card((target || '').slice(5));
-  const st = c && cardStatus(c);
-  if (!st || !st.owed) return null;
+  return c ? cardOwedState(c) : null;
+}
+/** A card's owed tri-state from its server-derived status: null | 'queued' | 'seen'. Pure. */
+export function cardOwedState(c) {
+  const st = cardStatus(c);
+  if (!st.owed) return null;
   return st.owedState || 'seen'; // older server payload: owed only — assume seen
 }
 export function targetOwed(target) { return !!targetOwedState(target); }
 // "may be stuck": owed with no lieutenant reply for longer than the stale
 // threshold. Purely client-derived from thread timestamps; the periodic
 // re-render refreshes it.
-const OWED_STALE_MS = 180000;
-function owedSinceTs(msgs) {
+export const OWED_STALE_MS = 180000;
+/** When the captain's unanswered run of messages began (ts), or null when nothing is owed. */
+export function owedSinceTs(msgs) {
   let since = null;
   for (const m of msgs || []) {
     if (m.author === USER) { if (since == null) since = m.ts; }
@@ -157,9 +223,12 @@ export function targetMsgs(target) {
   return (card((target || '').slice(5)) || {}).thread || [];
 }
 export function targetOwedStale(target) {
-  if (!targetOwed(target)) return false;
-  const since = owedSinceTs(targetMsgs(target));
-  return !!since && Date.now() - new Date(since).getTime() >= OWED_STALE_MS;
+  return targetOwed(target) && owedStale(targetMsgs(target), Date.now());
+}
+/** Whether the captain's unanswered run in `msgs` is older than the stale threshold at `nowMs`. */
+export function owedStale(msgs, nowMs) {
+  const since = owedSinceTs(msgs);
+  return !!since && nowMs - new Date(since).getTime() >= OWED_STALE_MS;
 }
 export function owedTargets() {
   const out = [];
@@ -250,6 +319,36 @@ export function activeFilterCount() {
   const f = S.filters;
   return f.sel.length + (f.age ? 1 : 0) + f.types.length + f.columns.length;
 }
+// the popup's "updated" windows; a chip names the picked one
+export const AGES = [
+  { v: '', t: 'any time' }, { v: '3600', t: 'last hour' }, { v: 'today', t: 'today' },
+  { v: '259200', t: 'last 3 days' }, { v: '604800', t: 'last week' },
+];
+const TYPE_NAMES = { plan: '🧠 plan', implementation: '🔥 impl', investigation: '🕵️ invest' };
+/**
+ * One removable chip per active filter value — {kind, value, label, exclude}.
+ * No chip for text: the input already shows it. `archived` drops status and
+ * updated, which frozen snapshots ignore; `doc` names owners and columns.
+ */
+export function filterChips(f, doc, archived) {
+  const lts = (doc && doc.lieutenants) || [];
+  const cols = (doc && doc.columns) || [];
+  const chips = f.sel.map((s) => {
+    const lt = s.kind === 'owner' && lts.find((l) => l.id === s.value);
+    return { kind: s.kind, value: s.value, exclude: s.mode === 'out', label: s.kind + ': ' + (lt ? lt.name || lt.id : s.value) };
+  });
+  for (const t of f.types) chips.push({ kind: 'types', value: t, exclude: false, label: 'type: ' + (TYPE_NAMES[t] || t) });
+  if (archived) return chips;
+  for (const c of f.columns) {
+    const k = cols.find((x) => x.id === c);
+    chips.push({ kind: 'columns', value: c, exclude: false, label: 'status: ' + (k ? k.title : c) });
+  }
+  if (f.age) {
+    const a = AGES.find((x) => x.v === f.age);
+    chips.push({ kind: 'age', value: f.age, exclude: false, label: 'updated: ' + (a ? a.t : f.age) });
+  }
+  return chips;
+}
 // toggle a value in a multi dimension array (types / columns)
 export function toggleDim(dim, value) {
   const arr = S.filters[dim];
@@ -257,36 +356,47 @@ export function toggleDim(dim, value) {
   if (i >= 0) arr.splice(i, 1); else arr.push(value);
   render();
 }
-function ageCutoff() {
-  const v = S.filters.age;
+function ageCutoff(v) {
   if (!v) return 0;
   if (v === 'today') { const d = new Date(); d.setHours(0, 0, 0, 0); return d.getTime(); }
   return Date.now() - parseInt(v, 10) * 1000;
 }
-function haystack(c) {
-  const col = columns().find((k) => k.id === c.column);
+/**
+ * The lower-cased text a card is searched by: title, id, body, type, owner id
+ * and name, labels, attributes and column title. `doc` supplies the names.
+ */
+export function cardSearchText(c, doc) {
+  const col = ((doc && doc.columns) || []).find((k) => k.id === c.column);
+  const lt = ((doc && doc.lieutenants) || []).find((l) => l.id === c.owner);
   const at = c.attributes || {};
-  return [c.title, c.id, c.body, c.type, c.owner, lieutenantName(c.owner), (c.labels || []).join(' '),
+  return [c.title, c.id, c.body, c.type, c.owner, lt ? lt.name || lt.id : '', (c.labels || []).join(' '),
     Object.entries(at).map(([k, v]) => k + ' ' + v).join(' '),
     col ? col.title : c.column,
   ].filter(Boolean).join(' ').toLowerCase();
 }
-export function cardVisible(c) {
-  if (!filtersActive()) return true;
-  const q = S.filters.text.trim().toLowerCase();
-  if (q && !haystack(c).includes(q)) return false;
-  const cutoff = ageCutoff();
+/**
+ * Whether a card passes a filter shaped like S.filters — {text, age, sel,
+ * types, columns}, every field optional. Pure over `doc`, so the 3D wall uses
+ * the same rule with its own filter object.
+ */
+export function cardMatches(c, f, doc) {
+  const q = (f.text || '').trim().toLowerCase();
+  if (q && !cardSearchText(c, doc).includes(q)) return false;
+  const cutoff = ageCutoff(f.age);
   if (cutoff) { const t = cardRecency(c); if (!t || new Date(t).getTime() < cutoff) return false; }
-  if (S.filters.types.length && !S.filters.types.includes(c.type)) return false;
-  if (S.filters.columns.length && !S.filters.columns.includes(c.column)) return false;
-  return selMatches(c);
+  if (f.types && f.types.length && !f.types.includes(c.type)) return false;
+  if (f.columns && f.columns.length && !f.columns.includes(c.column)) return false;
+  return selMatches(c, f.sel);
+}
+export function cardVisible(c) {
+  return !filtersActive() || cardMatches(c, S.filters, S.doc);
 }
 // the owner/label chips: excludes drop the card outright; includes are OR
 // within each dimension, AND across them — two owners included means "either
 // owner", never the impossible "both"
-export function selMatches(c) {
+export function selMatches(c, sel = S.filters.sel) {
   const inc = { owner: [], label: [] }, exc = { owner: [], label: [] };
-  for (const f of S.filters.sel) ((f.mode === 'out' ? exc : inc)[f.kind] || []).push(f.value);
+  for (const f of sel || []) ((f.mode === 'out' ? exc : inc)[f.kind] || []).push(f.value);
   if (exc.owner.includes(c.owner || '')) return false;
   if (exc.label.some((n) => (c.labels || []).includes(n))) return false;
   if (inc.owner.length && !inc.owner.includes(c.owner || '')) return false;

@@ -262,7 +262,8 @@ test('card artifact add normalizes a bare path to a file:// uri', async () => {
     await s.api('POST', '/api/cards', withOwner({ title: 'Filepath' }));
     const r = await s.api('POST', '/api/cards/filepath/artifacts', { uri: '/tmp/report.md', label: 'report' });
     assert.strictEqual(r.status, 200);
-    assert.strictEqual(r.body.artifact.uri, 'file:///tmp/report.md');
+    // stored through the real directory: /tmp is a symlink on macOS
+    assert.strictEqual(r.body.artifact.uri, 'file://' + path.join(fs.realpathSync('/tmp'), 'report.md'));
   } finally {
     await s.stop();
   }

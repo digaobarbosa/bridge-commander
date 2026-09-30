@@ -1,0 +1,9 @@
+{
+  "id": "off",
+  "enabled": false,
+  "activation": "boot",
+  "server": "server.js",
+  "contributes": {
+    "commands": [{ "id": "off.x", "title": "X", "run": "server" }]
+  }
+}

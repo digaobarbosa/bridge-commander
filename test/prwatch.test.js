@@ -9,25 +9,14 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync } = require('node:child_process');
-const { startServerWithLieutenant, withOwner, sleep, LT } = require('./helper');
-const { lieutenantSession, workerWindow } = require('../server/names.js');
+const { startServerWithLieutenant, withOwner, sleep, until, makeRepo, LT } = require('./helper');
+const { lieutenantSession, workerWindow } = require('../server/layout.js');
 
 // A worker's harness key: a WINDOW inside its lieutenant's session.
 function workerKey(dir, cardId) {
   return lieutenantSession(dir, LT) + ':' + workerWindow(cardId);
 }
 
-function makeRepo(root) {
-  const repo = path.join(root, 'srcrepo');
-  fs.mkdirSync(repo, { recursive: true });
-  execFileSync('git', ['init', '-q', '-b', 'main', repo], { stdio: ['ignore', 'pipe', 'pipe'] });
-  fs.writeFileSync(path.join(repo, 'README.md'), 'hi\n');
-  execFileSync('git', ['-C', repo, 'add', '.'], { stdio: ['ignore', 'pipe', 'pipe'] });
-  execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'],
-    { stdio: ['ignore', 'pipe', 'pipe'] });
-  return repo;
-}
 
 // A gh stub: `gh pr view <url> --json state,mergedAt` answered from a control
 // map file the test rewrites (url -> state). Unknown URL = non-zero exit.
@@ -49,15 +38,6 @@ function makeGhStub(root) {
   } };
 }
 
-async function until(what, fn, ms = 6000) {
-  const deadline = Date.now() + ms;
-  for (;;) {
-    const v = await fn();
-    if (v) return v;
-    if (Date.now() > deadline) throw new Error('timeout waiting for: ' + what);
-    await sleep(50);
-  }
-}
 
 async function boot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-prwatch-'));
@@ -147,11 +127,11 @@ test('a merged card whose worker kill FAILED still archives with the run\'s addr
     assert.ok(spawnId);
 
     // the relay moves the run onto a new transcript id AFTER the spawn — the
-    // record knows it, the card's own note still says the old one
+    // the record and the durable card address must both adopt it immediately
     const relayed = 'relay-uuid-after-the-spawn';
     const te = await s.api('POST', '/api/turn-end', { session: workerKey(wsDir, 'mergefail'), session_id: relayed });
     assert.strictEqual(te.status, 200, JSON.stringify(te.body));
-    assert.strictEqual((await s.api('GET', '/api/cards/mergefail')).body.attributes.resumeId, spawnId);
+    assert.strictEqual((await s.api('GET', '/api/cards/mergefail')).body.attributes.resumeId, relayed);
 
     gh.setState(PR, 'OPEN');
     await s.api('POST', '/api/cards/mergefail/worker/done', { outcome: 'PR open: ' + PR });

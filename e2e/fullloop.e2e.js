@@ -77,8 +77,7 @@ function git(dir, ...args) {
   return execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 
-const { lieutenantSession, workspaceDisc } = require(path.join(__dirname, '..', 'server', 'names.js'));
-const { writeCharter } = require(path.join(__dirname, '..', 'server', 'charter.js'));
+const { lieutenantSession, workspaceDisc, workerWindow, writeCharter } = require(path.join(__dirname, '..', 'server', 'layout.js'));
 
 const LT = 'hopper';
 const LT_SESSION = lieutenantSession(ws, LT); // workspace-discriminated
@@ -209,7 +208,8 @@ function dumpDiagnostics() {
     assert.strictEqual(c.type, 'implementation');
     assert.strictEqual(String(c.attributes.repo), 'proj');
     assert.ok(ev.some((e) => e.kind === 'started'), 'card.start happened (started event)');
-    assert.ok(c.attributes.session && c.attributes.session.startsWith('bc-' + workspaceDisc(ws) + '-w-'), 'worker session bound: ' + c.attributes.session);
+    // A worker is a window inside its lieutenant's session: <lt session>:<worker window>.
+    assert.strictEqual(c.attributes.session, lieutenantSession(ws, c.owner) + ':' + workerWindow(card.id), 'worker session bound');
     assert.ok(ev.some((e) => e.kind === 'worker-done'), 'worker reported done');
     const handoff = ev.find((e) => e.kind === 'handoff' && e.actor !== 'user');
     assert.ok(handoff, 'the handoff event exists and is the lieutenant\'s');

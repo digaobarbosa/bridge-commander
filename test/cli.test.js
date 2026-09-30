@@ -5,7 +5,7 @@ const assert = require('node:assert');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { startServerWithLieutenant, withOwner, LT, runCli } = require('./helper');
+const { startServer, startServerWithLieutenant, withOwner, LT, runCli } = require('./helper');
 
 test('cli config reads and writes the workspace config.json', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-test-'));
@@ -147,13 +147,13 @@ test('cli card create / board / say / drain / ack round-trip against a test serv
     r = await runCli(['drain', '--json', ...args]);
     assert.strictEqual(r.stdout.trim(), '');
 
-    // lieutenant reply via say (interlocutor default: the owning lieutenant)
+    // a say from outside tmux is unidentified: signed `agent`, never the owner's name
     const sayFile = path.join(s.dir, 'reply.md');
     fs.writeFileSync(sayFile, 'on it, captain');
     r = await runCli(['say', 'card:ADA-1', '--text-file', sayFile, ...args], { TMUX: '' });
     assert.strictEqual(r.code, 0, r.stderr);
     const card = (await s.api('GET', '/api/cards/ADA-1')).body;
-    assert.strictEqual(card.thread[1].author, 'Ada');
+    assert.strictEqual(card.thread[1].author, 'agent');
     assert.strictEqual(card.thread[1].text, 'on it, captain');
 
     // an UNIDENTIFIED card-thread say default-notifies the owner (worker-said);
@@ -178,6 +178,48 @@ test('cli card create / board / say / drain / ack round-trip against a test serv
     // status reads pending queue from the server
     r = await runCli(['status', ...args]);
     assert.match(r.stdout, /pending-queue=0/);
+  } finally {
+    await s.stop();
+  }
+});
+
+// The teleport registers the caller on the harness it actually runs on. codex
+// exports CODEX_THREAD_ID (the id `codex resume` takes) to every command it
+// runs; claude exports CLAUDECODE and, when it has one, CLAUDE_SESSION_ID.
+test('init records the founding lieutenant on the caller\'s harness: codex or claude', async () => {
+  // No supervision or clock: these refs name no real session, and a tick
+  // would try to revive them in the machine's own tmux.
+  const s = await startServer({ env: { BC_SUPERVISE_INTERVAL_MS: '0', BC_SCHEDULE_INTERVAL_MS: '0' } });
+  const bin = path.join(s.dir, 'bin');
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(bin, 'tmux'), '#!/bin/sh\necho bc-founder\n');
+  fs.chmodSync(path.join(bin, 'tmux'), 0o755);
+  const tmux = { TMUX: '/tmp/stub,1,0', PATH: bin + ':' + process.env.PATH };
+  const ws = ['--workspace', s.dir, '--port', String(s.port)];
+  const refOf = async (id) =>
+    (await s.api('GET', '/api/lieutenants')).body.lieutenants.find((l) => l.id === id).ref;
+  try {
+    let r = await runCli(['init', '--name', 'Cody', ...ws],
+      Object.assign({ CLAUDECODE: '', CLAUDE_SESSION_ID: '', CODEX_THREAD_ID: 'thread-123' }, tmux));
+    assert.strictEqual(r.code, 0, r.stderr);
+    assert.match(r.stderr, /harness {3}: codex/);
+    assert.deepStrictEqual(await refOf('cody'),
+      { harness: 'codex', session: 'bc-founder', cwd: s.dir, resumeId: 'thread-123' });
+
+    // claude wins a tie: a tmux server started from codex leaks its variable
+    // into every session, and claude is what every earlier init recorded
+    r = await runCli(['init', '--name', 'Claudia', ...ws],
+      Object.assign({ CLAUDECODE: '1', CLAUDE_SESSION_ID: 'sess-9', CODEX_THREAD_ID: 'leaked' }, tmux));
+    assert.strictEqual(r.code, 0, r.stderr);
+    assert.deepStrictEqual(await refOf('claudia'),
+      { harness: 'claude', session: 'bc-founder', cwd: s.dir, resumeId: 'sess-9' });
+
+    // --harness overrides what the environment says
+    r = await runCli(['init', '--name', 'Cody', '--harness', 'claude', ...ws],
+      Object.assign({ CLAUDECODE: '', CLAUDE_SESSION_ID: '', CODEX_THREAD_ID: 'thread-123' }, tmux));
+    assert.strictEqual(r.code, 0, r.stderr);
+    assert.match(r.stdout, /already registered — session ref refreshed/);
+    assert.deepStrictEqual(await refOf('cody'), { harness: 'claude', session: 'bc-founder', cwd: s.dir });
   } finally {
     await s.stop();
   }

@@ -15,15 +15,17 @@
 // Machine numbers come straight from /proc/stat + /proc/meminfo + statfs on
 // the workspace volume — Linux-first; anywhere that surface is missing the
 // numbers read as graceful zeros. Entity rows are the headline: for every
-// live worker and lieutenant session the server tracks, the sampler asks tmux
-// for the pane pids (`list-panes -s`), walks the /proc ppid tree to collect
-// each pane's descendants, and sums CPU%+RSS per entity, heaviest first.
+// live worker and lieutenant session the server tracks, the sampler asks the
+// harness port for the session's pane pids (the optional panePids verb, which
+// the server injects), walks the /proc ppid tree to collect each pane's
+// descendants, and sums CPU%+RSS per entity, heaviest first. A harness
+// without the verb simply has no rows.
 // CPU% is delta-based (two reads of the same counters), so the first sample
 // of a fresh loop reads 0% and truth arrives one interval later.
 //
 // Everything environmental is injectable (procRoot, statfs, execFile impl,
-// targets, interval) so tests run on fixture /proc trees and stubbed tmux —
-// see test/sysload.test.js.
+// panePids, targets, interval) so tests run on fixture /proc trees and stubbed
+// panes — see test/sysload.test.js.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -124,10 +126,13 @@ function descendants(table, rootPids) {
 }
 
 // ---------- sampler ----------
-// createSampler({ workspace, targets, intervalMs?, procRoot?, execFileImpl?, statfs? })
-//   targets()  -> [{ kind, id, label, session, window|null }] — the server's
-//                 live worker/lieutenant registry, re-read every sample so
-//                 rows track the board.
+// createSampler({ workspace, targets, panePids?, intervalMs?, procRoot?, execFileImpl?, statfs? })
+//   targets()  -> [{ kind, id, label, session, window|null, ref? }] — the
+//                 server's live worker/lieutenant registry, re-read every
+//                 sample so rows track the board.
+//   panePids(target) -> [{ window, pid }] (may be async) — every pane of the
+//                 target's SESSION. Absent, throwing or slow = no rows for
+//                 that session; the loop never stalls on it.
 //   subscribe(fn) -> unsubscribe(). First subscriber starts the loop (and gets
 //                 a sample immediately); last unsubscribe stops it and drops
 //                 all delta state, so a fresh viewer always re-baselines.
@@ -139,6 +144,7 @@ function createSampler(opts) {
   const diskPath = o.diskPath || o.workspace || '/';
   const intervalMs = o.intervalMs > 0 ? o.intervalMs : DEFAULT_INTERVAL_MS;
   const targets = typeof o.targets === 'function' ? o.targets : () => [];
+  const panePidsOf = typeof o.panePids === 'function' ? o.panePids : () => [];
   const exec = o.execFileImpl || ((cmd, args) => new Promise((resolve, reject) => {
     execFile(cmd, args, { encoding: 'utf8', timeout: EXEC_TIMEOUT_MS }, (err, stdout) => {
       if (err) reject(err); else resolve(stdout);
@@ -173,18 +179,19 @@ function createSampler(opts) {
     };
   }
 
-  // tmux pane pids for one session: [{ window, pid }] ([] when tmux/session is gone).
-  async function panePids(session) {
-    let out;
+  // Pane pids of one target's session: [{ window, pid }], [] when the lookup
+  // is absent, fails, or outlives EXEC_TIMEOUT_MS (the bound the tmux call
+  // had when it lived here).
+  async function panePids(target) {
+    let timer;
+    const late = new Promise((resolve) => {
+      timer = setTimeout(() => resolve([]), EXEC_TIMEOUT_MS);
+      timer.unref?.();
+    });
     try {
-      out = await exec('tmux', ['list-panes', '-s', '-t', session, '-F', '#{window_name}\t#{pane_pid}']);
-    } catch (e) { return []; }
-    const panes = [];
-    for (const line of String(out || '').split('\n')) {
-      const m = /^(.*)\t(\d+)$/.exec(line.trim());
-      if (m) panes.push({ window: m[1], pid: parseInt(m[2], 10) });
-    }
-    return panes;
+      const panes = await Promise.race([Promise.resolve().then(() => panePidsOf(target)), late]);
+      return Array.isArray(panes) ? panes : [];
+    } catch (e) { return []; } finally { clearTimeout(timer); }
   }
 
   async function containerCount() {
@@ -207,8 +214,8 @@ function createSampler(opts) {
       bySession.get(t.session).push(t);
     }
     const rootsByTarget = new Map(); // target -> [panePid]
-    for (const [session, ts] of bySession) {
-      const panes = await panePids(session);
+    for (const ts of bySession.values()) {
+      const panes = await panePids(ts[0]);
       for (const pane of panes) {
         const owner = ts.find((t) => t.window && t.window === pane.window)
           || ts.find((t) => !t.window);

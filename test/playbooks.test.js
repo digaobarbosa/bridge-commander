@@ -1,8 +1,10 @@
 'use strict';
 // playbooks.js — a playbook is a markdown file the USER owns, rendered against
-// the card at card.start into the worker's brief. These tests pin the
+// the card at card.start into the worker's brief. The unit tests pin the
 // renderer: which playbook wins, what a placeholder resolves to, and what
-// happens to one that resolves to nothing.
+// happens to one that resolves to nothing. The server tests at the bottom pin
+// the seam: which playbook a card gets, when it is read, and what happens when
+// a card has none.
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('node:fs');
@@ -12,6 +14,10 @@ const {
   workerBrief, render, listPlaybooks, resolvePlaybook, playbooksDir, seedPlaybooksAndDuties, parsePlaybook,
   briefVars, PACKAGED_PLAYBOOKS_DIR, PACKAGED_SKILL_DIR, FM_KEYS, PLACEHOLDERS, FRONTMATTER,
 } = require('../server/playbooks.js');
+const { startServerWithProject, withOwner, runCli, LT } = require('./helper');
+const { lieutenantSession, workerWindow } = require('../server/layout.js');
+// Where the skill is linked is the claude profile's answer, not the core's.
+const skillsDir = (home) => require('../harness/port.js').profileOf('claude').skillsDir(home);
 
 function tmpState(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-playbooks-'));
@@ -266,7 +272,7 @@ test('render() substitutes only what it was given, and leaves the rest alone', (
 test('init seeds COPIES of the playbooks and never overwrites one the user edited', () => {
   const dir = tmpState({ 'default.md': 'MY default, do not touch\n' });
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-home-'));
-  const first = seedPlaybooksAndDuties(dir, home);
+  const first = seedPlaybooksAndDuties(dir, [skillsDir(home)]);
   // the edited one is left alone; the rest arrive
   assert.ok(!first.playbooks.includes('default.md'), 'an existing file is not re-seeded');
   assert.ok(first.playbooks.includes('no-mistakes.md'));
@@ -275,7 +281,7 @@ test('init seeds COPIES of the playbooks and never overwrites one the user edite
   assert.ok(!fs.lstatSync(path.join(playbooksDir(dir), 'no-mistakes.md')).isSymbolicLink());
 
   // idempotent — a re-run (an upgrade, a second init) copies nothing
-  assert.deepStrictEqual(seedPlaybooksAndDuties(dir, home).playbooks, []);
+  assert.deepStrictEqual(seedPlaybooksAndDuties(dir, [skillsDir(home)]).playbooks, []);
   fs.rmSync(dir, { recursive: true, force: true });
   fs.rmSync(home, { recursive: true, force: true });
 });
@@ -285,7 +291,7 @@ test('init SYMLINKS the worker-duties skill, repoints a stale link, and leaves a
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bc-home-'));
   const skillDst = path.join(home, '.claude', 'skills', 'bridge-commander-worker');
 
-  const r = seedPlaybooksAndDuties(dir, home);
+  const r = seedPlaybooksAndDuties(dir, [skillsDir(home)]);
   assert.strictEqual(r.skill, skillDst);
   assert.ok(fs.lstatSync(skillDst).isSymbolicLink(), 'a symlink, so an upgrade upgrades the duties');
   assert.strictEqual(fs.readlinkSync(skillDst), PACKAGED_SKILL_DIR);
@@ -293,19 +299,19 @@ test('init SYMLINKS the worker-duties skill, repoints a stale link, and leaves a
   assert.ok(fs.existsSync(path.join(skillDst, 'images.md')), 'the whole skill dir ships, not one file');
 
   // already ours and pointing right: nothing to do
-  assert.strictEqual(seedPlaybooksAndDuties(dir, home).skill, '');
+  assert.strictEqual(seedPlaybooksAndDuties(dir, [skillsDir(home)]).skill, '');
 
   // a link left by an older checkout is repointed at the current one
   fs.unlinkSync(skillDst);
   fs.symlinkSync(path.join(home, 'somewhere-else'), skillDst, 'dir');
-  assert.strictEqual(seedPlaybooksAndDuties(dir, home).skill, skillDst);
+  assert.strictEqual(seedPlaybooksAndDuties(dir, [skillsDir(home)]).skill, skillDst);
   assert.strictEqual(fs.readlinkSync(skillDst), PACKAGED_SKILL_DIR);
 
   // a REAL directory is someone's own install — never clobbered
   fs.unlinkSync(skillDst);
   fs.mkdirSync(skillDst);
   fs.writeFileSync(path.join(skillDst, 'SKILL.md'), 'hand-rolled\n');
-  assert.strictEqual(seedPlaybooksAndDuties(dir, home).skill, '');
+  assert.strictEqual(seedPlaybooksAndDuties(dir, [skillsDir(home)]).skill, '');
   assert.strictEqual(fs.readFileSync(path.join(skillDst, 'SKILL.md'), 'utf8'), 'hand-rolled\n');
 
   fs.rmSync(dir, { recursive: true, force: true });
@@ -335,4 +341,187 @@ test('the documented placeholders are exactly the ones briefVars fills, plus ATT
 test('the documented frontmatter keys are exactly FM_KEYS', () => {
   assert.deepStrictEqual(FRONTMATTER.map((f) => f.key), FM_KEYS);
   for (const f of FRONTMATTER) assert.ok(f.desc && f.desc.trim(), f.key + ' has a description');
+});
+
+// ================= through the server: the card's playbook =================
+// The card's playbook is a POINTER to a markdown file the user owns, resolved
+// and rendered into the worker's brief at card.start and only there.
+
+function workerKey(dir, cardId) {
+  return lieutenantSession(dir, LT) + ':' + workerWindow(cardId);
+}
+async function boot() {
+  const { s, fdir, teardown } = await startServerWithProject({ prefix: 'bc-cardplaybook-' });
+  // the prompt the fake harness was spawned with
+  const prompt = (cardId) =>
+    JSON.parse(fs.readFileSync(path.join(fdir, workerKey(s.dir, cardId) + '.json'), 'utf8')).prompt;
+  const pbDir = path.join(s.dir, '.bridge-commander', 'playbooks');
+  return { s, fdir, prompt, pbDir, teardown };
+}
+
+test('the playbook list is served off disk, workspace and packaged together', async () => {
+  const { s, pbDir, teardown } = await boot();
+  try {
+    let r = await s.api('GET', '/api/playbooks');
+    assert.strictEqual(r.status, 200);
+    assert.deepStrictEqual(r.body.playbooks, ['default', 'investigation', 'no-mistakes']);
+    assert.strictEqual(r.body.dir, pbDir);
+
+    // a playbook dropped in a second ago is pickable now — no restart, no cache
+    fs.mkdirSync(pbDir, { recursive: true });
+    fs.writeFileSync(path.join(pbDir, 'house-style.md'), '# {{CARD_TITLE}}\n');
+    r = await s.api('GET', '/api/playbooks');
+    assert.ok(r.body.playbooks.includes('house-style'));
+
+    const cli = await runCli(['playbook', 'list', '--workspace', s.dir, '--port', String(s.port)]);
+    assert.strictEqual(cli.code, 0, cli.stderr);
+    assert.match(cli.stdout, /^house-style$/m);
+    assert.match(cli.stdout, /^no-mistakes$/m);
+  } finally { await teardown(); }
+});
+
+test('a card carries the playbook it was created with, and card patch --playbook changes it', async () => {
+  const { s, teardown } = await boot();
+  try {
+    const c = await s.api('POST', '/api/cards', withOwner({ title: 'Pick one', playbook: 'no-mistakes' }));
+    assert.strictEqual(c.body.card.playbook, 'no-mistakes');
+
+    const cli = await runCli(['card', 'patch', 'pick-one', '--playbook', 'investigation',
+      '--workspace', s.dir, '--port', String(s.port)]);
+    assert.strictEqual(cli.code, 0, cli.stderr);
+    assert.strictEqual((await s.api('GET', '/api/cards/pick-one')).body.playbook, 'investigation');
+
+    // a typo is refused where it is typed, and the error names what exists
+    let r = await s.api('PATCH', '/api/cards/pick-one', { playbook: 'no-mistkaes' });
+    assert.strictEqual(r.status, 400);
+    assert.match(r.body.error, /unknown playbook: no-mistkaes/);
+    assert.match(r.body.error, /no-mistakes/);
+    r = await s.api('POST', '/api/cards', withOwner({ title: 'Typo', playbook: 'nope' }));
+    assert.strictEqual(r.status, 400);
+    assert.match(r.body.error, /unknown playbook: nope/);
+
+    // and it can be cleared back to none
+    assert.strictEqual((await s.api('PATCH', '/api/cards/pick-one', { playbook: '' })).status, 200);
+    assert.strictEqual((await s.api('GET', '/api/cards/pick-one')).body.playbook, '');
+  } finally { await teardown(); }
+});
+
+test('card start refuses a card with no playbook, and names the playbooks', async () => {
+  const { s, teardown } = await boot();
+  try {
+    // cards that predate playbooks have none — that is the state, not a bug
+    await s.api('POST', '/api/cards', withOwner({ title: 'Old card', playbook: '', attributes: { repo: 'proj' } }));
+    const r = await s.api('POST', '/api/cards/old-card/start', { harness: 'fake' });
+    assert.strictEqual(r.status, 400);
+    assert.match(r.body.error, /has no playbook/);
+    assert.match(r.body.error, /card patch old-card --playbook/);
+    assert.match(r.body.error, /default, investigation, no-mistakes/);
+    // it did not half-start: no worker, still in backlog
+    assert.strictEqual((await s.api('GET', '/api/cards/old-card')).body.column, 'backlog');
+
+    // one playbook away from starting
+    assert.strictEqual((await s.api('PATCH', '/api/cards/old-card', { playbook: 'default' })).status, 200);
+    assert.strictEqual((await s.api('POST', '/api/cards/old-card/start', { harness: 'fake' })).status, 200);
+  } finally { await teardown(); }
+});
+
+// The dead `brief` key is not migrated and not special-cased: it is simply not
+// a key the board reads, so a card carrying only that one has no playbook and
+// takes the refusal every playbookless card already takes.
+test('a card whose only key is the dead `brief` has no playbook, and no special case says so', async () => {
+  const { s, teardown } = await boot();
+  try {
+    const c = await s.api('POST', '/api/cards', withOwner({
+      title: 'Legacy', playbook: '', brief: 'default', attributes: { repo: 'proj' },
+    }));
+    assert.strictEqual(c.body.card.playbook, '');
+    assert.strictEqual(c.body.card.brief, undefined, '`brief` is not a card key');
+    const r = await s.api('POST', '/api/cards/legacy/start', { harness: 'fake' });
+    assert.strictEqual(r.status, 400);
+    assert.match(r.body.error, /has no playbook/);
+  } finally { await teardown(); }
+});
+
+test('the card gets ITS playbook: playbook no-mistakes renders no-mistakes.md, fully', async () => {
+  const { s, prompt, teardown } = await boot();
+  try {
+    await s.api('POST', '/api/cards', withOwner({
+      title: 'Gate it', playbook: 'no-mistakes', attributes: { repo: 'proj' }, body: 'add the flag',
+    }));
+    assert.strictEqual((await s.api('POST', '/api/cards/gate-it/start', { harness: 'fake' })).status, 200);
+    const p = prompt('gate-it');
+    assert.match(p, /^# Gate it \(gate-it\)/);
+    assert.match(p, /Delivery — the no-mistakes gate/);
+    assert.match(p, /add the flag/);
+    assert.doesNotMatch(p, /\{\{/, 'nothing left unrendered');
+    // the OTHER playbooks' text is nowhere near it
+    assert.doesNotMatch(p, /a report, not a change/);
+  } finally { await teardown(); }
+});
+
+test('the playbook resolves at START: the body edited a second before it is the body the worker reads', async () => {
+  const { s, prompt, teardown } = await boot();
+  try {
+    await s.api('POST', '/api/cards', withOwner({
+      title: 'Stale?', playbook: 'default', attributes: { repo: 'proj' }, body: 'the ORIGINAL plan',
+    }));
+    // everything the brief reads keeps moving between create and start
+    await s.api('PATCH', '/api/cards/stale', { title: 'Fresh!', body: 'the REWRITTEN plan' });
+    await s.api('POST', '/api/feedback', { target: 'card:stale', text: 'and mind the mobile flow' });
+    assert.strictEqual((await s.api('POST', '/api/cards/stale/start', { harness: 'fake' })).status, 200);
+
+    const p = prompt('stale');
+    assert.match(p, /the REWRITTEN plan/);
+    assert.match(p, /^# Fresh! \(stale\)/);
+    assert.match(p, /and mind the mobile flow/);
+    assert.doesNotMatch(p, /the ORIGINAL plan/);
+  } finally { await teardown(); }
+});
+
+test('editing playbooks/default.md changes the next card started on it — no restart', async () => {
+  const { s, prompt, pbDir, teardown } = await boot();
+  try {
+    fs.mkdirSync(pbDir, { recursive: true });
+    fs.writeFileSync(path.join(pbDir, 'default.md'), 'HOUSE STYLE for {{CARD_ID}}\n');
+    await s.api('POST', '/api/cards', withOwner({ title: 'After the edit', attributes: { repo: 'proj' } }));
+    assert.strictEqual((await s.api('POST', '/api/cards/after-the-edit/start', { harness: 'fake' })).status, 200);
+    assert.strictEqual(prompt('after-the-edit'), 'HOUSE STYLE for after-the-edit\n');
+
+    // edit it again — the NEXT card gets the new text, same running server
+    fs.writeFileSync(path.join(pbDir, 'default.md'), 'SECOND take for {{CARD_ID}}\n');
+    await s.api('POST', '/api/cards', withOwner({ title: 'After the second', attributes: { repo: 'proj' } }));
+    assert.strictEqual((await s.api('POST', '/api/cards/after-the-second/start', { harness: 'fake' })).status, 200);
+    assert.strictEqual(prompt('after-the-second'), 'SECOND take for after-the-second\n');
+  } finally { await teardown(); }
+});
+
+// How {{ATTR_*}} renders (and that a missing one stays literal) is pinned in
+// the unit tests above; this pins that the server hands the renderer the
+// card's attributes as they are at START.
+test('{{ATTR_*}} reads the card attributes at start, including one set after create', async () => {
+  const { s, prompt, pbDir, teardown } = await boot();
+  try {
+    fs.mkdirSync(pbDir, { recursive: true });
+    fs.writeFileSync(path.join(pbDir, 'attrs.md'), 'PR {{ATTR_PR_URL}} on {{ATTR_REPO}}\n');
+    await s.api('POST', '/api/cards', withOwner({ title: 'Review it', playbook: 'attrs', attributes: { repo: 'proj' } }));
+    // set through the CLI, exactly as a lieutenant would
+    const cli = await runCli(['card', 'patch', 'review-it', '--attr', 'pr_url=https://github.com/o/r/pull/9',
+      '--workspace', s.dir, '--port', String(s.port)]);
+    assert.strictEqual(cli.code, 0, cli.stderr);
+    assert.strictEqual((await s.api('POST', '/api/cards/review-it/start', { harness: 'fake' })).status, 200);
+    assert.strictEqual(prompt('review-it'), 'PR https://github.com/o/r/pull/9 on proj\n');
+  } finally { await teardown(); }
+});
+
+test('a playbook deleted out from under the card is a loud refusal', async () => {
+  const { s, pbDir, teardown } = await boot();
+  try {
+    fs.mkdirSync(pbDir, { recursive: true });
+    fs.writeFileSync(path.join(pbDir, 'doomed.md'), 'hi {{CARD_ID}}\n');
+    await s.api('POST', '/api/cards', withOwner({ title: 'Orphan', playbook: 'doomed', attributes: { repo: 'proj' } }));
+    fs.unlinkSync(path.join(pbDir, 'doomed.md'));
+    const r = await s.api('POST', '/api/cards/orphan/start', { harness: 'fake' });
+    assert.strictEqual(r.status, 400);
+    assert.match(r.body.error, /points at playbook "doomed", which no file matches/);
+  } finally { await teardown(); }
 });

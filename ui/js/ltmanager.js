@@ -14,43 +14,28 @@
 // verb is how it gets opened by accident.
 import { api } from './api.js';
 import { lieutenantColor } from './state.js';
-import { avatarHtml } from './avatars.js';
+import { avatarHtml, validAvatar } from './avatars.js';
 import { openLtSettings } from './ltswitcher.js';
 import { openArtifactFile } from './detail.js';
+import { listSection, button } from './listpanel.js';
+import { lieutenantView } from './panelviews.js';
 
-const listEl = document.getElementById('lt-list');
+let listEl;
+/** Hand the section its list element: {list}. */
+export function initLieutenants(els) { listEl = els.list; }
 
 // [{id, name, color, avatar, prefix, next, cards, memory, session}] — the last
 // answer from /api/lieutenants?live=1, in the order the board holds them.
 let items = null;
-let loading = false;
 
-// Same contract as the projects and playbooks sections: `reload` is what the tab
-// passes on the way in, so entering reads the session probes afresh while the
-// renders that follow — one per board event — repaint what is already here.
-// Nothing runs while another tab is up, so opening the screen for labels asks
-// the harness nothing.
-export async function renderLieutenants(reload) {
-  if (reload) items = null;
-  if (items) return paint();
-  if (loading) return;
-  loading = true;
-  try {
-    items = (await api.lieutenants(true)).lieutenants || [];
-  } catch (e) {
-    listEl.textContent = '⚠ ' + e.message;
-    return;
-  } finally { loading = false; }
-  paint();
-}
-
-// The three session states the server answers with, each said as the thing the
-// captain would do about it.
-const SESSION = {
-  live: { text: 'live', cls: 'lt-live', title: 'the harness says its session is up' },
-  dead: { text: 'dead', cls: 'lt-dead', title: 'it had a session and it is gone — the board respawns it, or reset it yourself' },
-  none: { text: 'no session', cls: 'lt-none', title: 'never spawned: this lieutenant is registered but nothing is running for it' },
-};
+// `reload` is what the tab passes on the way in, so entering reads the session
+// probes afresh while the renders that follow — one per board event — repaint
+// what is already here. Opening the screen for labels asks the harness nothing.
+export const renderLieutenants = listSection({
+  load: async () => { items = (await api.lieutenants(true)).lieutenants || []; },
+  paint,
+  fail: (e) => { listEl.textContent = '⚠ ' + e.message; },
+});
 
 // One line per lieutenant, the way the playbooks tab is one line per playbook:
 // face, name, id, the three facts as a single dim run, and the two actions as
@@ -58,9 +43,11 @@ const SESSION = {
 function paint() {
   listEl.textContent = '';
   for (const l of items) {
+    const v = lieutenantView(l);
     const row = document.createElement('div');
     row.className = 'lt-row';
-    row.append(face(l), name(l), id(l), facts(l), actions(l));
+    row.append(face(l), span('lt-name', v.name), span('lt-id', v.id), facts(v),
+      actions(v, (a) => (a.key === 'settings' ? openLtSettings(l.id) : openCharter(l))));
     listEl.appendChild(row);
   }
   if (!items.length) listEl.textContent = 'no lieutenants';
@@ -69,7 +56,7 @@ function paint() {
 // the avatar in its own colour, or a plain dot when it has none
 function face(l) {
   const el = document.createElement('span');
-  if (Number.isInteger(l.avatar) && l.avatar >= 0 && l.avatar <= 63) {
+  if (validAvatar(l.avatar) !== null) {
     el.className = 'lt-face';
     el.style.borderColor = lieutenantColor(l.id);
     el.innerHTML = avatarHtml(l.avatar);
@@ -80,58 +67,29 @@ function face(l) {
   return el;
 }
 
-function name(l) {
+function span(cls, text) {
   const el = document.createElement('span');
-  el.className = 'lt-name';
-  el.textContent = l.name || l.id;
+  el.className = cls;
+  el.textContent = text;
   return el;
 }
 
-// the id is what every verb takes, so it reads as a value rather than a caption
-function id(l) {
-  const el = document.createElement('span');
-  el.className = 'lt-id';
-  el.textContent = l.id;
-  return el;
-}
-
-const countText = (n) => (n === 1 ? '1 card' : n + ' cards');
-
-// The three facts as one line — `WAL-4 · 14 cards · live`. Separators, not
-// labels: the section heading says what these are once, so eight rows do not
-// each spell it out. The session is the one part that keeps a colour of its
-// own, because a dead one has to be what the eye lands on.
-function facts(l) {
-  const st = SESSION[l.session] || SESSION.none;
-  const el = document.createElement('span');
-  el.className = 'lt-facts';
+// Separators, not labels: the section heading says what these are once. The
+// session keeps a colour of its own, because a dead one is what the eye lands on.
+function facts(v) {
+  const el = span('lt-facts', v.facts);
   el.title = 'next card id · live cards it owns · session';
-  const sess = document.createElement('span');
-  sess.className = st.cls;
-  sess.textContent = st.text;
-  sess.title = st.title;
-  el.append(l.next + ' · ' + countText(l.cards) + ' · ', sess);
+  const sess = span(v.session.cls, v.session.text);
+  sess.title = v.session.title;
+  el.append(sess);
   return el;
 }
 
-function actions(l) {
+function actions(v, on) {
   const el = document.createElement('span');
   el.className = 'lt-acts';
-  el.append(
-    action('⚙', 'settings — name, colour, avatar, voice, card prefix', () => openLtSettings(l.id)),
-    action('✎', 'charter — ' + l.memory, () => openCharter(l)),
-  );
+  el.append(...v.actions.map((a) => button(a, () => on(a))));
   return el;
-}
-
-function action(label, title, onClick) {
-  const b = document.createElement('button');
-  b.type = 'button';
-  b.className = 'lt-act';
-  b.textContent = label;
-  b.title = title;
-  b.onclick = onClick;
-  return b;
 }
 
 // The charter is a file, so editing it is the file screen — the same 💾, the

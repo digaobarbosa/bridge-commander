@@ -2,17 +2,19 @@
 // the lieutenant's main chat or one of its card threads (a card thread's
 // interlocutor is always the owning lieutenant). Whole-window mode switch,
 // premium composer.
-import { S, card, cards, lieutenants, lieutenant, lieutenantColor, lieutenantName, lieutenantAvatar, lieutenantUnread, cardStatus, cardActivityTs, render, threadUnread, targetOwedState, targetOwedStale, USER } from './state.js';
+import { S, card, cards, lieutenants, lieutenant, lieutenantColor, lieutenantName, lieutenantAvatar, lieutenantUnread, cardStatus, cardActivityTs, render, applyBoard, applyLocalRead, threadUnread, targetOwedState, targetOwedStale, USER } from './state.js';
 import { api } from './api.js';
-import { esc, hhmm, dayLabel, cardEmoji, setHtmlIfChanged, fmtSize, isImageMime, statusBlockHtml, ctxBarHtml, owedIndHtml } from './util.js';
+import { esc, hhmm, dayLabel, cardEmoji, setHtmlIfChanged, fmtSize, isImageMime, statusBlockHtml, ctxBarHtml, owedIndHtml, runsOn, lastTurnHtml } from './util.js';
 import { md, mdEnhance, copyText } from './md.js';
-import { speakMessage, trackMessages } from './voice.js';
+import { speakMessage } from './voice.js';
 import { openAttachment } from './detail.js';
 import { avatarHtml } from './avatars.js';
 import { isEchoOf, addPending, pendingFor } from './pending.js';
 import { fileContextBlock } from './filectx.js';
 import { CHAT_KEY, CLOSED, encodeChat, decodeChat } from './chatmem.js';
 import { slashOptions } from './slash.js';
+import { interruptTarget, escInterrupts } from './interrupt.js';
+import { cardPermissions, mainChatPermissions, permBlockHtml, capturePermFocus, hydratePermInputs } from './perms.js';
 
 const feedEl = document.getElementById('chat-feed');
 const titleEl = document.getElementById('chat-title');
@@ -376,8 +378,10 @@ function ltTriggerHtml(lt) {
   const owed = targetOwedState('lieutenant:' + lt.id);
   const ind = owedIndHtml(owed, owed && targetOwedStale('lieutenant:' + lt.id));
   const st = lt.agentStatus || {};
-  const model = st.model
-    ? '<span class="clt-model">' + esc(st.model) + (st.effort ? ' <span class="clt-effort">(' + esc(st.effort) + ')</span>' : '') + '</span>'
+  const on = runsOn(lt);
+  const model = on.model
+    ? '<span class="clt-model">' + esc(on.model) + (on.effort ? ' <span class="clt-effort">(' + esc(on.effort) + ')</span>' : '')
+      + lastTurnHtml('clt-last', on.last, true) + '</span>'
     : '';
   const meta = model || ctxBarHtml(st) ? '<span class="clt-meta">' + model + ctxBarHtml(st) + '</span>' : '';
   const others = lieutenants().reduce((n, l) => n + (l.id === lt.id ? 0 : lieutenantUnread(l)), 0);
@@ -391,6 +395,7 @@ function ltTriggerHtml(lt) {
 
 export function renderChat() {
   const target = currentTarget();
+  stopBtn.hidden = !interruptTarget(target, S.doc);
   if (!target) {
     backBtn.hidden = true;
     openBtn.hidden = true;
@@ -488,6 +493,11 @@ export function renderChat() {
   }
   const owedState = targetOwedState(target);
   if (owedState) tail += typingHtml(targetOwedStale(target) ? 'stale' : owedState, ltName);
+  // an agent of THIS conversation is blocked on a permission prompt: answer it
+  // where you are reading, last in the feed (the tray carries the same block)
+  const perms = isCard ? cardPermissions(S.doc, c.id) : lt ? mainChatPermissions(S.doc, lt.id) : [];
+  for (const p of perms) tail += permBlockHtml(p, 'chat');
+  const permFocus = perms.length ? capturePermFocus() : null;
 
   const prev = feed;
   feed = { key: target, blocks, tail };
@@ -499,8 +509,9 @@ export function renderChat() {
   } else if (prefixOk && prev.blocks.length) {
     // append-only delta: swap the typing indicator, add the new blocks at the
     // end; the earlier DOM — scroll, selection, focus — is never touched
-    const typingEl = feedEl.querySelector('.msg.typing');
-    if (typingEl) typingEl.remove();
+    // every tail element goes: the unified stream can hold several owed
+    // bubbles plus approval blocks, and each one is re-emitted below
+    for (const el of feedEl.querySelectorAll('.msg.typing, .perm-block')) el.remove();
     const fresh = blocks.slice(prev.blocks.length);
     feedEl.insertAdjacentHTML('beforeend', fresh.map((b) => b.html).join('') + tail);
     mdEnhance(feedEl);
@@ -525,6 +536,7 @@ export function renderChat() {
     };
   }
 
+  if (perms.length) hydratePermInputs(feedEl, permFocus);
   maybeMarkRead(isCard ? c : null, target);
 }
 
@@ -538,16 +550,8 @@ function markRead(target, ts) {
   marked.set(target, ts);
   api.markThreadRead(target).catch(() => marked.delete(target));
   // The server persists the marker WITHOUT broadcasting (a read only moves
-  // this user's own derivation), so apply it locally: the reads map feeds
-  // threadUnread/bell, the card's server-derived status.unread feeds the
-  // board dot. The next real broadcast carries the same state.
-  const reads = S.doc.reads || (S.doc.reads = {});
-  const u = reads[USER] || (reads[USER] = { notifSeq: 0, notifSeqs: [], threads: {} });
-  const threads = u.threads || (u.threads = {});
-  if (!threads[target] || threads[target] < ts) threads[target] = ts;
-  const m = /^card:(.+)$/.exec(target);
-  const c = m && card(m[1]);
-  if (c && c.status) c.status.unread = false;
+  // this user's own derivation), so apply it locally.
+  applyLocalRead(target, ts);
   // markRead fires from inside render; repaint dots/bell on the next tick
   if (!readRepaint) readRepaint = setTimeout(() => { readRepaint = 0; render(); }, 0);
 }
@@ -830,7 +834,7 @@ async function watchEcho(target, text) {
   for (let i = 0; i < 120; i++) { // 250ms steps: refetch at 3s, hint at 10s, give up at 30s
     if (token !== echoWatch) return;
     if (seen()) { clearSyncHint(); return; }
-    if (i === 12) api.board().then((doc) => { if (token === echoWatch) { S.doc = doc; trackMessages(doc); render(); } }).catch(() => {});
+    if (i === 12) api.board().then((doc) => { if (token === echoWatch) applyBoard(doc); }).catch(() => {});
     if (i === 40) setSyncHint();
     await new Promise((r) => setTimeout(r, 250));
   }
@@ -927,4 +931,30 @@ inputEl.onkeydown = (e) => {
   }
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
 };
+// ---------- stop (⏹ and Esc) ----------
+// The button is a tap target for a phone; Esc is the same verb from a keyboard.
+// Both stop the running turn only — the agent stays up for the next message.
+const stopBtn = document.getElementById('chat-stop');
+async function stopAgent(t) {
+  if (stopBtn.disabled) return;
+  stopBtn.disabled = true;
+  try { await api.interrupt(t.kind, t.id); }
+  catch (e) { setSendError('could not stop the agent: ' + e.message); }
+  finally { stopBtn.disabled = false; }
+}
+stopBtn.onclick = () => {
+  const t = interruptTarget(currentTarget(), S.doc);
+  if (t) stopAgent(t);
+};
+// escInterrupt(e) -> true when this Esc stopped the agent. main.js asks it
+// after every overlay had its turn, so an open menu still closes first.
+export function escInterrupt(e) {
+  if (e.target !== inputEl || inputEl.disabled) return false;
+  const t = escInterrupts({ value: inputEl.value, attachments: pendingAtts.length, menuOpen: slash.open,
+    target: currentTarget(), doc: S.doc });
+  if (!t) return false;
+  e.preventDefault();
+  stopAgent(t);
+  return true;
+}
 document.getElementById('chat-form').onsubmit = (e) => { e.preventDefault(); send(); };

@@ -13,7 +13,7 @@ const path = require('node:path');
 const {
   STATE_DIR_NAME, LEGACY_STATE_DIR_NAME,
   migrateStateDir, resolveStateDir, migrateHomeStateDir,
-} = require('../server/statedir.js');
+} = require('../server/layout.js');
 const { startServer } = require('./helper.js');
 
 function tmp() { return fs.mkdtempSync(path.join(os.tmpdir(), 'bc-migrate-')); }

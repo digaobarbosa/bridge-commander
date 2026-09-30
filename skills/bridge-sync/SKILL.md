@@ -1,0 +1,135 @@
+---
+name: bridge-sync
+description: Link the current Codex or Claude session to a Bridge Commander card, then automatically sync meaningful development updates with a lightweight model. Include problem context, progress, and PR, Slack, Linear, or other references for managed and external sessions.
+---
+
+# Bridge sync
+
+Keep a durable link from a card back to the **current development conversation**. A checkpoint
+updates the card through `POST /api/sessions/sync`; the server deduplicates by host, provider,
+and exact session UUID. Board-managed workers use the same link as independently started sessions.
+
+## Capture identity before summarizing
+
+- Codex: use the current `CODEX_THREAD_ID`, or an exact session ID supplied by the caller.
+- Claude: use the exact `session_id` from the invoking hook/caller, or an explicit session ID.
+  Never guess from the newest transcript or use `--continue`/`--last` as identity.
+- Include the original conversation's absolute working directory, hostname, and `surface`
+  (`app` for a desktop conversation, `cli` for a terminal conversation).
+- If identity is unavailable, obtain the exact ID before writing a card. A summarizer's session
+  ID is never the development session ID.
+
+## Automatic milestone sync after linking
+
+The first successful sync enables **agent-driven milestone syncing for this conversation**.
+Retain the board address, returned card ID, original session identity, and last successful
+checkpoint in the conversation/handoff context. On later turns, use this skill proactively
+without waiting for another invocation. After compaction or resume, recover the binding from
+the board using the exact session identity if needed; never guess the latest session or card.
+
+Sync when a material update changes the card: an agreed scope/design decision, completed
+implementation step, meaningful test result, commit or PR update, review finding/resolution,
+development-stage change, blocker, or resolved blocker. Combine related changes into one
+checkpoint at a milestone boundary, normally before reporting the outcome to the user. Skip
+routine exploration, repeated status, wording changes, and updates already in the last checkpoint.
+
+Use the same lightweight helper and explicit `--card` to update the existing card, preserving
+its context and exact source links. For split work, update only the affected sibling card(s).
+Confirm success before advancing the remembered checkpoint. If sync fails, keep the previous
+checkpoint, report the failure briefly, and retry on the next relevant update rather than looping.
+
+Honor requests to pause or stop automatic syncing until the user asks to resume; keep the
+saved session link. This is an instruction to the active development agent, not an installed
+background hook or monitor. Syncing pauses while that agent is inactive.
+
+## One PR per card
+
+Track at most **one delivery PR per card**. A card without a PR is fine during planning;
+never invent a PR or combine multiple delivery PRs into one card.
+
+When a task requires multiple PRs, split it into one card per PR. Connect those sibling cards
+with the **same task-specific card label** and connect their PRs with the **same title prefix**.
+Reuse an established label/prefix for that task. For example, label all cards `session-sync`
+and title their PRs `[session-sync] Persist conversation links` and
+`[session-sync] Add resume navigation`. Keep each card's scope, progress, and primary PR specific
+to its own change; mention sibling card IDs and dependencies in the body.
+
+Use the board API to create the sibling cards and update their metadata. `PATCH /api/cards/:id`
+accepts `labels` and `attributes.prs`; retain unrelated labels and attributes, and keep the
+tracked PR list to one entry. Include the shared prefix when creating or updating PR titles
+as part of the requested PR workflow.
+
+Use an explicit `--card` when syncing sibling cards: session deduplication cannot select
+between multiple cards linked to the same external conversation. A Commander-managed session
+stays attached to its own card; sibling managed work uses its own actual session identity.
+
+## Sync a checkpoint
+
+Resolve `scripts/sync.js` relative to this skill directory. Save a short checkpoint (at most
+12 KB) to a temporary UTF-8 file: the original problem and why it matters, agreed approach,
+work completed, evidence, current stage, next action, blockers, and relevant source links.
+Include the background needed to understand the task, not just the latest progress message.
+Use a file/tool argument for content; do not interpolate conversation text into a shell command.
+
+Before replacing an existing card's body, read its description and retain useful requirements,
+notes, decisions, and references in the checkpoint. Gather source links from the conversation,
+card brief, and current development artifacts. Include PR URLs and their purpose, the Slack
+thread or Linear ticket that triggered the work, and relevant specs, issues, or commits when
+available. Use scoped read-only lookups when a referenced item needs its exact URL or title;
+do not search unrelated history. Never invent URLs, PRs, tickets, or claims about their status.
+
+The small model writes both a short timeline summary and a Markdown card body. The body should
+let someone understand the task without opening this conversation: explain the problem and
+intended behavior, describe the approach, state progress and evidence, and give the next step.
+Include a References section with descriptive clickable links when sources are known. Omit
+empty sections and unsupported details; preserve exact URLs. A PR list alone is not a description.
+Use `[short descriptive label](exact URL)` so long source URLs do not overwhelm the card.
+
+Run the helper with the captured identity and `--checkpoint-file`:
+
+```sh
+node /absolute/path/to/bridge-sync/scripts/sync.js \
+  --provider codex --session-id EXACT_UUID --cwd /absolute/project/path \
+  --surface app --workspace /absolute/board/workspace \
+  --checkpoint-file /absolute/checkpoint.txt
+```
+
+The helper runs a **separate one-shot lightweight model**, defaulting to `gpt-6-luna` for
+Codex and `haiku` for Claude. It does not change the development conversation's model or
+resume it. Configure `--model` or `BRIDGE_SYNC_MODEL` when a different small model is available.
+If the small runner fails, report the failure; do not silently summarize with the development
+model or claim that the card was updated.
+
+The helper discovers the board by walking up from its invocation directory for
+`.bridge-commander/config.json` or `board.json` (legacy `.bridge-command` also works).
+Use `--workspace`, `--board-url`, or `BRIDGE_SYNC_URL` when the board is elsewhere.
+It never initializes or restarts the board. Network calls time out after 10 seconds; model
+calls after 120 seconds. Both limits are configurable with the helper's `--help` flags.
+
+Pass `--card CARD_ID` to link an existing card. With no card, the server reuses the card already
+holding this session, including a regular Commander worker. For a new session, provide
+`--owner LIEUTENANT_ID --title "Task title"`; read `GET /api/board` if owner/card selection needs
+discovery. Do not create a duplicate when a session belongs to an archived card: report the
+server's refusal or use a caller-selected active target card.
+
+Checkpoints carry `body` (Markdown), `summary`, `stage` (`planning`, `implementation`, `review`,
+`peer`), `nextAction`, and `blocker`. A supplied body replaces the card description; leaving it
+out preserves the existing description. Managed cards keep their orchestrator-owned column.
+External companion cards can follow their stage without launching a worker. Completion and archival
+remain deliberate board actions.
+
+Explicit checkpoint fields supplied by the caller take precedence over the small model's
+suggestions (for example `--stage planning`). Use `--body-file FILE` to supply an exact Markdown
+description instead of the generated body.
+
+## Direct API input and hooks
+
+For a prepared checkpoint, `--stdin` or `--input FILE` accepts JSON with `card`, `owner`,
+`title`, `session: {provider, id, cwd, host, surface}`, and the checkpoint fields, including
+optional `body` (up to 20,000 characters). This path does not invoke a model.
+Claude hook JSON containing `session_id` and `cwd` is accepted with
+`--provider claude`; hook installation is separate from invoking this skill.
+
+Use the returned card/session to confirm the link and report the update briefly. The card's eye
+can open/resume the original conversation across development stages. Further meaningful updates
+are synced by the active agent under the milestone rule above.

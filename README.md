@@ -47,9 +47,22 @@ Per-workspace config lives in `.bridge-commander/config.json`:
 |---|---|---|
 | `port` | `4780` | server port (also `--port N` on `init`/`open`) |
 | `host` | `127.0.0.1` | bind address — see network exposure below |
-| `harness` | `claude` | default agent harness (`claude` \| `codex`) |
+| `harness` | `claude` | default agent harness: a built-in (`claude` \| `codex`) or a profile a plugin contributes (`plugins/deepseek`; `claude-acp` \| `codex-acp` from `plugins/acp-agents`, see [harness/ACP.md](harness/ACP.md#the-shipped-profiles-claude-acp-and-codex-acp)) |
+| `permissionMode` | `auto` | how agents launch: `auto` \| `default` \| `acceptEdits` \| `bypass`. Outside `bypass`, a prompt an agent would show lands on the board for you to approve or deny |
 | `voices` | — | UI text-to-speech voice filter |
 | `tts` | — | speak agent messages through an external TTS engine: `{"url": "http://127.0.0.1:8883", "lang": "pt", "voice": null, "params": {}}` (voxbench API). Absent = the board stays silent. The **server** reaches the engine: the browser talks to `/api/tts/*` on the board's own origin and the url only has to be reachable from the machine running the server (no CORS, no tailnet on the phone) |
+
+Two more files in `.bridge-commander/` shape the harnesses:
+
+| File | Meaning |
+|---|---|
+| `plugins.json` | the plugin overlay: `{"plugins": {"deepseek": {"enabled": true}}, "contributions": {"profile:codex": {"enabled": false}}}` turns a plugin, or one of its contributions, on or off. Shipped plugins live in `plugins/<id>/`; a workspace's own in `.bridge-commander/plugins/<id>/` replaces a shipped one of the same id. Re-read whenever the board or `bc-axi plugins enable\|disable` writes it; agent profiles only register at server start |
+| `secrets.env` | `KEY=value` lines a profile's `env` may reference as `${KEY}` (the server's own environment wins). `bc-axi init` already keeps `.bridge-commander/` out of git. Values reach the agent through a mode-0600 file its launch sources — never argv, the tmux launch line or `spawn-args` |
+
+Per-browser settings live in the board's ⚙️ menu, not here. One of them, **terminal**, adds a ⌨
+to the 👁 drawer that opens the agent's tmux session in a real terminal: `iTerm2 (macOS)` hands an
+`iterm2:` link to iTerm (it asks before running), `copy tmux command` works with any terminal. Off
+by default.
 
 Env knobs (set on the server process):
 
@@ -79,6 +92,58 @@ the board, including starting workers (running code):
 - Private mesh (e.g. Tailscale): set `host` to that interface's address; a loopback listener is
   kept alongside. The mesh is your only auth boundary.
 - **Never bind `0.0.0.0`.**
+
+## Session companion
+
+The `bridge-sync` skill links an existing Codex or Claude conversation to a card and updates a
+recent checkpoint through the board API. Its Markdown description explains the problem,
+approach, progress, and known PR, Slack, Linear, or other reference links. The eye opens that
+conversation in every stage, including archived cards; multiple linked conversations have a
+picker and a current selection.
+Commander-managed workers save the same links automatically. External companion cards follow
+their development stage without spawning a worker. CLI sessions use the terminal setting or
+offer a copyable exact resume command; Codex desktop sessions open in Codex. Claude defaults
+to CLI unless its harness profile supplies a verified app link. Use launch links on the session's
+machine; opening an old conversation does not recreate a released checkout.
+
+Install the skill folder in `~/.claude/skills/bridge-sync` and symlink it from
+`~/.codex/skills/bridge-sync` to keep Claude as the canonical source. Invoke `/bridge-sync` in
+Claude or `$bridge-sync` in Codex. Its helper uses a separate lightweight model (`haiku` or
+`gpt-6-luna`, configurable), leaving the development model unchanged. See
+[the skill](skills/bridge-sync/SKILL.md) for board discovery and direct API input.
+
+## Plugins
+
+A plugin is a folder with a `plugin.json`: shipped ones in `plugins/<id>/`, a workspace's own in
+`.bridge-commander/plugins/<id>/` (the same id replaces the shipped one whole). A manifest can
+contribute agent **profiles**, card **commands** placed in menus with a `when` predicate,
+**checks**, views and sections; an optional `server.js` runs on the board's server and an
+optional `ui` module in the browser. The RFC is [docs/rfc/plugins.md](docs/rfc/plugins.md), the
+exact shapes are in [docs/rfc/plugins-contracts.md](docs/rfc/plugins-contracts.md).
+
+- **The overlay** (`.bridge-commander/plugins.json`) turns a plugin or one contribution on or off
+  and holds each plugin's config. The board's Plugins settings and `bc-axi plugins` write it; the
+  server reloads the catalog on each write. A change to which agent profiles are enabled needs a
+  server restart, and the answer says so.
+- **`secrets.env`** holds the values a profile's `env` references as `${KEY}` (see above).
+- **Commands** run one of three ways: a shell line (every `${card.*}` / `${input.*}` value is
+  single-quoted into it, and `BC_CARD`, `BC_WORKTREE`, `BC_INPUT_<NAME>`… ride the env), a link
+  to open, or the plugin's own server handler. A `tracked` command is an **activity**: the board
+  lists it, its whole log is kept in `.bridge-commander/runs/`, and a failure wakes the card's
+  owner.
+- **Events** (`card-created`, `card-moved`, `card-archived`, `worker-started`, `worker-done`,
+  `worker-died`, `activity-ended`) reach a plugin that says `"activation": "boot"`. They are
+  observe-only, like hooks.
+- The PR watch is the shipped `github` plugin's: `bc-axi plugins disable github` turns it off.
+
+```
+bc-axi plugins                               # id, source, enabled, active, error
+bc-axi plugins enable|disable <id>
+bc-axi command run <command-id> <card-id> [--input k=v]...
+bc-axi activities [--card <id>]
+bc-axi activity log <activity-id> [--follow]
+bc-axi checks [--phase init|boot]            # init also runs the init checks itself
+```
 
 How it works inside: [ARCHITECTURE.md](ARCHITECTURE.md). The conceptual API
 ([docs/api/overview.md](docs/api/overview.md)) is the spec the implementation follows.

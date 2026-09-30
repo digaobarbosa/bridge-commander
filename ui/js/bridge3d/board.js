@@ -42,6 +42,7 @@ import { ChatPanel } from './chat.js';
 import { addMarkdown } from './md3d.js';
 import { Field } from './field.js';
 import { Target } from './hover.js';
+import { byId, byRecency, cardMatches } from '../state.js';
 
 const D = W.WALL.distM;
 const ROWS = W.wallRows();
@@ -362,11 +363,9 @@ export class BoardWall {
     this.repaint();
   }
   filters() {
-    const lts = new Map((this.doc.lieutenants || []).map((l) => [l.id, l]));
-    const cols = new Map((this.doc.columns || []).map((c) => [c.id, c.title || c.id]));
     const on = [];
-    if (this.owner) on.push((lts.get(this.owner) || {}).name || this.owner);
-    if (this.column) on.push(shortColumn(cols.get(this.column) || this.column));
+    if (this.owner) on.push((byId(this.doc.lieutenants).get(this.owner) || {}).name || this.owner);
+    if (this.column) on.push(shortColumn((byId(this.doc.columns).get(this.column) || {}).title || this.column));
     if (this.query.trim()) on.push('"' + this.query.trim() + '"');
     return on;
   }
@@ -381,19 +380,15 @@ export class BoardWall {
   // Which lanes belong to which column. Recomputed on OPEN and never while he
   // is standing in front of it — see world.js.
   repaint() {
-    const q = this.query.trim().toLowerCase();
-    const lts = new Map((this.doc.lieutenants || []).map((l) => [l.id, l]));
-    const cols = new Map((this.doc.columns || []).map((c) => [c.id, c.title || c.id]));
+    const lts = byId(this.doc.lieutenants);
     const all = this.doc.cards || [];
-    const hit = (c) => {
-      if (this.owner && c.owner !== this.owner) return false;
-      if (this.column && c.column !== this.column) return false;
-      if (!q) return true;
-      const lt = lts.get(c.owner);
-      return [c.title, c.id, c.column, cols.get(c.column), c.owner, lt && lt.name, (c.labels || []).join(' ')]
-        .some((s) => String(s || '').toLowerCase().includes(q));
+    // The flat board's filter rule, with the wall's three controls as its filter.
+    const filter = {
+      text: this.query,
+      sel: this.owner ? [{ kind: 'owner', value: this.owner, mode: 'in' }] : [],
+      columns: this.column ? [this.column] : [],
     };
-    const kept = all.filter(hit);
+    const kept = all.filter((c) => cardMatches(c, filter, this.doc));
 
     // **One lane per board column.** That is what makes a column a column, and
     // it is the whole reason a lane is 27.75° wide and a title is 36 characters
@@ -404,10 +399,7 @@ export class BoardWall {
     this.lanes.forEach((lane, i) => {
       lane.column = frame[i] || null;
       const id = lane.column && lane.column.id;
-      const mine = id
-        ? kept.filter((c) => c.column === id).sort((a, b) => String(b.activity || b.updated || '')
-          .localeCompare(String(a.activity || a.updated || '')))
-        : [];
+      const mine = id ? kept.filter((c) => c.column === id).sort(byRecency) : [];
       lane.cards = mine;
       lane.title.setProperties({ text: safe(shortColumn((lane.column && lane.column.title) || id || '')) });
       lane.count.setProperties({ text: safe(String(mine.length)) });
@@ -553,7 +545,7 @@ export class BoardWall {
       if (first === lane.first) continue;
       lane.first = first;
       lane.scrolled = now;
-      this._bind(lane, new Map((this.doc.lieutenants || []).map((l) => [l.id, l])));
+      this._bind(lane, byId(this.doc.lieutenants));
     }
   }
 }
@@ -605,11 +597,7 @@ export class CardPanel extends ChatPanel {
     else this.addText('no body yet', { color: COL.dim });
     if (list.length) {
       this.addText('- the thread -', { size: W.TYPE.meta, color: COL.faint });
-      for (const m of list) {
-        const mine = m.author === 'user';
-        this.addText((mine ? 'you' : (m.author || 'lieutenant')), { size: W.TYPE.meta, color: COL.faint });
-        this.addText(m.text || '', { color: mine ? COL.dim : COL.text });
-      }
+      for (const m of list) this.addMessage(m);
     }
     if (!this._toTop) this.scrollToEnd();
   }

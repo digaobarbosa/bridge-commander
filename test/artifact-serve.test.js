@@ -1,0 +1,276 @@
+'use strict';
+// Artifact serve — the READ side of /api/artifact and /artifacts/<dir>/<rel>.
+// The text preview (default) and the raw byte mode (raw=1) that backs inline
+// <img>/<video>/<audio> and downloads: the auth guard (uri must be listed
+// verbatim on a live card), the path/file:// guard, the size cap and the
+// attachments-grade hardening all hold for raw mode too.
+//
+// The directory serve gives an HTML artifact a folder for its relative
+// references to sit in — `?uri=…&raw=1` has none, so `./beep.wav` beside the
+// page asked the board for /api/beep.wav. It is scoped to that folder only.
+const test = require('node:test');
+const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
+const { startServerWithLieutenant, LT } = require('./helper');
+
+// A minimal but valid 1x1 PNG.
+const PNG = Buffer.from(
+  '89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478' +
+  '9c6200010000050001' + '0d0a2db400000000' + '49454e44ae426082',
+  'hex'
+);
+
+// Create a card and promote a file at `filePath` (bare path or file:// uri) to
+// its artifacts; returns the stored artifact uri (normalized by the server).
+async function cardWithArtifact(s, uri, label) {
+  // no id pinned: each call mints its own (ADA-1, ADA-2, …), so a test may
+  // stand up several of these without colliding
+  const cr = await s.api('POST', '/api/cards', { owner: LT, title: 'Deliverable' });
+  assert.strictEqual(cr.status, 200, JSON.stringify(cr.body));
+  const id = cr.body.card.id;
+  const add = await s.api('POST', '/api/cards/' + id + '/artifacts', { uri, label });
+  assert.strictEqual(add.status, 200, JSON.stringify(add.body));
+  return { id, uri: add.body.artifact.uri };
+}
+
+test('raw=1 for a listed image → 200, image Content-Type, hardening headers, exact bytes', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    const img = path.join(s.dir, 'lunch.png');
+    fs.writeFileSync(img, PNG);
+    const { uri } = await cardWithArtifact(s, img, 'almoço do captain');
+
+    const res = await fetch(s.base + '/api/artifact?uri=' + encodeURIComponent(uri) + '&raw=1');
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers.get('content-type'), 'image/png');
+    assert.strictEqual(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.strictEqual(res.headers.get('content-security-policy'), 'sandbox');
+    assert.match(res.headers.get('content-disposition') || '', /^inline/);
+    const got = Buffer.from(await res.arrayBuffer());
+    assert.ok(got.equals(PNG), 'served bytes match the file');
+  } finally {
+    await s.stop();
+  }
+});
+
+test('raw=1 for a listed .mp4 → video/mp4, inline, Accept-Ranges; Range → 206 slice', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    const vid = path.join(s.dir, 'demo.mp4');
+    fs.writeFileSync(vid, 'FAKE-MP4-BYTES-0123456789'); // headers/range only — no real codec needed
+    const { uri } = await cardWithArtifact(s, vid, 'worker demo video');
+    const raw = s.base + '/api/artifact?uri=' + encodeURIComponent(uri) + '&raw=1';
+
+    const res = await fetch(raw);
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers.get('content-type'), 'video/mp4');
+    assert.match(res.headers.get('content-disposition') || '', /^inline/);
+    assert.strictEqual(res.headers.get('accept-ranges'), 'bytes');
+    assert.strictEqual(res.headers.get('x-content-type-options'), 'nosniff');
+
+    // iOS Safari probes with a tiny Range and refuses to play on a plain 200
+    const r2 = await fetch(raw, { headers: { Range: 'bytes=0-1' } });
+    assert.strictEqual(r2.status, 206);
+    assert.strictEqual(r2.headers.get('content-range'), 'bytes 0-1/25');
+    assert.strictEqual(await r2.text(), 'FA');
+
+    const r3 = await fetch(raw, { headers: { Range: 'bytes=15-' } });
+    assert.strictEqual(r3.status, 206);
+    assert.strictEqual(r3.headers.get('content-range'), 'bytes 15-24/25');
+    assert.strictEqual(await r3.text(), '0123456789');
+
+    const r4 = await fetch(raw, { headers: { Range: 'bytes=999-' } });
+    assert.strictEqual(r4.status, 416);
+    assert.strictEqual(r4.headers.get('content-range'), 'bytes */25');
+  } finally {
+    await s.stop();
+  }
+});
+
+test('raw=1 for a listed .mp3 → audio/mpeg, inline, Accept-Ranges; Range → 206 slice', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    const aud = path.join(s.dir, 'reply.mp3');
+    fs.writeFileSync(aud, 'FAKE-MP3-BYTES-0123456789'); // headers/range only — no real codec needed
+    const { uri } = await cardWithArtifact(s, aud, 'worker voice reply');
+    const raw = s.base + '/api/artifact?uri=' + encodeURIComponent(uri) + '&raw=1';
+
+    const res = await fetch(raw);
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers.get('content-type'), 'audio/mpeg');
+    assert.match(res.headers.get('content-disposition') || '', /^inline/);
+    assert.strictEqual(res.headers.get('accept-ranges'), 'bytes');
+    assert.strictEqual(res.headers.get('x-content-type-options'), 'nosniff');
+
+    // <audio> seeking rides the same Range path that makes iOS Safari play <video>
+    const r2 = await fetch(raw, { headers: { Range: 'bytes=0-1' } });
+    assert.strictEqual(r2.status, 206);
+    assert.strictEqual(r2.headers.get('content-range'), 'bytes 0-1/25');
+    assert.strictEqual(await r2.text(), 'FA');
+  } finally {
+    await s.stop();
+  }
+});
+
+test('raw=1 for a uri NOT listed on any card → 404 (auth guard holds for raw too)', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    const img = path.join(s.dir, 'secret.png');
+    fs.writeFileSync(img, PNG);
+    // never promoted to a card
+    const res = await fetch(s.base + '/api/artifact?uri=' + encodeURIComponent('file://' + img) + '&raw=1');
+    assert.strictEqual(res.status, 404);
+  } finally {
+    await s.stop();
+  }
+});
+
+test('raw=1 over BC_ARTIFACT_MAX_BYTES → 413', async () => {
+  const s = await startServerWithLieutenant({ env: { BC_ARTIFACT_MAX_BYTES: '64' } });
+  try {
+    const big = path.join(s.dir, 'big.png');
+    fs.writeFileSync(big, Buffer.alloc(65, 1));
+    const { uri } = await cardWithArtifact(s, big);
+    const res = await fetch(s.base + '/api/artifact?uri=' + encodeURIComponent(uri) + '&raw=1');
+    assert.strictEqual(res.status, 413);
+  } finally {
+    await s.stop();
+  }
+});
+
+test('raw=1 rejects a traversal file:// uri and a non-file:// uri', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    // A file:// uri with a `..` segment passes through the promote normalizer
+    // verbatim; the raw serve must reject it (resolves away from the given path).
+    const trav = await cardWithArtifact(s, 'file:///tmp/../etc/passwd');
+    const r1 = await fetch(s.base + '/api/artifact?uri=' + encodeURIComponent(trav.uri) + '&raw=1');
+    assert.strictEqual(r1.status, 400);
+
+    // A non-file artifact (http) is not servable as local bytes.
+    const web = await cardWithArtifact(s, 'https://example.com/x.png');
+    const r2 = await fetch(s.base + '/api/artifact?uri=' + encodeURIComponent(web.uri) + '&raw=1');
+    assert.strictEqual(r2.status, 400);
+  } finally {
+    await s.stop();
+  }
+});
+
+test('raw=1 for a listed .html → 200, text/html inline, no sandbox CSP', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    const page = path.join(s.dir, 'teach-me.html');
+    fs.writeFileSync(page, '<!doctype html><title>Diff</title><script>document.title="ok"</script>');
+    const { uri } = await cardWithArtifact(s, page, 'explain diff');
+
+    const res = await fetch(s.base + '/api/artifact?uri=' + encodeURIComponent(uri) + '&raw=1');
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers.get('content-type'), 'text/html; charset=utf-8');
+    assert.strictEqual(res.headers.get('x-content-type-options'), 'nosniff');
+    // The sandbox is gone: a curated .html artifact is the captain's own
+    // deliverable, and the board it would be sandboxed against has no auth.
+    assert.strictEqual(res.headers.get('content-security-policy'), null);
+    assert.match(res.headers.get('content-disposition') || '', /^inline/);
+    assert.match(await res.text(), /teach|Diff|doctype/i);
+  } finally {
+    await s.stop();
+  }
+});
+
+test('non-image binary served as bytes with attachment disposition', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    const zip = path.join(s.dir, 'bundle.zip');
+    fs.writeFileSync(zip, Buffer.from('PKrest-of-zip'));
+    const { uri } = await cardWithArtifact(s, zip);
+    const res = await fetch(s.base + '/api/artifact?uri=' + encodeURIComponent(uri) + '&raw=1');
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers.get('content-type'), 'application/octet-stream');
+    assert.match(res.headers.get('content-disposition') || '', /^attachment/);
+  } finally {
+    await s.stop();
+  }
+});
+
+test('text artifact still returns the text preview (no raw)', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    const md = path.join(s.dir, 'report.md');
+    fs.writeFileSync(md, '# Findings\n\nall good');
+    const { uri } = await cardWithArtifact(s, md, 'report');
+    const res = await s.api('GET', '/api/artifact?uri=' + encodeURIComponent(uri));
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.name, 'report.md');
+    assert.match(res.body.content, /# Findings/);
+  } finally {
+    await s.stop();
+  }
+});
+
+// ---------- the directory serve: /artifacts/<dir>/<rel> ----------
+
+const WAV = Buffer.concat([Buffer.from('RIFF....WAVEfmt '), Buffer.alloc(24), Buffer.from('data')]);
+
+// A page + its two siblings in their own directory, promoted as a card artifact.
+async function pageWithSiblings(s) {
+  const dir = path.join(s.dir, 'demo');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'index.html'),
+    '<!doctype html><img src="./x.png"><audio src="./y.wav"></audio>');
+  fs.writeFileSync(path.join(dir, 'x.png'), PNG);
+  fs.writeFileSync(path.join(dir, 'y.wav'), WAV);
+  await cardWithArtifact(s, path.join(dir, 'index.html'), 'demo');
+  return { dir, base: s.base + '/artifacts/' + encodeURIComponent(dir) + '/' };
+}
+
+test('an HTML artifact loads the image and audio next to it by relative path', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    const { base } = await pageWithSiblings(s);
+
+    const page = await fetch(base + 'index.html');
+    assert.strictEqual(page.status, 200);
+    assert.strictEqual(page.headers.get('content-type'), 'text/html; charset=utf-8');
+    // No sandbox: the board has no auth, hardening this page defends nothing.
+    assert.strictEqual(page.headers.get('content-security-policy'), null);
+
+    // What the browser actually asks for when it resolves ./x.png and ./y.wav
+    // against the page's own URL — the whole point of the path-shaped route.
+    const img = await fetch(new URL('./x.png', base));
+    assert.strictEqual(img.status, 200);
+    assert.strictEqual(img.headers.get('content-type'), 'image/png');
+    assert.ok(Buffer.from(await img.arrayBuffer()).equals(PNG), 'served bytes match the file');
+
+    const audio = await fetch(new URL('./y.wav', base));
+    assert.strictEqual(audio.status, 200);
+    assert.strictEqual(audio.headers.get('content-type'), 'audio/wav');
+    assert.strictEqual(audio.headers.get('accept-ranges'), 'bytes'); // <audio> seeking
+  } finally {
+    await s.stop();
+  }
+});
+
+test('the serve is scoped to the artifact directory — no escape, encoded or not', async () => {
+  const s = await startServerWithLieutenant();
+  try {
+    const { dir, base } = await pageWithSiblings(s);
+    const secret = path.join(s.dir, 'passwd');
+    fs.writeFileSync(secret, 'root:x:0:0');
+
+    for (const rel of ['%2e%2e%2fpasswd', '..%2Fpasswd', encodeURIComponent('../../etc/passwd'),
+      encodeURIComponent(secret)]) {
+      const res = await fetch(base + rel);
+      assert.strictEqual(res.status, 403, rel + ' → ' + res.status);
+      assert.doesNotMatch(await res.text(), /root:/, rel + ' leaked bytes');
+    }
+
+    // A directory that is not some listed artifact's own directory is not served.
+    const other = s.base + '/artifacts/' + encodeURIComponent(path.dirname(dir)) + '/passwd';
+    assert.strictEqual((await fetch(other)).status, 404);
+    // Nor is a path that only looks absolute-ish.
+    assert.strictEqual((await fetch(s.base + '/artifacts/' + encodeURIComponent(dir + '/..') + '/passwd')).status, 404);
+  } finally {
+    await s.stop();
+  }
+});

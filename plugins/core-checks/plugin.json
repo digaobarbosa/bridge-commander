@@ -1,0 +1,51 @@
+{
+  "id": "core-checks",
+  "name": "Core checks",
+  "description": "What bridge-commander itself needs on this machine: tmux, git and a git identity at init; gh and treehouse at boot.",
+  "version": "1.0.0",
+  "activation": "boot",
+  "contributes": {
+    "checks": [
+      {
+        "id": "tmux",
+        "phase": "init",
+        "bin": "tmux",
+        "title": "tmux is installed",
+        "severity": "error",
+        "hint": "brew install tmux (macOS) or apt install tmux (Debian/Ubuntu)"
+      },
+      {
+        "id": "git",
+        "phase": "init",
+        "bin": "git",
+        "title": "git is installed",
+        "severity": "error",
+        "hint": "brew install git (macOS) or apt install git (Debian/Ubuntu)"
+      },
+      {
+        "id": "git-identity",
+        "phase": "init",
+        "exec": "git config user.name && git config user.email",
+        "title": "git has an identity (user.name and user.email)",
+        "severity": "warn",
+        "hint": "git config --global user.name \"Your Name\" && git config --global user.email you@example.com"
+      },
+      {
+        "id": "gh",
+        "phase": "boot",
+        "bin": "gh",
+        "title": "gh (GitHub CLI) is installed",
+        "severity": "warn",
+        "hint": "the PR watch (a merged PR archives its card) needs gh: brew install gh, then gh auth login"
+      },
+      {
+        "id": "treehouse",
+        "phase": "boot",
+        "bin": "treehouse",
+        "title": "treehouse is installed",
+        "severity": "warn",
+        "hint": "optional; git worktree is used otherwise"
+      }
+    ]
+  }
+}

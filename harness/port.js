@@ -1,106 +1,35 @@
 'use strict';
-// harness port — the multi-harness contract (docs/api/overview.md, "harness port").
-//
-// The server speaks ONLY this port. An implementation is a module exposing
-// exactly these seven verbs (all may be async):
+// harness port — the multi-harness contract. The server speaks ONLY this port.
+// An implementation exposes these seven verbs (all may be async):
 //
 //   spawn(cwd, prompt, opts?) -> HarnessRef   birth an agent session
 //   send(ref, text)                           type a message into a session (verified submit)
-//   alive(ref) -> bool                        liveness
-//   resumable(ref, opts?) -> bool             would resume(ref) restore memory? (introspection only)
-//   resume(ref) -> HarnessRef                 reincarnate a dead session with memory when possible
-//   kill(ref)                                 end a session for good (idempotent; dead ref is a no-op)
-//   onTurnEnd(ref, hook) -> unsubscribe()     turn-boundary detection
+//   alive(ref) -> bool                        liveness; throws when it cannot tell
+//   resumable(ref, opts?) -> bool             would resume(ref, opts) restore memory?
+//   resume(ref, opts?) -> HarnessRef          reincarnate a dead session, with memory when possible
+//   kill(ref)                                 end a session for good (idempotent)
+//   onTurnEnd(ref, hook, opts?) -> unsubscribe()   turn-boundary detection
 //
-// A HarnessRef is a plain, JSON-serializable object; `harness` names the
-// implementation and the rest is that implementation's opaque address:
-//   { harness: 'claude', session: 'bc-<id>', window?: 'w-<id>', cwd: '/abs/path', resumeId?: '<uuid>' }
-// `window` marks a window-granular ref: the agent lives in a named window of
-// a shared session (workers inside their lieutenant's session) instead of
-// owning the whole session.
+// opts is one bag for spawn, resumable, resume and onTurnEnd: stateDir,
+// callbackUrl, extraArgs, model, effort, allowRoot, installHooks, session,
+// window. model/effort are TYPED options: a profile turns them into its own
+// flags (profile.modelArgs), and one it does not honor is dropped by the
+// caller with a warning — options are best-effort, verbs throw. The first
+// two are plumbing: a server binds them once (getHarness(name, env) /
+// harnessFor(ref, env), see "binding" below) and passes only the rest.
 //
-// Adding a harness = implementing the seven verbs and registering it here
-// (or shipping it as a builtin module). Nothing else.
+// A HarnessRef is plain JSON: { harness, session, window?, cwd, resumeId? },
+// with window and resumeId either absent or strings. keyOf(ref) is its state
+// key (`session` or `session:window`) — the name a turn-end relay posts and
+// every per-agent state file carries. Nobody outside the harness builds it.
 //
-// All seven must EXIST; one that cannot be honored must THROW with the reason
-// rather than pretend — a caller that learns why beats one watching text vanish
-// into a verb that quietly did nothing.
-//
-// OPTIONAL capability verbs: beyond the seven REQUIRED verbs a harness MAY
-// expose extra verbs for features not every harness can honor. They are
-// deliberately NOT validated here — adding one to VERBS would force every
-// harness (the fake included) to implement it and break validation. The
-// server capability-checks at the call site (`typeof impl.openPane ===
-// 'function'`) and degrades gracefully when the verb is absent. Current
-// optional verbs — pane viewing (the UI's 👁 peek):
-//   openPane(ref, { onFrame, intervalMs?, lines? }) -> { close() }
-//       deliver the pane's CURRENT RENDERED SCREEN as successive frames:
-//       onFrame(frameString) fires whenever the content changes (identical
-//       frames are skipped); a frame MAY carry ANSI SGR escapes. close()
-//       stops delivery and releases resources. All async-safe.
-//   paneSnapshot(ref, { lines? }) -> Promise<string>
-//       one-shot capture — the initial paint / non-streaming fallback.
-//   paneInput(ref, { text? | key? }) -> Promise<void>
-//       forward RAW input to the pane: `text` typed literally (multi-line
-//       rides a bracketed paste), `key` ONE tmux key name ('Enter', 'BSpace',
-//       'Up', 'BTab', 'C-c', …). Exactly one of the two; anything else throws,
-//       as does an unusable key name, a pane that is gone, or text past
-//       PANE_INPUT_MAX. Validate with the SHARED validatePaneInput() below —
-//       a harness with its own copy of the rules is a harness that drifts from
-//       them. Deliberately NOT
-//       send(): that one types, settles, Enters and retries until the composer
-//       verifies empty — right for delivering a brief, wrong for a keystroke.
-//       A harness MAY offer paneInput while send() throws: "no composer for a
-//       brief" and "no way to press a key" are different claims.
-//       Implementations that also stream SHOULD speed their feed up briefly
-//       after input, so the echo is not stuck behind the poll.
-// — migration of a session-granular ref to window granularity (the lieutenant
-// whose session it turned out to cohabit with its worker windows):
-//   adoptWindow(ref, window, taken?) -> Promise<HarnessRef|null>
-//       make the SAME running agent addressable as `session:window` without
-//       restarting it. `taken` names windows that belong to someone else and
-//       must never be adopted. null = the agent's window cannot be identified;
-//       the caller keeps the old ref. Idempotent: a ref that already carries a
-//       window comes back unchanged.
-// — and slash commands + session status (the UI composer's "/" and the
-// context bars; agent-status.js holds the shared machinery):
-//   commands(ref?) -> [{ name, description, args? }]
-//       the slash commands this harness answers (/status /compact /help
-//       where applicable; claude adds /autocompact and /output-style — verified
-//       against the binary, the public docs lag behind).
-//       `ref`, when given, scopes the answer to that session — claude's style
-//       list includes the ones installed in the session's own cwd.
-//       `args` is OPTIONAL metadata: [{ value, description }], the values this
-//       command accepts as its single argument, for a composer that wants to
-//       keep completing AFTER the command name (ui/js/slash.js). A harness that
-//       does not send it behaves exactly as before — the picker closes on the
-//       space, as it always did — so this is additive for every existing
-//       implementation. Everything a caller types after the command name is ONE
-//       argument: a `value` may contain spaces, and runCommand must not tokenize
-//       it. The server passes the field through untouched.
-//   runCommand(ref, command, opts?) -> Promise<string>
-//       execute one command line against the session (first token names the
-//       command; arguments ride along); resolves to the reply text. opts is
-//       the same bag spawn/resume take — `stateDir` is the one field that
-//       matters here, since /status reads from it.
-//       Pass-through commands (/compact, claude's /autocompact) type the
-//       LITERAL line through the verified-submit send path — the harness's
-//       own implementation runs in-session; /status formats status(); /help
-//       renders commands(). Unknown names throw — and so does a command whose
-//       argument is missing or unrecognised, BEFORE it does anything: claude's
-//       /output-style writes a setting to disk, and a typo must not sit there
-//       waiting to surprise the next conversation. A command that changes
-//       something the session only reads at STARTUP says WHEN it applies in
-//       its reply (/output-style: the next time this session starts) without
-//       naming a command to get there, which a harness cannot know exists —
-//       no verb here restarts a session on the caller's behalf.
-//   status(ref, opts?) -> Promise<{ model, contextUsed, contextWindow, rateLimits? } | null>
-//       model + context usage read from the files the harness already
-//       writes (transcript / rollout log); null — never a throw — when
-//       nothing is readable. opts.stateDir points at the board's harness
-//       state (codex resolves its thread-id from the session-id file there);
-//       omitting it falls back to whatever the ref alone can answer. rateLimits only where the harness persists
-//       them (codex); claude omits the field.
+// A verb a harness cannot honor THROWS with the reason, never silently
+// succeeds. The optional capability verbs (pane viewing, slash commands,
+// status, window adoption) are deliberately NOT validated here — the contract
+// for them lives in ONE place, harness/README.md, and the inventory in
+// docs/api/overview.md.
+
+const { keyOf, isSpawnableSession } = require('./util.js');
 
 const VERBS = ['spawn', 'send', 'alive', 'resumable', 'resume', 'kill', 'onTurnEnd'];
 
@@ -108,7 +37,7 @@ const VERBS = ['spawn', 'send', 'alive', 'resumable', 'resume', 'kill', 'onTurnE
 // Lives HERE, not in an implementation, because every harness that offers
 // paneInput must enforce the SAME contract: a fake that is laxer than the real
 // thing turns route tests green against payloads tmux would choke on. port.js
-// has no dependencies, so both the tmux adapters and the fake can require it.
+// depends only on util.js, so both the tmux adapters and the fake can require it.
 //
 // KEY_RE — tmux's key-name grammar. Anchored, and no branch can begin with '-':
 // tmux is spawned via execFile (an argv array, so no shell) and sendKey passes
@@ -157,6 +86,7 @@ const BUILTINS = {
 };
 
 const registry = new Map();
+const pluginOf = new Map(); // harness name -> the plugin that contributed or declared it
 
 function validateImpl(name, impl) {
   if (!impl || typeof impl !== 'object') {
@@ -170,13 +100,23 @@ function validateImpl(name, impl) {
   return impl;
 }
 
-function registerHarness(name, impl) {
+// meta.plugin names the plugin that contributed the harness (listHarnesses).
+function registerHarness(name, impl, meta) {
   if (!name || typeof name !== 'string') throw new TypeError('harness name must be a non-empty string');
   registry.set(name, validateImpl(name, impl));
+  if (meta && meta.plugin) pluginOf.set(name, meta.plugin);
   return impl;
 }
 
-function getHarness(name) {
+function isBuiltin(name) { return Object.prototype.hasOwnProperty.call(BUILTINS, name); }
+// A shipped plugin declares a built-in profile so it is listed with its plugin.
+function tagHarness(name, plugin) { if (plugin) pluginOf.set(name, plugin); }
+
+// The one place the default harness literal lives outside the profiles; a
+// workspace's config.json `harness` overrides it at every call site.
+function defaultHarness() { return 'claude'; }
+
+function lookup(name) {
   if (registry.has(name)) return registry.get(name);
   if (Object.prototype.hasOwnProperty.call(BUILTINS, name)) {
     const impl = validateImpl(name, require(BUILTINS[name]));
@@ -184,6 +124,98 @@ function getHarness(name) {
     return impl;
   }
   throw new Error(`unknown harness "${name}" (known: ${[...new Set([...registry.keys(), ...Object.keys(BUILTINS)])].join(', ')})`);
+}
+
+// ---------- binding ----------
+// Two opts are plumbing, not choices: where harness state lives (stateDir) and
+// where turn ends are POSTed (callbackUrl). A board has exactly one of each, and
+// a call that forgot stateDir used to land silently in the global last-resort
+// dir, shared by every board on the machine. A BOUND instance carries both, so
+// its verbs take only the real per-call choices (permissionMode, extraArgs,
+// session, window, …). The binding wins over whatever a caller passes.
+//
+// OPTS_AT — which argument of each verb is its opts bag. A verb not listed
+// takes no plumbing and is passed through as it is, optional verbs included,
+// so a capability check (`typeof impl.openPane`) reads the same bound or not.
+const OPTS_AT = { spawn: 2, resumable: 1, resume: 1, onTurnEnd: 2, status: 1, runCommand: 2, brief: 1 };
+const bindings = new WeakMap(); // env -> Map(impl -> bound instance)
+
+function bind(impl, env) {
+  if (!env || typeof env.stateDir !== 'string' || !env.stateDir) {
+    throw new TypeError('a harness binding needs a stateDir');
+  }
+  let cache = bindings.get(env);
+  if (!cache) bindings.set(env, (cache = new Map()));
+  if (cache.has(impl)) return cache.get(impl);
+  const plumbing = { stateDir: env.stateDir };
+  if (env.callbackUrl) plumbing.callbackUrl = env.callbackUrl;
+  const out = {};
+  for (const [verb, fn] of Object.entries(impl)) {
+    const at = OPTS_AT[verb];
+    out[verb] = typeof fn !== 'function' || at === undefined ? fn
+      : (...args) => { args[at] = { ...args[at], ...plumbing }; return fn.apply(impl, args); };
+  }
+  cache.set(impl, out);
+  return out;
+}
+
+// getHarness(name, env?) — the implementation registered under name; bound to
+// env ({ stateDir, callbackUrl? }) when one is given. The unbound form is for
+// tests and embedders that pass opts themselves.
+function getHarness(name, env) {
+  const impl = lookup(name);
+  return env ? bind(impl, env) : impl;
+}
+
+// profileInfo(name) -> the profile's data (options, permission modes,
+// requirements, install hint, context windows), or null for an impl that
+// offers none.
+function profileInfo(name) {
+  const impl = lookup(name);
+  return typeof impl.profileInfo === 'function' ? impl.profileInfo() : null;
+}
+
+// profileOf(name) -> the profile object behind a profile-backed impl, or null.
+// The core calls its behavioural fields (handRunLine, diagnose, detectSelf,
+// skillsDir, installWorkspace, permissions.describe) directly.
+function profileOf(name) {
+  const impl = lookup(name);
+  return impl && impl.profile && typeof impl.profile === 'object' ? impl.profile : null;
+}
+
+// listHarnesses() -> [{name, adapter, plugin?, handResume?, appResume?}], sorted. The fake is a test
+// double, so it is listed only where tests run it.
+function listHarnesses() {
+  const withFake = !!(process.env.BC_FAKE_STATE || process.env.BC_LIST_FAKE);
+  const names = [...new Set([...Object.keys(BUILTINS), ...registry.keys()])]
+    .filter((n) => withFake || n !== 'fake').sort();
+  const out = [];
+  for (const name of names) {
+    let info = null;
+    try { info = profileInfo(name); } catch { continue; } // a builtin that cannot load is not offered
+    const e = { name, adapter: (info && info.adapter) || (name === 'fake' ? 'fake' : 'custom') };
+    if (pluginOf.has(name)) e.plugin = pluginOf.get(name);
+    if (info && info.handResume) e.handResume = info.handResume;
+    if (info && info.appResume) e.appResume = info.appResume;
+    out.push(e);
+  }
+  return out;
+}
+
+// splitOptions(impl, wanted) -> {opts, ignored[]}: the typed options the impl
+// honors (profileInfo().options), and the names of the ones it does not.
+// Empty values are neither.
+function splitOptions(impl, wanted) {
+  const info = impl && typeof impl.profileInfo === 'function' ? impl.profileInfo() : null;
+  const honored = new Set((info && info.options) || []);
+  const opts = {};
+  const ignored = [];
+  for (const [k, v] of Object.entries(wanted || {})) {
+    if (v === undefined || v === null || v === '') continue;
+    if (honored.has(k)) opts[k] = v;
+    else ignored.push(k);
+  }
+  return { opts, ignored };
 }
 
 // isHarnessRef — structural check for a persisted/deserialized ref.
@@ -197,11 +229,13 @@ function isHarnessRef(ref) {
     && (ref.resumeId === undefined || typeof ref.resumeId === 'string');
 }
 
-// harnessFor(ref) — dispatch helper: the implementation a ref belongs to.
-function harnessFor(ref) {
+// harnessFor(ref, env?) — dispatch helper: the implementation a ref belongs
+// to, bound to env when one is given (see getHarness).
+function harnessFor(ref, env) {
   if (!isHarnessRef(ref)) throw new TypeError('not a HarnessRef: ' + JSON.stringify(ref));
-  return getHarness(ref.harness);
+  return getHarness(ref.harness, env);
 }
 
 module.exports = { VERBS, registerHarness, getHarness, isHarnessRef, harnessFor,
-  validatePaneInput, KEY_RE, PANE_INPUT_MAX };
+  listHarnesses, defaultHarness, profileInfo, profileOf, splitOptions, isBuiltin, tagHarness,
+  keyOf, isSpawnableSession, validatePaneInput, KEY_RE, PANE_INPUT_MAX };

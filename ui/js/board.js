@@ -1,60 +1,58 @@
 // board: dense card tiles, drag&drop, long-press move menu, new-card /
 // new-lieutenant modals. (Lieutenant switching lives in the chat header —
 // ltswitcher.js — not on the board.)
-import { S, columns, cards, lieutenants, lieutenant, lieutenantColor, cardVisible, cardStatus, cardRecency, targetOwedState, targetOwedStale, toggleFilter, filterSelected, workerFor, render } from './state.js';
+import { S, columns, cards, lieutenants, lieutenant, lieutenantColor, cardVisible, cardRecency, byRecency, toggleFilter, filterSelected, render } from './state.js';
 import { api } from './api.js';
-import { esc, agoSpanHtml, cardEmoji, cardNumHtml, cardPrs, prChipHtml, ctxBarHtml } from './util.js';
+import { esc, agoSpanHtml, cardNumHtml, cardPrs, prChipHtml, ctxBarHtml } from './util.js';
+import { cardFacts, cornerHtml, orderHtml, WORKER_LABEL } from './cardview.js';
 import { labelChipHtml } from './labels.js';
 import { openDetail } from './detail.js';
 import { openLieutenantChat } from './chat.js';
-import { openCardPane } from './pane.js';
+import { openCardSession } from './pane.js';
+import { cardSessions } from './terminal.js';
 import { avatarGridHtml, wireAvatarGrid } from './avatars.js';
-import { selectionOn, isSelected, enterSelection, pick } from './selection.js';
+import { selectionOn, isSelected, pick } from './selection.js';
+import { openCardMenu, moveCard, pluginBadgesHtml, activityChipHtml, tileActionsHtml } from './cardactions.js';
+import { runCommand } from './commandui.js';
+import { openActivity } from './activities.js';
+import { fillHarnessOptions, defaultHarness } from './plugins.js';
 
 const boardEl = document.getElementById('board');
 
-function byRecency(a, b) {
-  return (new Date(cardRecency(b) || 0).getTime() || 0) - (new Date(cardRecency(a) || 0).getTime() || 0);
-}
-
 // ---------- tiles ----------
+// Every fact on a tile comes from cardFacts (cardview.js), the same model the
+// table row and the detail panel draw from, so the surfaces cannot drift.
 function tileHtml(c) {
+  const f = cardFacts(c, S.doc, Date.now());
+  const session = cardSessions(c)[0];
+  const sessionTitle = 'open or resume session' + (session ? ' · ' + session.provider + ' · ' + session.host : '');
   const at = c.attributes || {};
   const repo = at.repo || '';
-  const msgs = (c.thread || []).length;
-  const st = cardStatus(c);
-  // "the lieutenant owes you a reply" balloon: SAME source as the chat typing
-  // bubble (card.status.owedState, server-derived), so tile and chat can never
-  // drift. Takes priority over the unread dot — one unambiguous corner indicator.
-  // stale-owed mirrors the chat's "may be stuck" state: static amber ⚠, no dots.
-  // queued mirrors the chat's "delivered, not picked up": static hourglass, no dots.
-  const owed = targetOwedState('card:' + c.id);
-  const staleW = owed && targetOwedStale('card:' + c.id);
-  const cornerInd = staleW
-    ? '<span class="t-typing stale" title="no response yet — the lieutenant may be stuck">⚠</span>'
-    : owed === 'queued'
-    ? '<span class="t-typing queued" title="delivered — the lieutenant hasn\'t picked it up yet">⏳</span>'
-    : owed
-    ? '<span class="t-typing" title="the lieutenant owes you a reply here"><span class="tdot"></span><span class="tdot"></span><span class="tdot"></span></span>'
-    : (st.unread ? '<span class="t-unread" title="unread activity"></span>' : '');
+  const msgs = f.messageCount;
+  // the corner: owed (the chat typing bubble's source) beats the unread dot
+  const cornerInd = cornerHtml(f);
   const hasLink = Object.entries(at).some(([k, v]) => /^https?:\/\//.test(String(v)));
   const labels = (c.labels || []).map((n) => labelChipHtml(n, filterSelected('label', n))).join('');
   // PR chips: attributes.prs [{url, state}] — one state-colored chip per entry
   const prs = cardPrs(c).map((pr) => prChipHtml(pr)).join('');
-  // a captain drag-order awaiting the lieutenant: subtle pending marker
-  const order = c.pendingOrder
-    ? '<span class="t-order" title="' + esc(c.pendingOrder.kind) + ' sent to ' + esc(c.owner) + ' — the card moves when the lieutenant acts">⏳ ordered</span>'
+  // a worker on this card is blocked on a permission prompt: the loudest chip,
+  // first in the row, because nothing moves on the card until the captain answers
+  const nPerm = f.needsApproval;
+  const perm = nPerm
+    ? '<span class="t-perm" title="' + nPerm + ' permission request' + (nPerm > 1 ? 's' : '') + ' waiting for you">🔐 needs approval' + (nPerm > 1 ? ' ×' + nPerm : '') + '</span>'
     : '';
+  const order = orderHtml(f, 'chip', c.owner);
+  // plugin data only — badges and the running-activity chip are markup built
+  // from the card and the manifests; no plugin code runs per tile
+  const ext = pluginBadgesHtml(c, S.doc) + activityChipHtml(c, S.doc);
   // worker-state stripe on the tile's RIGHT edge — a PERSISTENT status signal,
   // deliberately separate from the transient top-right corner (the LEFT edge is
-  // the owner's color). Driven by card.status.worker (the lease); only the known
-  // states get a stripe (whitelist, so no server value ever reaches the class
-  // name — XSS-safe). working=green pulsing, needs-you=amber, idle=gray.
-  const WORKER_STATES = { working: 'Working', 'needs-you': 'Needs you', idle: 'Idle' };
-  const worker = st.worker && WORKER_STATES[st.worker.state] ? st.worker.state : '';
-  const workerCls = worker ? ' worker worker-' + worker : ''; // worker value is whitelisted above
+  // the owner's color). workerState is whitelisted in cardview, so no server
+  // value reaches the class name. working=green pulsing, needs-you=amber, idle=gray.
+  const worker = f.workerState === 'absent' ? '' : f.workerState;
+  const workerCls = worker ? ' worker worker-' + worker : '';
   const workerTitle = worker
-    ? ' title="worker: ' + esc(WORKER_STATES[worker]) + (st.worker.id ? ' — ' + esc(st.worker.id) : '') + '"'
+    ? ' title="worker: ' + esc(WORKER_LABEL[worker]) + (f.workerId ? ' — ' + esc(f.workerId) : '') + '"'
     : '';
   // owner color stripe on the LEFT edge: every card belongs to exactly one lieutenant
   const stripe = '<span class="t-stripe" style="background:' + esc(lieutenantColor(c.owner)) + '"></span>';
@@ -64,24 +62,24 @@ function tileHtml(c) {
   const box = sel
     ? '<input class="t-sel" type="checkbox" tabindex="-1" aria-label="select card"' + (isSelected(c.id) ? ' checked' : '') + '>'
     : '';
-  return '<div class="tile' + (c.id === S.openCardId ? ' open' : '') + (sel && isSelected(c.id) ? ' sel' : '') + workerCls +
+  return '<div class="tile' + (c.id === S.openCardId ? ' open' : '') + (sel && isSelected(c.id) ? ' sel' : '') + workerCls + (nPerm ? ' needs-perm' : '') +
     '" draggable="' + (sel ? 'false' : 'true') + '" data-id="' + esc(c.id) + '"' + workerTitle + '>' +
     stripe +
-    '<div class="t-row1">' + box + '<span class="t-emoji">' + esc(cardEmoji(c)) + '</span>' +
+    '<div class="t-row1">' + box + '<span class="t-emoji">' + esc(f.emoji) + '</span>' +
     '<span class="t-title">' + esc(c.title || c.id) + '</span>' +
     cardNumHtml(c.id) + cornerInd + '</div>' +
-    (labels || prs || order ? '<div class="t-chips">' + order + labels + prs + '</div>' : '') +
+    (perm || labels || prs || order || ext ? '<div class="t-chips">' + perm + order + ext + labels + prs + '</div>' : '') +
     '<div class="t-foot">' +
     '<span class="t-owner' + (filterSelected('owner', c.owner) ? ' active' : '') + '" data-owner="' + esc(c.owner) +
-      '" title="click: filter by lieutenant · alt-click: exclude"><span class="dot" style="background:' + esc(lieutenantColor(c.owner)) + '"></span>' + esc((lieutenant(c.owner) || {}).name || c.owner) + '</span>' +
+      '" title="click: filter by lieutenant · alt-click: exclude"><span class="dot" style="background:' + esc(lieutenantColor(c.owner)) + '"></span>' + esc(f.ownerName) + '</span>' +
     (repo ? '<span class="t-repo" title="repo">' + esc(repo) + '</span>' : '') +
     '<span class="grow"></span>' +
     (hasLink ? '<span class="t-ind" title="has link">📎</span>' : '') +
     (msgs ? '<span class="t-ind" title="' + msgs + ' messages">💬' + msgs + '</span>' : '') +
-    // Working tiles carry the worker's context bar (agentStatus, turn-end fed)
-    (c.column === 'working' ? ctxBarHtml((workerFor(c.id) || {}).agentStatus) : '') +
-    // 👁 peek: every Working card can be watched live (its worker's terminal)
-    (c.column === 'working' ? '<button class="t-peek" title="watch this worker\'s terminal live">👁</button>' : '') +
+    // The conversation stays reachable after its worker leaves Working.
+    (f.inWorking ? ctxBarHtml(f.agentStatus) : '') +
+    (f.inWorking || session ? '<button class="t-peek" title="' + esc(sessionTitle) + '">👁</button>' : '') +
+    tileActionsHtml(c, S.doc) +
     agoSpanHtml(cardRecency(c), 't-ago') +
     '</div></div>';
 }
@@ -142,7 +140,11 @@ function wire() {
       }
       const t = e.target;
       if (t.closest('a')) return; // PR chip / link: let the anchor navigate, don't open detail
-      if (t.closest('.t-peek')) { openCardPane(el.dataset.id); return; }
+      if (t.closest('.t-peek')) { openCardSession(el.dataset.id); return; }
+      const cmd = t.closest('.t-cmd');
+      if (cmd) { runCommand(cmd.dataset.cmd, el.dataset.id); return; }
+      const act = t.closest('.t-activity');
+      if (act) { openActivity(act.dataset.activity); return; }
       if (t.classList.contains('label')) { toggleFilter('label', t.dataset.label, e.altKey); return; }
       const own = t.closest('.t-owner');
       if (own) { toggleFilter('owner', own.dataset.owner, e.altKey); return; }
@@ -182,63 +184,19 @@ function wire() {
       e.preventDefault();
       col.classList.remove('drag-over');
       const cardId = e.dataTransfer.getData('text/bc-card');
-      if (cardId) { try { await api.moveCard(cardId, id, orderComment(cardId, id)); } catch (err) { alert(err.message); } }
+      if (cardId) await moveCard(cardId, id);
     };
     col.querySelector('.add-card').onclick = (e) => { e.stopPropagation(); openNewCard(id); };
   });
 }
 
-// A captain move that becomes an ORDER (any → working = start-order,
-// review → backlog = rework-order) carries an optional comment for the owning
-// lieutenant (the DNA: the rework-order QueueItem carries the captain's thread
-// comment). Empty or cancelled = no comment; the order still goes.
-function orderComment(cardId, to) {
-  const c = cards().find((k) => k.id === cardId);
-  if (!c || c.column === to) return '';
-  const order = to === 'working' ? 'start order'
-    : c.column === 'review' && to === 'backlog' ? 'rework order' : '';
-  if (!order) return '';
-  return (window.prompt('Comment for the ' + order + ' (optional):', '') || '').trim();
-}
-
 // ---------- move / actions menu ----------
-const menuEl = document.getElementById('move-menu');
+// The menu itself (moves with the order-comment rule, select, archive with its
+// refusal, plugin commands) is the card command table in cardactions.js; this
+// name stays for the callers that open it at a point.
 export function openMoveMenu(cardId, x, y) {
-  const c = cards().find((k) => k.id === cardId);
-  if (!c) return;
-  menuEl.textContent = '';
-  const head = document.createElement('div');
-  head.className = 'mm-head';
-  head.textContent = 'move to';
-  menuEl.appendChild(head);
-  for (const col of columns()) {
-    const b = document.createElement('button');
-    b.textContent = (col.id === c.column ? '● ' : '') + col.title;
-    if (col.id === c.column) b.className = 'cur';
-    else b.onclick = async () => { closeMoveMenu(); try { await api.moveCard(cardId, col.id, orderComment(cardId, col.id)); } catch (e) { alert(e.message); } };
-    menuEl.appendChild(b);
-  }
-  const sep = document.createElement('div');
-  sep.className = 'mm-sep';
-  menuEl.appendChild(sep);
-  // The way INTO selection mode, on both the board and the table — nothing has
-  // to sit on screen the rest of the time for this to be reachable.
-  const many = document.createElement('button');
-  many.textContent = '☑ select cards';
-  many.onclick = () => { closeMoveMenu(); enterSelection(cardId); render(); };
-  menuEl.appendChild(many);
-  const kill = document.createElement('button');
-  kill.className = 'danger';
-  kill.textContent = '✕ archive';
-  kill.onclick = async () => { closeMoveMenu(); try { await api.archiveCard(cardId); } catch (e) { alert(e.message); } };
-  menuEl.appendChild(kill);
-  menuEl.hidden = false;
-  const r = menuEl.getBoundingClientRect();
-  menuEl.style.left = Math.max(8, Math.min(x, window.innerWidth - r.width - 8)) + 'px';
-  menuEl.style.top = Math.max(8, Math.min(y, window.innerHeight - r.height - 8)) + 'px';
+  return openCardMenu(cardId, { x, y });
 }
-export function closeMoveMenu() { menuEl.hidden = true; }
-document.addEventListener('click', (e) => { if (!menuEl.hidden && !menuEl.contains(e.target)) closeMoveMenu(); });
 
 // ---------- new card modal ----------
 const ncOverlay = document.getElementById('nc-overlay');
@@ -324,7 +282,8 @@ const ltAvatarGrid = document.getElementById('lt-avatar-grid');
 let ltAvatarPick = null; // null = no avatar (the "none" cell), "none" allowed
 export function openNewLieutenant() {
   document.getElementById('lt-name').value = '';
-  document.getElementById('lt-harness').value = 'claude';
+  // the harnesses the server lists (GET /api/plugins), the built-in pair otherwise
+  fillHarnessOptions(document.getElementById('lt-harness'), defaultHarness());
   ltAvatarPick = null;
   ltAvatarGrid.innerHTML = avatarGridHtml(ltAvatarPick);
   wireAvatarGrid(ltAvatarGrid, (idx) => { ltAvatarPick = idx; });
@@ -350,7 +309,7 @@ document.getElementById('lt-modal').onsubmit = async (e) => {
       name,
       avatar: ltAvatarPick,
       color: document.getElementById('lt-color').value,
-      harness: document.getElementById('lt-harness').value || 'claude',
+      harness: document.getElementById('lt-harness').value || defaultHarness(),
       spawn: true,
     });
     closeNewLieutenant();
