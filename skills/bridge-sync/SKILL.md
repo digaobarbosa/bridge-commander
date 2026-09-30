@@ -39,6 +39,7 @@ let someone understand the task without opening this conversation: explain the p
 intended behavior, describe the approach, state progress and evidence, and give the next step.
 Include a References section with descriptive clickable links when sources are known. Omit
 empty sections and unsupported details; preserve exact URLs. A PR list alone is not a description.
+Use `[short descriptive label](exact URL)` so long source URLs do not overwhelm the card.
 
 Run the helper with the captured identity and `--checkpoint-file`:
 

@@ -210,8 +210,8 @@ test('checkpoint bodies retain exact supplied links, including references omitte
   const result = await run(['--board-url', url, '--provider', 'codex', '--checkpoint', checkpoint], env);
   assert.equal(result.code, 0, result.stderr);
   assert.ok(posted.body.startsWith(modelBody));
-  assert.ok(posted.body.includes(`- <${slack}>`));
-  assert.ok(posted.body.includes(`- <${linear}>`));
+  assert.ok(posted.body.includes(`- [Additional reference](<${slack}>)`));
+  assert.ok(posted.body.includes(`- [Additional reference](<${linear}>)`));
   assert.equal((posted.body.match(/## References/g) || []).length, 1);
   const child = JSON.parse(fs.readFileSync(capture, 'utf8'));
   assert.ok(child.input.endsWith(checkpoint), 'original reference URLs reach the model unchanged');
