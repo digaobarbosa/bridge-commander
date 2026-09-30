@@ -31,8 +31,8 @@ function modelStub(dir, name) {
   const bin = path.join(dir, name);
   fs.writeFileSync(bin, `#!${process.execPath}\n` +
     "const fs=require('node:fs');let input='';process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{\n" +
-    "const a=process.argv.slice(2); fs.writeFileSync(process.env.STUB_CAPTURE,JSON.stringify({args:a,input,cwd:process.cwd(),thread:process.env.CODEX_THREAD_ID,claudecode:process.env.CLAUDECODE}));\n" +
-    "if(process.env.STUB_FAIL)process.exit(2);const out={summary:'Implemented the link; tests passed',stage:'review',nextAction:'Review the diff',blocker:''};\n" +
+    "const a=process.argv.slice(2); const schema=a[0]==='exec'?JSON.parse(fs.readFileSync(a[a.indexOf('--output-schema')+1],'utf8')):JSON.parse(a[a.indexOf('--json-schema')+1]); fs.writeFileSync(process.env.STUB_CAPTURE,JSON.stringify({args:a,input,schema,cwd:process.cwd(),thread:process.env.CODEX_THREAD_ID,claudecode:process.env.CLAUDECODE}));\n" +
+    "if(process.env.STUB_FAIL)process.exit(2);const out={summary:'Implemented the link; tests passed',stage:'review',nextAction:'Review the diff',blocker:'',body:process.env.STUB_BODY===undefined?'## Problem\\nCards need durable session links.\\n\\n## Approach\\nLink the exact conversation.\\n\\n## Status\\nTests passed.\\n\\n## Next action\\nReview the diff.':process.env.STUB_BODY};\n" +
     "if(process.env.STUB_INJECT)out.session={id:'ffffffff-ffff-ffff-ffff-ffffffffffff'};\n" +
     "if(a[0]==='exec')fs.writeFileSync(a[a.indexOf('-o')+1],JSON.stringify(out));else console.log(JSON.stringify({structured_output:out}));\n" +
     '});\n');
@@ -77,6 +77,7 @@ test('CLI sends one literal JSON update with exact identity and content; no shel
   assert.equal(requests[0].method, 'POST');
   assert.equal(requests[0].body.summary, summary);
   assert.equal(requests[0].body.session.id, ID);
+  assert.equal(Object.hasOwn(requests[0].body, 'body'), false, 'legacy direct update must preserve the existing description');
   assert.equal(JSON.parse(result.stdout).card.id, 'CARD-1');
 });
 
@@ -92,6 +93,48 @@ test('Claude hook input uses original session_id and explicit CLI identity has p
   assert.equal(explicit.code, 0, explicit.stderr);
   assert.equal(JSON.parse(explicit.stdout).session.id, ID);
   assert.equal(JSON.parse(explicit.stdout).session.provider, 'codex');
+});
+
+test('direct JSON body reaches the API literally with original PR, Slack, and Linear links', async (t) => {
+  const description = '## Problem\nSession links disappear after review.\n\n## References\n' +
+    '- [PR](https://github.com/example/bridge/pull/27)\n' +
+    '- [Original Slack thread](https://example.slack.com/archives/C123/p1750000000000000?thread_ts=1750000000.000000&cid=C123)\n' +
+    '- [Linear ticket](https://linear.app/example/issue/BRI-27/durable-links)';
+  let posted;
+  const url = await mockBoard(t, (req, res) => {
+    let raw = ''; req.on('data', (x) => raw += x);
+    req.on('end', () => { posted = JSON.parse(raw); res.end(JSON.stringify({ ok: true, card: {}, session: posted.session })); });
+  });
+  const result = await run(['--board-url', url, '--stdin'], {}, JSON.stringify({ session: { provider: 'codex', id: ID, cwd: '/project' }, body: description }));
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(posted.body, description);
+  assert.equal(posted.session.id, ID);
+});
+
+test('body-file takes precedence over input and lightweight model body while preserving exact content', async (t) => {
+  const dir = temp(t); modelStub(dir, 'codex');
+  const file = path.join(dir, 'body.md');
+  const description = '## Problem\nCaller-maintained description with literal `code` and $().\n\n## References\n' +
+    '- [PR](https://github.com/example/bridge/pull/73)\n';
+  fs.writeFileSync(file, description);
+  let posted;
+  const url = await mockBoard(t, (req, res) => {
+    let raw = ''; req.on('data', (x) => raw += x);
+    req.on('end', () => { posted = JSON.parse(raw); res.end(JSON.stringify({ ok: true, card: {}, session: posted.session })); });
+  });
+  const env = { PATH: dir + path.delimiter + process.env.PATH, STUB_CAPTURE: path.join(dir, 'capture.json'), CODEX_THREAD_ID: ID };
+  const result = await run(['--board-url', url, '--provider', 'codex', '--body-file', file, '--checkpoint', 'Tests passed; review next', '--stdin'], env, JSON.stringify({ body: 'Older description from input' }));
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(posted.body, description);
+  assert.equal(posted.stage, 'review');
+  assert.equal(posted.session.id, ID);
+});
+
+test('body limits fail before writing and an explicit empty body remains deliberate caller input', (t) => {
+  assert.equal(validatePayload({ provider: 'codex', session_id: ID, body: '' }, {}).body, '');
+  assert.equal(validatePayload({ provider: 'codex', session_id: ID, body: 'x'.repeat(20000) }, {}).body.length, 20000);
+  assert.throws(() => validatePayload({ provider: 'codex', session_id: ID, body: 'x'.repeat(20001) }, {}), /body.*20000/);
+  assert.throws(() => validatePayload({ provider: 'codex', session_id: ID, body: null }, {}), /body must be a string/);
 });
 
 test('archived-session errors are surfaced without retrying or recreating', async (t) => {
@@ -122,11 +165,15 @@ test('checkpoint uses a separate configurable small Codex runner and cannot repl
   assert.equal(posted.session.id, ID);
   assert.equal(posted.stage, 'review');
   assert.equal(posted.nextAction, 'Caller-selected next action');
+  assert.match(posted.body, /## Problem\nCards need durable session links/);
   const child = JSON.parse(fs.readFileSync(capture, 'utf8'));
   assert.equal(child.args[child.args.indexOf('-m') + 1], 'my-small-model');
   assert.ok(child.args.includes('--ephemeral'));
   assert.equal(child.args[child.args.indexOf('--sandbox') + 1], 'read-only');
   assert.equal(child.thread, undefined);
+  assert.ok(child.schema.required.includes('body'));
+  assert.equal(child.schema.properties.body.minLength, 1);
+  assert.equal(child.schema.properties.body.maxLength, 20000);
   assert.notEqual(child.cwd, process.cwd());
   assert.equal(fs.existsSync(child.cwd), false, 'isolated model directory cleaned up');
 });
@@ -144,6 +191,53 @@ test('Claude runner defaults to haiku, disables tools, preserves parent model, a
   assert.ok(child.args.includes('--no-session-persistence'));
   assert.equal(child.claudecode, undefined);
   assert.equal(env.CLAUDECODE, '1');
+});
+
+test('checkpoint bodies retain exact supplied links, including references omitted by the lightweight model', async (t) => {
+  const dir = temp(t); modelStub(dir, 'codex');
+  const pr = 'https://github.com/example/bridge/pull/27';
+  const slack = 'https://example.slack.com/archives/C123/p1750000000000000?thread_ts=1750000000.000000&cid=C123';
+  const linear = 'https://linear.app/example/issue/BRI-27/durable-links';
+  const checkpoint = `Problem: cards lose session links. Implemented a durable identity; tests passed.\nPR: <${pr}>\nOriginal thread: [Slack](${slack})\nTicket: ${linear}`;
+  const modelBody = `## Problem\nCards lose session links.\n\n## Approach\nStore exact identity.\n\n## Status\nTests passed.\n\n## Next action\nReview the diff.\n\n## References\n- [PR](${pr})`;
+  let posted;
+  const url = await mockBoard(t, (req, res) => {
+    let raw = ''; req.on('data', (x) => raw += x);
+    req.on('end', () => { posted = JSON.parse(raw); res.end(JSON.stringify({ ok: true, card: {}, session: posted.session })); });
+  });
+  const capture = path.join(dir, 'capture.json');
+  const env = { PATH: dir + path.delimiter + process.env.PATH, STUB_CAPTURE: capture, STUB_BODY: modelBody, CODEX_THREAD_ID: ID };
+  const result = await run(['--board-url', url, '--provider', 'codex', '--checkpoint', checkpoint], env);
+  assert.equal(result.code, 0, result.stderr);
+  assert.ok(posted.body.startsWith(modelBody));
+  assert.ok(posted.body.includes(`- <${slack}>`));
+  assert.ok(posted.body.includes(`- <${linear}>`));
+  assert.equal((posted.body.match(/## References/g) || []).length, 1);
+  const child = JSON.parse(fs.readFileSync(capture, 'utf8'));
+  assert.ok(child.input.endsWith(checkpoint), 'original reference URLs reach the model unchanged');
+  assert.equal(posted.session.id, ID);
+});
+
+test('invented or changed reference URLs from the lightweight model cannot update a card', async (t) => {
+  const dir = temp(t); modelStub(dir, 'codex');
+  let calls = 0;
+  const url = await mockBoard(t, (_req, res) => { calls++; res.end('{"ok":true}'); });
+  const env = { PATH: dir + path.delimiter + process.env.PATH, STUB_CAPTURE: path.join(dir, 'capture.json'), CODEX_THREAD_ID: ID, STUB_BODY: '## References\n- [PR](https://github.com/example/bridge/pull/999)' };
+  const result = await run(['--board-url', url, '--provider', 'codex', '--checkpoint', 'Original PR: https://github.com/example/bridge/pull/27'], env);
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /changed or invented a reference URL/);
+  assert.equal(calls, 0);
+});
+
+test('empty generated body cannot erase a description or count as a successful checkpoint', async (t) => {
+  const dir = temp(t); modelStub(dir, 'codex');
+  let calls = 0;
+  const url = await mockBoard(t, (_req, res) => { calls++; res.end('{"ok":true}'); });
+  const env = { PATH: dir + path.delimiter + process.env.PATH, STUB_CAPTURE: path.join(dir, 'capture.json'), CODEX_THREAD_ID: ID, STUB_BODY: ' \n\t' };
+  const result = await run(['--board-url', url, '--provider', 'codex', '--checkpoint', 'Current progress'], env);
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, /empty body/);
+  assert.equal(calls, 0);
 });
 
 test('model failure and oversize checkpoint cannot update the board; dry-run launches neither', async (t) => {

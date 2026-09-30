@@ -96,8 +96,10 @@ the board, including starting workers (running code):
 ## Session companion
 
 The `bridge-sync` skill links an existing Codex or Claude conversation to a card and updates a
-recent checkpoint through the board API. The eye opens that conversation in every stage,
-including archived cards; multiple linked conversations have a picker and a current selection.
+recent checkpoint through the board API. Its Markdown description explains the problem,
+approach, progress, and known PR, Slack, Linear, or other reference links. The eye opens that
+conversation in every stage, including archived cards; multiple linked conversations have a
+picker and a current selection.
 Commander-managed workers save the same links automatically. External companion cards follow
 their development stage without spawning a worker. CLI sessions use the terminal setting or
 offer a copyable exact resume command; Codex desktop sessions open in Codex. Claude defaults

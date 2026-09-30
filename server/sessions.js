@@ -69,6 +69,7 @@ function createSessions(deps) {
     for (const field of ['summary', 'nextAction', 'blocker']) {
       if (body[field] !== undefined && (typeof body[field] !== 'string' || body[field].length > 4000)) return { error: field + ' must be text up to 4000 characters', code: 400 };
     }
+    if (body.body !== undefined && (typeof body.body !== 'string' || body.body.length > 20000)) return { error: 'body must be text up to 20000 characters', code: 400 };
     const session = checked.session;
     const managed = deps.managedCard ? deps.managedCard(session) : null;
     const linked = deps.board().cards.filter((c) => c === managed || (c.sessions || []).some((s) => s.key === session.key));
@@ -88,6 +89,8 @@ function createSessions(deps) {
     const next = Object.assign({}, oldCheckpoint);
     for (const field of ['summary', 'stage', 'nextAction', 'blocker']) if (body[field] !== undefined) next[field] = body[field];
     const changed = JSON.stringify(next) !== JSON.stringify(oldCheckpoint);
+    const bodyChanged = body.body !== undefined && card.body !== body.body;
+    if (bodyChanged) card.body = body.body;
     const entry = remember(card, session, now, card === managed ? 'managed' : 'external');
     if (card === managed && deps.rememberManaged) deps.rememberManaged(card);
     card.updated = now;
@@ -96,7 +99,8 @@ function createSessions(deps) {
       card.column = STAGES[body.stage];
       card.pendingOrder = null;
     }
-    if (changed) deps.event(card, { text: next.summary || ('session checkpoint: ' + (next.stage || 'updated')), actor: 'bridge-sync', kind: 'session-synced', level: 2 });
+    if (changed || bodyChanged) deps.event(card, { text: changed ? next.summary || ('session checkpoint: ' + (next.stage || 'updated'))
+      : 'session description updated', actor: 'bridge-sync', kind: 'session-synced', level: 2 });
     return { card, session: entry };
   }
   return { sync };

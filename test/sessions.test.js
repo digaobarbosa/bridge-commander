@@ -157,3 +157,77 @@ test('managed worker links are captured at boot, adopt turn-end identity and fre
     assert.equal(frozen.sessions.find((v) => v.key === frozen.currentSession).id, ID2);
   } finally { await s.stop(); }
 });
+
+test('sync persists Markdown description and reference links, updates it explicitly and preserves absent body', async () => {
+  const s = await startServerWithLieutenant({ env: quiet });
+  try {
+    const description = '## Problem\nResume sessions from every stage.\n\n## Context\nKeep original task ownership.\n\n## References\n' +
+      '- [PR](https://github.com/example/project/pull/12)\n- [Slack](https://example.slack.com/archives/CHANNEL/p123)\n' +
+      '- [Linear](https://linear.app/example/issue/BC-12)';
+    const payload = { title: 'Rich session task', owner: LT, session: session(s.dir), summary: 'Ready for review', body: description };
+    let r = await s.api('POST', '/api/sessions/sync', payload);
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    const id = r.body.card.id;
+    assert.equal(r.body.card.body, description);
+    assert.equal((await s.api('GET', '/api/cards/' + id)).body.body, description, 'description is saved, not response-only');
+    const saved = JSON.parse(fs.readFileSync(path.join(s.dir, '.bridge-commander', 'board.json'), 'utf8'));
+    assert.equal(saved.cards.find((card) => card.id === id).body, description, 'description survives in the board file');
+    const events = r.body.card.events.length;
+    const updated = description + '\n\n## Progress\nSession navigation tested.';
+    r = await s.api('POST', '/api/sessions/sync', { session: payload.session, summary: payload.summary, body: updated });
+    assert.equal(r.body.card.body, updated);
+    assert.equal(r.body.card.events.length, events + 1, 'a body-only change records a sync event');
+    assert.equal(r.body.card.events.at(-1).text, 'session description updated');
+    r = await s.api('POST', '/api/sessions/sync', { session: payload.session, summary: 'Reviewed' });
+    assert.equal(r.body.card.body, updated, 'omitting body preserves the existing description');
+    r = await s.api('POST', '/api/sessions/sync', { session: payload.session, body: 'x'.repeat(20000) });
+    assert.equal(r.status, 200, 'the body size boundary is accepted');
+    assert.equal(r.body.card.body.length, 20000);
+    r = await s.api('POST', '/api/sessions/sync', { session: payload.session, body: '' });
+    assert.equal(r.body.card.body, '', 'explicit empty text clears the description');
+  } finally { await s.stop(); }
+});
+
+test('invalid description is rejected before creating or updating any card', async () => {
+  const s = await startServerWithLieutenant({ env: quiet });
+  try {
+    for (const body of [null, { text: 'not a string' }, 'x'.repeat(20001)]) {
+      const r = await s.api('POST', '/api/sessions/sync', { title: 'Must not create', owner: LT, session: session(s.dir), body });
+      assert.equal(r.status, 400);
+      assert.match(r.body.error, /body must be text up to 20000 characters/);
+    }
+    assert.equal((await s.api('GET', '/api/board')).body.cards.length, 0);
+    const created = await s.api('POST', '/api/sessions/sync', { title: 'Existing task', owner: LT, session: session(s.dir),
+      body: 'Keep this description', summary: 'Keep this checkpoint', stage: 'planning' });
+    const id = created.body.card.id;
+    const before = (await s.api('GET', '/api/cards/' + id)).body;
+    for (const body of [false, ['not text'], 'x'.repeat(20001)]) {
+      const r = await s.api('POST', '/api/sessions/sync', { session: session(s.dir), body,
+        summary: 'Must not land', stage: 'implementation' });
+      assert.equal(r.status, 400);
+      assert.deepEqual((await s.api('GET', '/api/cards/' + id)).body, before, 'invalid body cannot partially update stage or checkpoint');
+    }
+  } finally { await s.stop(); }
+});
+
+test('explicit managed card body updates preserve its lifecycle; omitted body keeps manual description', async () => {
+  const s = await startServerWithLieutenant({ env: quiet });
+  try {
+    const created = await s.api('POST', '/api/cards', withOwner({ title: 'Managed description', body: 'Captain instructions' }));
+    const id = created.body.card.id;
+    const before = (await s.api('GET', '/api/cards/' + id)).body;
+    let r = await s.api('POST', '/api/sessions/sync', { card: id, session: session(s.dir),
+      stage: 'implementation', summary: 'Working in original session' });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.card.body, 'Captain instructions');
+    r = await s.api('POST', '/api/sessions/sync', { card: id, session: session(s.dir), body: 'Captain instructions\n\nProgress: implementation complete' });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.card.body, 'Captain instructions\n\nProgress: implementation complete');
+    assert.equal(r.body.card.column, before.column, 'body sync never moves a managed card');
+    assert.equal(r.body.card.execution, before.execution, 'body sync never converts a managed card');
+    assert.equal(r.body.card.owner, before.owner);
+    assert.equal((await s.api('GET', '/api/board')).body.workers.length, 0, 'body sync launches no worker');
+    r = await s.api('POST', '/api/sessions/sync', { session: session(s.dir), nextAction: 'Review the change' });
+    assert.equal(r.body.card.body, 'Captain instructions\n\nProgress: implementation complete');
+  } finally { await s.stop(); }
+});

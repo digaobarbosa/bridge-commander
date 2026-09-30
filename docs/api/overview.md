@@ -54,10 +54,13 @@ opening a conversation does not recreate its worktree. Launch links operate on t
 machine, so use them on the session's machine.
 
 `POST /api/sessions/sync` accepts `{card?, owner?, title?, session: {provider, id, cwd, host,
-surface}, summary?, stage?, nextAction?, blocker?}`. Identity is the hostname, provider and exact
+surface}, body?, summary?, stage?, nextAction?, blocker?}`. Identity is the hostname, provider and exact
 conversation UUID. Repeated syncs reuse an active card; an archived match requires restoration
 or an explicit active target. New companion cards require an existing owner and a title.
 Stage is `planning`, `implementation`, `review` or `peer`; it moves external cards only.
+An optional Markdown `body` (up to 20,000 characters) replaces the card description atomically
+with its checkpoint. Omitting it preserves the description. Bodies can explain the problem,
+approach, current evidence, and exact PR, Slack, Linear, or other reference links.
 `GET /api/cards/:id/sessions` returns saved links, the current key and the worker's freshly
 probed liveness (`true`, `false` or `null` when the harness cannot tell). A failed probe does not
 authorize starting a second process. `PATCH /api/cards/:id` selects `currentSession` only from

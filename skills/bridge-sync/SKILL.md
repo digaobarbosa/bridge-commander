@@ -1,6 +1,6 @@
 ---
 name: bridge-sync
-description: Link the current Codex or Claude session to a Bridge Commander card and sync a recent development checkpoint with a lightweight model. Use for board-managed and independently started sessions, including planning, implementation, review, and peer review.
+description: Link the current Codex or Claude session to a Bridge Commander card and sync its problem, progress, and PR, Slack, Linear, or other references with a lightweight model. Use for board-managed and independently started sessions across development stages.
 ---
 
 # Bridge sync
@@ -21,10 +21,24 @@ and exact session UUID. Board-managed workers use the same link as independently
 
 ## Sync a checkpoint
 
-Resolve `scripts/sync.js` relative to this skill directory. Save a short recent checkpoint
-(at most 12 KB) to a temporary UTF-8 file: purpose, work completed, evidence, current stage,
-next action, and any blocker. Include only facts needed for the update, not the entire transcript.
+Resolve `scripts/sync.js` relative to this skill directory. Save a short checkpoint (at most
+12 KB) to a temporary UTF-8 file: the original problem and why it matters, agreed approach,
+work completed, evidence, current stage, next action, blockers, and relevant source links.
+Include the background needed to understand the task, not just the latest progress message.
 Use a file/tool argument for content; do not interpolate conversation text into a shell command.
+
+Before replacing an existing card's body, read its description and retain useful requirements,
+notes, decisions, and references in the checkpoint. Gather source links from the conversation,
+card brief, and current development artifacts. Include PR URLs and their purpose, the Slack
+thread or Linear ticket that triggered the work, and relevant specs, issues, or commits when
+available. Use scoped read-only lookups when a referenced item needs its exact URL or title;
+do not search unrelated history. Never invent URLs, PRs, tickets, or claims about their status.
+
+The small model writes both a short timeline summary and a Markdown card body. The body should
+let someone understand the task without opening this conversation: explain the problem and
+intended behavior, describe the approach, state progress and evidence, and give the next step.
+Include a References section with descriptive clickable links when sources are known. Omit
+empty sections and unsupported details; preserve exact URLs. A PR list alone is not a description.
 
 Run the helper with the captured identity and `--checkpoint-file`:
 
@@ -53,19 +67,22 @@ holding this session, including a regular Commander worker. For a new session, p
 discovery. Do not create a duplicate when a session belongs to an archived card: report the
 server's refusal or use a caller-selected active target card.
 
-Checkpoints carry `summary`, `stage` (`planning`, `implementation`, `review`, `peer`),
-`nextAction`, and `blocker`. Managed cards keep their orchestrator-owned column. External
-companion cards can follow their stage without launching a worker. Completion and archival
+Checkpoints carry `body` (Markdown), `summary`, `stage` (`planning`, `implementation`, `review`,
+`peer`), `nextAction`, and `blocker`. A supplied body replaces the card description; leaving it
+out preserves the existing description. Managed cards keep their orchestrator-owned column.
+External companion cards can follow their stage without launching a worker. Completion and archival
 remain deliberate board actions.
 
 Explicit checkpoint fields supplied by the caller take precedence over the small model's
-suggestions (for example `--stage planning`).
+suggestions (for example `--stage planning`). Use `--body-file FILE` to supply an exact Markdown
+description instead of the generated body.
 
 ## Direct API input and hooks
 
 For a prepared checkpoint, `--stdin` or `--input FILE` accepts JSON with `card`, `owner`,
-`title`, `session: {provider, id, cwd, host, surface}`, and the checkpoint fields. This path
-does not invoke a model. Claude hook JSON containing `session_id` and `cwd` is accepted with
+`title`, `session: {provider, id, cwd, host, surface}`, and the checkpoint fields, including
+optional `body` (up to 20,000 characters). This path does not invoke a model.
+Claude hook JSON containing `session_id` and `cwd` is accepted with
 `--provider claude`; hook installation is separate from invoking this skill.
 
 Use the returned card/session to confirm the link and report the update briefly. The card's eye
