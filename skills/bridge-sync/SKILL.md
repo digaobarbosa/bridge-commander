@@ -1,6 +1,6 @@
 ---
 name: bridge-sync
-description: Link the current Codex or Claude session to a Bridge Commander card and sync its problem, progress, and PR, Slack, Linear, or other references with a lightweight model. Use for board-managed and independently started sessions across development stages.
+description: Link the current Codex or Claude session to a Bridge Commander card, then automatically sync meaningful development updates with a lightweight model. Include problem context, progress, and PR, Slack, Linear, or other references for managed and external sessions.
 ---
 
 # Bridge sync
@@ -18,6 +18,29 @@ and exact session UUID. Board-managed workers use the same link as independently
   (`app` for a desktop conversation, `cli` for a terminal conversation).
 - If identity is unavailable, obtain the exact ID before writing a card. A summarizer's session
   ID is never the development session ID.
+
+## Automatic milestone sync after linking
+
+The first successful sync enables **agent-driven milestone syncing for this conversation**.
+Retain the board address, returned card ID, original session identity, and last successful
+checkpoint in the conversation/handoff context. On later turns, use this skill proactively
+without waiting for another invocation. After compaction or resume, recover the binding from
+the board using the exact session identity if needed; never guess the latest session or card.
+
+Sync when a material update changes the card: an agreed scope/design decision, completed
+implementation step, meaningful test result, commit or PR update, review finding/resolution,
+development-stage change, blocker, or resolved blocker. Combine related changes into one
+checkpoint at a milestone boundary, normally before reporting the outcome to the user. Skip
+routine exploration, repeated status, wording changes, and updates already in the last checkpoint.
+
+Use the same lightweight helper and explicit `--card` to update the existing card, preserving
+its context and exact source links. For split work, update only the affected sibling card(s).
+Confirm success before advancing the remembered checkpoint. If sync fails, keep the previous
+checkpoint, report the failure briefly, and retry on the next relevant update rather than looping.
+
+Honor requests to pause or stop automatic syncing until the user asks to resume; keep the
+saved session link. This is an instruction to the active development agent, not an installed
+background hook or monitor. Syncing pauses while that agent is inactive.
 
 ## One PR per card
 
@@ -108,5 +131,5 @@ Claude hook JSON containing `session_id` and `cwd` is accepted with
 `--provider claude`; hook installation is separate from invoking this skill.
 
 Use the returned card/session to confirm the link and report the update briefly. The card's eye
-can open/resume the original conversation across development stages. This skill is a checkpoint
-command; it does not install a background watcher or continuously sync every message.
+can open/resume the original conversation across development stages. Further meaningful updates
+are synced by the active agent under the milestone rule above.
