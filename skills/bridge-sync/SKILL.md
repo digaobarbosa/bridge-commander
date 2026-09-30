@@ -19,6 +19,27 @@ and exact session UUID. Board-managed workers use the same link as independently
 - If identity is unavailable, obtain the exact ID before writing a card. A summarizer's session
   ID is never the development session ID.
 
+## One PR per card
+
+Track at most **one delivery PR per card**. A card without a PR is fine during planning;
+never invent a PR or combine multiple delivery PRs into one card.
+
+When a task requires multiple PRs, split it into one card per PR. Connect those sibling cards
+with the **same task-specific card label** and connect their PRs with the **same title prefix**.
+Reuse an established label/prefix for that task. For example, label all cards `session-sync`
+and title their PRs `[session-sync] Persist conversation links` and
+`[session-sync] Add resume navigation`. Keep each card's scope, progress, and primary PR specific
+to its own change; mention sibling card IDs and dependencies in the body.
+
+Use the board API to create the sibling cards and update their metadata. `PATCH /api/cards/:id`
+accepts `labels` and `attributes.prs`; retain unrelated labels and attributes, and keep the
+tracked PR list to one entry. Include the shared prefix when creating or updating PR titles
+as part of the requested PR workflow.
+
+Use an explicit `--card` when syncing sibling cards: session deduplication cannot select
+between multiple cards linked to the same external conversation. A Commander-managed session
+stays attached to its own card; sibling managed work uses its own actual session identity.
+
 ## Sync a checkpoint
 
 Resolve `scripts/sync.js` relative to this skill directory. Save a short checkpoint (at most
